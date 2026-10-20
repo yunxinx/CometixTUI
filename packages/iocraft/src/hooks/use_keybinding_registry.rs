@@ -417,6 +417,15 @@ fn resolve_key_event_with_state(
         .filter(|binding| context_set.contains(&binding.context))
         .collect::<Vec<_>>();
 
+    // A handler outside the pending chord's contexts must leave it for its owner.
+    if test_chord.len() > 1
+        && !context_bindings
+            .iter()
+            .any(|binding| chord_prefix_matches(&test_chord[..test_chord.len() - 1], binding))
+    {
+        return KeybindingResolveResult::None;
+    }
+
     let mut chord_winners: Vec<(String, Option<String>)> = Vec::new();
     for binding in &context_bindings {
         if binding.chord.len() > test_chord.len() && chord_prefix_matches(&test_chord, binding) {

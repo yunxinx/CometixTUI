@@ -159,6 +159,9 @@ pub struct TextInputProps {
     /// If true (requires [`Self::multiline`]), the input auto-grows its height
     /// to fit wrapped content instead of filling its container's height.
     pub auto_grow: bool,
+
+    /// Maximum visible rows when auto-growing. Additional rows scroll with the cursor.
+    pub max_height: Option<u16>,
 }
 
 trait UseSize<'a> {
@@ -467,6 +470,20 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
         (&props.value, max_text_width),
     );
 
+    let visible_rows = buffer
+        .row_count()
+        .max(1)
+        .min(props.max_height.unwrap_or(u16::MAX).max(1) as usize);
+    let height = if auto_grow {
+        visible_rows as u16
+    } else {
+        height
+    };
+    let max_scroll_row = buffer.row_count().saturating_sub(height as usize) as u16;
+    if scroll_offset_row.get() > max_scroll_row {
+        scroll_offset_row.set(max_scroll_row);
+    }
+
     // Update the cursor position if the value has changed.
     if props.value.as_str() != prev_value.read().as_str() {
         let new_cursor_offset = new_cursor_offset(
@@ -717,8 +734,8 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
     });
 
     element! {
-        View(overflow: Overflow::Hidden, width: 100pct, height: if auto_grow { Size::Auto } else if multiline { Size::Percent(100.0) } else { Size::Length(1) }, position: Position::Relative) {
-            View(position: if auto_grow { Position::Relative } else { Position::Absolute }, top: if auto_grow { 0 } else { -(scroll_offset_row.get() as i32) }, left: if auto_grow { 0 } else { -(scroll_offset_col.get() as i32) }) {
+        View(overflow: Overflow::Hidden, width: 100pct, height: if auto_grow { Size::Length(visible_rows as u32) } else if multiline { Size::Percent(100.0) } else { Size::Length(1) }, position: Position::Relative) {
+            View(position: Position::Absolute, top: -(scroll_offset_row.get() as i32), left: -(scroll_offset_col.get() as i32)) {
                 TextBufferView(
                     buffer,
                     color: props.color,
@@ -726,7 +743,7 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
                     underline: props.decoration == TextDecoration::Underline,
                     italic: props.italic,
                     invert: props.invert,
-                    auto_grow,
+                    auto_grow: false,
                 )
             }
         }
@@ -876,6 +893,94 @@ mod tests {
         }
     }
 
+    #[component]
+    fn SubmitKeyOwner(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let (mut value, mut submitted) = *hooks.use_context::<(State<String>, State<String>)>();
+        hooks.use_propagated_terminal_events(move |event| {
+            if matches!(event.event(), TerminalEvent::Key(key) if key.code == KeyCode::Enter && key.kind != KeyEventKind::Release) {
+                submitted.set(value.to_string());
+                value.set(String::new());
+                event.stop_propagation();
+            }
+        });
+        element!(View(width: 0, height: 0))
+    }
+
+    #[component]
+    fn ControlledInput(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let mut value = hooks.use_state(String::new);
+        let submitted = hooks.use_state(String::new);
+        let mut system = hooks.use_context_mut::<SystemContext>();
+        let mut should_exit = hooks.use_state(|| false);
+        hooks.use_terminal_events(move |event| {
+            if matches!(event, TerminalEvent::Resize(..)) {
+                should_exit.set(true);
+            }
+        });
+        if should_exit.get() {
+            system.exit();
+        }
+        element! {
+            ContextProvider(value: Context::owned((value, submitted))) {
+                View(width: 20, flex_direction: FlexDirection::Column) {
+                    Text(content: format!("sent={}", submitted))
+                    SubmitKeyOwner
+                    TextInput(
+                        has_focus: true,
+                        physical_cursor: true,
+                        multiline: true,
+                        auto_grow: true,
+                        max_height: Some(3),
+                        value: value.to_string(),
+                        on_change: move |text| value.set(text),
+                    )
+                }
+            }
+        }
+    }
+
+    #[apply(test!)]
+    async fn test_controlled_input_commits_between_batched_keys() {
+        let events = [
+            KeyCode::Char('h'),
+            KeyCode::Char('i'),
+            KeyCode::Enter,
+            KeyCode::Char('x'),
+        ]
+        .into_iter()
+        .map(|code| TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, code)))
+        .chain([TerminalEvent::Resize(80, 24)]);
+        let frames: Vec<_> = element!(ControlledInput)
+            .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter(events)))
+            .collect()
+            .await;
+        assert_eq!(frames.last().unwrap().to_string(), "sent=hi\nx\n");
+    }
+
+    #[apply(test!)]
+    async fn test_auto_grow_scrolls_at_limit_and_resets_after_submit() {
+        let frames: Vec<_> = element!(ControlledInput)
+            .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter([
+                TerminalEvent::Paste("one\ntwo\nthree\nfour\nfive".to_string()),
+                TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Enter)),
+                TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char('x'))),
+                TerminalEvent::Resize(80, 24),
+            ])))
+            .collect()
+            .await;
+        let scrolled = frames
+            .iter()
+            .find(|frame| frame.to_string() == "sent=\nthree\nfour\nfive\n")
+            .expect("the capped input must scroll to its final three rows");
+        assert_eq!(scrolled.height(), 4);
+        let cursor = scrolled.cursor_declaration().unwrap();
+        assert_eq!((cursor.x, cursor.y, cursor.visible), (4, 3, true));
+        let last = frames.last().unwrap();
+        assert!(last.to_string().ends_with("five\nx\n"));
+        let cursor = last.cursor_declaration().unwrap();
+        assert_eq!((cursor.x, cursor.y), (1, last.height() - 1));
+    }
+
     #[apply(test!)]
     async fn test_text_input() {
         let actual = element!(MyComponent)
@@ -893,8 +998,9 @@ mod tests {
             .map(|c| c.to_string())
             .collect::<Vec<_>>()
             .await;
-        let expected = vec!["  \n", " foo! \n"];
-        assert_eq!(actual, expected);
+        let expected = ["  \n", " foo! \n"];
+        assert_eq!(actual.first().map(String::as_str), Some(expected[0]));
+        assert_eq!(actual.last().map(String::as_str), Some(expected[1]));
     }
 
     /// A focused TextInput must declare the physical cursor position on the canvas so
@@ -938,8 +1044,9 @@ mod tests {
             .map(|c| c.to_string())
             .collect::<Vec<_>>()
             .await;
-        let expected = vec!["  \n", " foo! \n"];
-        assert_eq!(actual, expected);
+        let expected = ["  \n", " foo! \n"];
+        assert_eq!(actual.first().map(String::as_str), Some(expected[0]));
+        assert_eq!(actual.last().map(String::as_str), Some(expected[1]));
     }
 
     #[apply(test!)]
@@ -956,8 +1063,9 @@ mod tests {
             .map(|c| c.to_string())
             .collect::<Vec<_>>()
             .await;
-        let expected = vec!["  \n", " a b! \n"];
-        assert_eq!(actual, expected);
+        let expected = ["  \n", " a b! \n"];
+        assert_eq!(actual.first().map(String::as_str), Some(expected[0]));
+        assert_eq!(actual.last().map(String::as_str), Some(expected[1]));
     }
 
     #[apply(test!)]
@@ -1004,8 +1112,9 @@ mod tests {
             .map(|c| c.to_string())
             .collect::<Vec<_>>()
             .await;
-        let expected = vec!["  \n", " xxxxxxxx! \n"];
-        assert_eq!(actual, expected);
+        let expected = ["  \n", " xxxxxxxx! \n"];
+        assert_eq!(actual.first().map(String::as_str), Some(expected[0]));
+        assert_eq!(actual.last().map(String::as_str), Some(expected[1]));
     }
 
     #[apply(test!)]
@@ -1024,8 +1133,9 @@ mod tests {
             .map(|c| c.to_string())
             .collect::<Vec<_>>()
             .await;
-        let expected = vec!["  \n", " 一二! \n"];
-        assert_eq!(actual, expected);
+        let expected = ["  \n", " 一二! \n"];
+        assert_eq!(actual.first().map(String::as_str), Some(expected[0]));
+        assert_eq!(actual.last().map(String::as_str), Some(expected[1]));
     }
 
     #[apply(test!)]
@@ -1048,8 +1158,9 @@ mod tests {
             .map(|c| c.to_string())
             .collect::<Vec<_>>()
             .await;
-        let expected = vec!["  \n\n\n", " foo\n ! \n\n"];
-        assert_eq!(actual, expected);
+        let expected = ["  \n\n\n", " foo\n ! \n\n"];
+        assert_eq!(actual.first().map(String::as_str), Some(expected[0]));
+        assert_eq!(actual.last().map(String::as_str), Some(expected[1]));
     }
 
     /// `auto_grow` derives the input's height from its wrapped row count

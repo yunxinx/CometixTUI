@@ -2739,6 +2739,7 @@ fn test_resize_event_triggers_terminal_mode_reassertion() {
         last_stdin_event_at: Some(Instant::now()),
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
+        input_dispatched: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -2787,6 +2788,7 @@ fn test_stdin_gap_reasserts_terminal_modes_like_cc_ink() {
         last_stdin_event_at: Some(Instant::now() - STDIN_RESUME_GAP - Duration::from_secs(1)),
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
+        input_dispatched: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -2799,10 +2801,11 @@ fn test_stdin_gap_reasserts_terminal_modes_like_cc_ink() {
     };
 
     term.start_event_stream().unwrap();
-    // The mock stream ends after its events; stream exhaustion is the expected
-    // UnexpectedEof per the input-error propagation semantics.
-    let wait_result = smol::block_on(term.wait());
-    assert!(wait_result.is_err());
+    smol::block_on(term.wait()).unwrap();
+    assert!(term.take_input_dispatched());
+    assert!(!term.take_input_dispatched());
+    let error = smol::block_on(term.wait()).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
 
     assert_eq!(
         reasserts.load(Ordering::SeqCst),
@@ -2837,6 +2840,7 @@ fn test_same_size_resize_event_is_ignored() {
         last_stdin_event_at: Some(Instant::now()),
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
+        input_dispatched: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -2964,6 +2968,7 @@ fn test_synchronized_update_wraps_clear_canvas_when_it_writes() {
         last_stdin_event_at: Some(Instant::now()),
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
+        input_dispatched: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -3013,6 +3018,7 @@ fn test_synchronized_update_stays_lazy_for_identical_canvas_write() {
         last_stdin_event_at: Some(Instant::now()),
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
+        input_dispatched: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -3059,6 +3065,7 @@ fn test_synchronized_update_wraps_current_damage_canvas_write() {
         last_stdin_event_at: Some(Instant::now()),
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
+        input_dispatched: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -3116,6 +3123,7 @@ fn test_synchronized_update_wraps_previous_damage_canvas_write() {
         last_stdin_event_at: Some(Instant::now()),
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
+        input_dispatched: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -3170,6 +3178,7 @@ fn test_synchronized_update_stays_lazy_for_identical_fullscreen_canvas_write() {
         last_stdin_event_at: Some(Instant::now()),
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
+        input_dispatched: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -3245,6 +3254,7 @@ fn test_synchronized_update_wraps_pending_wrap_resolution() {
         last_stdin_event_at: Some(Instant::now()),
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
+        input_dispatched: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,

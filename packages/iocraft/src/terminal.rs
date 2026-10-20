@@ -276,6 +276,7 @@ pub(crate) struct Terminal<'a> {
     last_stdin_event_at: Option<Instant>,
     query_queue: VecDeque<PendingTerminalRequest>,
     pending_ctrl_c: Vec<Arc<SharedEventState>>,
+    input_dispatched: bool,
     received_ctrl_c: bool,
     ignore_ctrl_c: bool,
     suspend_on_ctrl_z: bool,
@@ -311,6 +312,7 @@ impl<'a> Terminal<'a> {
             last_stdin_event_at: Some(Instant::now()),
             query_queue: VecDeque::new(),
             pending_ctrl_c: Vec::new(),
+            input_dispatched: false,
             received_ctrl_c: false,
             ignore_ctrl_c: false,
             suspend_on_ctrl_z: false,
@@ -719,6 +721,10 @@ impl<'a> Terminal<'a> {
         Ok(())
     }
 
+    pub(crate) fn take_input_dispatched(&mut self) -> bool {
+        std::mem::take(&mut self.input_dispatched)
+    }
+
     pub async fn wait(&mut self) -> io::Result<()> {
         use futures::future::{poll_fn, select, Either};
 
@@ -808,6 +814,8 @@ impl<'a> Terminal<'a> {
                     );
                 }
                 let is_resize = matches!(event, TerminalEvent::Resize(..));
+                self.input_dispatched =
+                    matches!(event, TerminalEvent::Key(_) | TerminalEvent::Paste(_));
                 if let TerminalEvent::Resize(width, height) = &event {
                     let next_size = (*width, *height);
                     if self.inner.size() == Some(next_size) {
@@ -836,7 +844,7 @@ impl<'a> Terminal<'a> {
                         self.received_ctrl_c = true;
                     }
                 }
-                if self.received_ctrl_c || is_resize {
+                if self.received_ctrl_c || is_resize || self.input_dispatched {
                     return Ok(());
                 }
             },
@@ -908,6 +916,7 @@ impl Terminal<'static> {
                 last_stdin_event_at: Some(Instant::now()),
                 query_queue: VecDeque::new(),
                 pending_ctrl_c: Vec::new(),
+                input_dispatched: false,
                 received_ctrl_c: false,
                 ignore_ctrl_c,
                 suspend_on_ctrl_z,

@@ -2260,6 +2260,12 @@ impl<'a> Tree<'a> {
             {
                 result?;
             }
+            if term.take_input_dispatched() {
+                // Commit controlled input state before dispatching the next input event.
+                let _ = self.root_component.wait().now_or_never();
+                term.resolve_pending_ctrl_c();
+                continue;
+            }
             if term.take_resumed() {
                 term.reinitialize_after_resume()?;
                 prev_canvas = None;
@@ -2311,9 +2317,13 @@ impl<'a> Tree<'a> {
                             prev_terminal_size = None;
                             resumed_during_throttle = true;
                         }
-                        term.resolve_pending_ctrl_c();
                         Ok::<bool, io::Error>(timed_out)
                     }?;
+                    if term.take_input_dispatched() {
+                        let _ = self.root_component.wait().now_or_never();
+                        term.resolve_pending_ctrl_c();
+                        break;
+                    }
                     if resumed_during_throttle {
                         break;
                     }
