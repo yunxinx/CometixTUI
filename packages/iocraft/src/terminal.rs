@@ -4,6 +4,7 @@ use crate::{
         SelectionController, SelectionFocusMove, SelectionHoverOutcome, SelectionPressOutcome,
         SelectionReleaseOutcome,
     },
+    context::ScrollbackReplay,
     element::Output,
 };
 use crossterm::{
@@ -277,6 +278,7 @@ pub(crate) struct Terminal<'a> {
     query_queue: VecDeque<PendingTerminalRequest>,
     pending_ctrl_c: Vec<Arc<SharedEventState>>,
     input_dispatched: bool,
+    resized: bool,
     received_ctrl_c: bool,
     ignore_ctrl_c: bool,
     suspend_on_ctrl_z: bool,
@@ -313,6 +315,7 @@ impl<'a> Terminal<'a> {
             query_queue: VecDeque::new(),
             pending_ctrl_c: Vec::new(),
             input_dispatched: false,
+            resized: false,
             received_ctrl_c: false,
             ignore_ctrl_c: false,
             suspend_on_ctrl_z: false,
@@ -438,6 +441,10 @@ impl<'a> Terminal<'a> {
         let decstbm_safe = self.synchronized_update_supported && self.synchronized_update_started;
         self.inner.set_decstbm_safe(decstbm_safe);
         self.inner.write_canvas(prev, canvas)
+    }
+
+    pub(crate) fn set_scrollback_replay(&mut self, replay: Option<ScrollbackReplay>) {
+        self.inner.set_scrollback_replay(replay);
     }
 
     pub(crate) fn write_canvas_after_repaint_check(
@@ -725,6 +732,11 @@ impl<'a> Terminal<'a> {
         std::mem::take(&mut self.input_dispatched)
     }
 
+    /// Whether a size-changing resize event arrived since the last call.
+    pub(crate) fn take_resized(&mut self) -> bool {
+        std::mem::take(&mut self.resized)
+    }
+
     pub async fn wait(&mut self) -> io::Result<()> {
         use futures::future::{poll_fn, select, Either};
 
@@ -825,6 +837,7 @@ impl<'a> Terminal<'a> {
                         continue;
                     }
                     self.inner.set_size_from_resize_event(*width, *height);
+                    self.resized = true;
                     let _ = self.inner.reassert_after_resize();
                 }
                 let event = Self::annotate_terminal_event(event, event_cell_snapshot.as_ref());
@@ -917,6 +930,7 @@ impl Terminal<'static> {
                 query_queue: VecDeque::new(),
                 pending_ctrl_c: Vec::new(),
                 input_dispatched: false,
+                resized: false,
                 received_ctrl_c: false,
                 ignore_ctrl_c,
                 suspend_on_ctrl_z,

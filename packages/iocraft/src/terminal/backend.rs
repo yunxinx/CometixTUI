@@ -163,6 +163,7 @@ pub(super) trait TerminalImpl: Write + Send {
         Ok(false)
     }
     fn set_decstbm_safe(&mut self, _safe: bool) {}
+    fn set_scrollback_replay(&mut self, _replay: Option<crate::context::ScrollbackReplay>) {}
     fn clear_canvas_would_write(&self) -> bool {
         true
     }
@@ -435,6 +436,8 @@ pub(super) struct StdTerminal<'a> {
     /// precede the canvas in the main screen, so establish a clean retained
     /// baseline before trusting sparse row diffs.
     pub(super) inline_force_full_rewrite_next_diff: bool,
+    /// History written back into native scrollback after an automatic inline purge.
+    pub(super) scrollback_replay: Option<crate::context::ScrollbackReplay>,
     #[cfg(unix)]
     pub(super) resume_signal: Option<ResumeSignalListener>,
 }
@@ -684,6 +687,10 @@ impl TerminalImpl for StdTerminal<'_> {
             }
             (false, None) => Ok(false),
         }
+    }
+
+    fn set_scrollback_replay(&mut self, replay: Option<crate::context::ScrollbackReplay>) {
+        self.scrollback_replay = replay;
     }
 
     fn set_decstbm_safe(&mut self, safe: bool) {
@@ -1167,6 +1174,7 @@ impl<'a> StdTerminal<'a> {
             inline_pending_wrap: false,
             decstbm_safe: false,
             inline_force_full_rewrite_next_diff: false,
+            scrollback_replay: None,
             // Best-effort: if signal registration fails, the terminal still works —
             // it just won't self-heal after suspend/resume.
             #[cfg(unix)]
@@ -1288,8 +1296,9 @@ impl<'a> StdTerminal<'a> {
 
     /// Maps to CC `ink/log-update.ts#LogUpdate.render` automatic resize /
     /// offscreen full-reset branches and `fullResetSequence_CAUSES_FLICKER`.
-    /// Explicit `clear_canvas()` remains screen-only; only resize/offscreen
-    /// automatic fallbacks purge native scrollback.
+    /// Explicit `clear_canvas()` remains screen-only; only width-change and
+    /// offscreen automatic fallbacks purge native scrollback, and both replay
+    /// the registered history before the canvas is rewritten.
     fn clear_inline_for_full_rewrite(
         &mut self,
         prev_height: usize,
@@ -1307,22 +1316,40 @@ impl<'a> StdTerminal<'a> {
         {
             return self.clear_canvas();
         }
+        // A height-only change is not a resize reset: the rows the terminal moved
+        // across the scrollback boundary are judged by the offscreen rule. The
+        // smaller of the two viewports decides it, so a canvas that overflowed
+        // either one counts as already partly in scrollback.
+        let viewport_height = prev_viewport_height.min(next_viewport_height) as usize;
         let prev = TerminalFrameBounds {
             screen_height: prev_height,
             viewport_width: prev_width as usize,
-            viewport_height: prev_viewport_height as usize,
+            viewport_height,
         };
         let next = TerminalFrameBounds {
             screen_height: next_height,
             viewport_width: next_width as usize,
-            viewport_height: next_viewport_height as usize,
+            viewport_height,
         };
         match should_clear_terminal_screen(prev, next) {
             Some(TerminalClearReason::Resize | TerminalClearReason::Offscreen) => {
-                self.clear_terminal()
+                self.clear_terminal()?;
+                self.replay_scrollback()
             }
             Some(TerminalClearReason::Clear) | None => self.clear_canvas(),
         }
+    }
+
+    /// Writes the registered history at the current width, leaving the cursor at
+    /// the start of the row where the canvas rewrite begins.
+    fn replay_scrollback(&mut self) -> io::Result<()> {
+        let (Some(replay), Some((width, _))) = (self.scrollback_replay.clone(), self.size) else {
+            return Ok(());
+        };
+        for canvas in replay(width as usize) {
+            canvas.write_ansi(&mut *self.dest)?;
+        }
+        Ok(())
     }
 
     fn inline_resize_requires_full_rewrite(&self) -> bool {
@@ -1333,11 +1360,11 @@ impl<'a> StdTerminal<'a> {
             return false;
         };
 
-        // Mirrors Ink/log-update's resize guard: changing width invalidates
-        // wrapping assumptions, and a shorter viewport can make previously
-        // reachable rows disappear into scrollback. Reset the retained inline
-        // canvas before diffing against the new terminal geometry.
-        next.1 < prev.1 || (prev.0 != 0 && next.0 != prev.0)
+        // Changing width invalidates every wrapping assumption, so the retained
+        // inline canvas is reset before diffing. A height-only change keeps the
+        // canvas: rows pushed into scrollback become unreachable and are handled
+        // by the offscreen rule like any other overflow.
+        prev.0 != 0 && next.0 != prev.0
     }
 
     pub(super) fn inline_shrink_requires_full_rewrite(

@@ -42,6 +42,13 @@ pub(crate) struct AlternateScreenRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ExitOnCtrlCContext(pub bool);
 
+/// Renders the application history that precedes the inline canvas at a given terminal width.
+///
+/// The inline renderer calls it right after it purges native scrollback (a width change, or a
+/// frame whose offscreen rows changed) and writes the returned canvases, oldest first, above the
+/// live canvas. Each canvas is written as complete rows, so it carries its own spacing.
+pub type ScrollbackReplay = Arc<dyn Fn(usize) -> Vec<crate::Canvas> + Send + Sync>;
+
 /// The system context, which is always available to all components.
 pub struct SystemContext {
     should_exit: bool,
@@ -49,6 +56,7 @@ pub struct SystemContext {
     keyboard_enhancement_flags: Option<crate::KeyboardEnhancementFlags>,
     alternate_screen: Option<AlternateScreenRequest>,
     terminal_handoff: Option<TerminalHandoffRequest>,
+    scrollback_replay: Option<ScrollbackReplay>,
 }
 
 impl SystemContext {
@@ -59,6 +67,7 @@ impl SystemContext {
             keyboard_enhancement_flags: None,
             alternate_screen: None,
             terminal_handoff: None,
+            scrollback_replay: None,
         }
     }
 
@@ -123,6 +132,16 @@ impl SystemContext {
 
     pub(crate) fn keyboard_enhancement_flags(&self) -> Option<crate::KeyboardEnhancementFlags> {
         self.keyboard_enhancement_flags
+    }
+
+    /// Registers the history the inline renderer replays into native scrollback after purging
+    /// it, replacing any earlier registration. Without one, a purge leaves only the live canvas.
+    pub fn set_scrollback_replay(&mut self, replay: ScrollbackReplay) {
+        self.scrollback_replay = Some(replay);
+    }
+
+    pub(crate) fn scrollback_replay(&self) -> Option<ScrollbackReplay> {
+        self.scrollback_replay.clone()
     }
 }
 

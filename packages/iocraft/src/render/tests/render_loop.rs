@@ -174,6 +174,33 @@ async fn test_resize_event_repaints_unchanged_canvas() {
     assert_eq!(actual, vec!["static\n", "static\n"]);
 }
 
+#[component]
+fn ResizeBurstComponent(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let mut system = hooks.use_context_mut::<SystemContext>();
+    let (width, _) = hooks.use_terminal_size();
+    if width == 70 {
+        system.exit();
+    }
+    element!(Text(content: format!("width: {width}")))
+}
+
+#[apply(test!)]
+async fn test_resize_burst_paints_once_after_settling() {
+    let canvases: Vec<_> = element!(ResizeBurstComponent)
+        .mock_terminal_render_loop(MockTerminalConfig::with_events(futures::stream::iter(
+            vec![
+                TerminalEvent::Resize(100, 40),
+                TerminalEvent::Resize(90, 40),
+                TerminalEvent::Resize(70, 40),
+            ],
+        )))
+        .collect()
+        .await;
+    let actual = canvases.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+    assert_eq!(actual.len(), 2, "{actual:?}");
+    assert_eq!(actual[1], "width: 70\n");
+}
+
 #[derive(Default, Props)]
 struct AvailableHeightProbeProps;
 

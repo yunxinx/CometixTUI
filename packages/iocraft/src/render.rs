@@ -69,6 +69,10 @@ impl LayoutInvalidations {
 /// that would otherwise dominate profiled frames on large sessions. Enable
 /// with `IOCRAFT_DEBUG=cells` when the analysis actually needs per-frame
 /// changed-cell numbers.
+/// How long the terminal size must stay unchanged before a resized frame is
+/// painted; matches codex's transcript reflow debounce.
+const RESIZE_SETTLE: Duration = Duration::from_millis(75);
+
 fn changed_cell_count_enabled() -> bool {
     #[cfg(test)]
     {
@@ -2055,6 +2059,59 @@ impl<'a> Tree<'a> {
         let mut prev_terminal_size: Option<(u16, u16)> = None;
         let mut mouse_capture_enabled: Option<bool> = None;
         loop {
+            // Resize settling: a drag delivers a burst of sizes, and painting any
+            // of them would reset the inline canvas (and, on a width change, purge
+            // and replay scrollback) once per step. Hold the paint until the size
+            // has been stable for `RESIZE_SETTLE`, polling the component tree the
+            // whole time like the frame throttle. Nothing is painted meanwhile, so
+            // no intermediate frame can observe the new size and reset early.
+            // Input still ends the wait: each input event is painted before the
+            // next one is dispatched, and a later resize settles again.
+            if term.take_resized() {
+                let mut deadline = std::time::Instant::now() + RESIZE_SETTLE;
+                let mut resumed_during_settle = false;
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let timer = futures_timer::Delay::new(remaining);
+                    if let futures::future::Either::Right((Either::Right((result, _)), _)) =
+                        futures::future::select(
+                            timer,
+                            select(self.root_component.wait().boxed(), term.wait().boxed()),
+                        )
+                        .await
+                    {
+                        result?;
+                    }
+                    if term.take_resumed() {
+                        term.reinitialize_after_resume()?;
+                        prev_canvas = None;
+                        prev_terminal_size = None;
+                        resumed_during_settle = true;
+                        break;
+                    }
+                    if term.take_input_dispatched() {
+                        let _ = self.root_component.wait().now_or_never();
+                        term.resolve_pending_ctrl_c();
+                        break;
+                    }
+                    term.resolve_pending_ctrl_c();
+                    if self.system_context.should_exit() || term.received_ctrl_c() {
+                        break;
+                    }
+                    if term.take_resized() {
+                        deadline = std::time::Instant::now() + RESIZE_SETTLE;
+                    }
+                }
+                if resumed_during_settle {
+                    continue;
+                }
+                if self.system_context.should_exit() || term.received_ctrl_c() {
+                    break;
+                }
+            }
             // Self-healing: if the process was just resumed from suspension (Ctrl+Z
             // followed by `fg`), the shell has reset the terminal modes and overwritten
             // parts of the screen. Re-apply our modes and forget the previous canvas so
@@ -2085,6 +2142,7 @@ impl<'a> Tree<'a> {
                         prev_canvas.as_ref()
                     },
                 );
+                term.set_scrollback_replay(self.system_context.scrollback_replay());
                 let terminal_diff_planning = term.canvas_diff_planning();
                 let (should_repaint, repaint_reason, changed_cells, diff_rows_scanned) =
                     if matches!(

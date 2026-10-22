@@ -959,6 +959,7 @@ fn new_fullscreen_term(
         inline_pending_wrap: false,
         decstbm_safe: false,
         inline_force_full_rewrite_next_diff: false,
+        scrollback_replay: None,
         #[cfg(unix)]
         resume_signal: None,
     }
@@ -994,6 +995,7 @@ fn new_inline_term_with_size(
         inline_pending_wrap: false,
         decstbm_safe: false,
         inline_force_full_rewrite_next_diff: false,
+        scrollback_replay: None,
         #[cfg(unix)]
         resume_signal: None,
     }
@@ -2740,6 +2742,7 @@ fn test_resize_event_triggers_terminal_mode_reassertion() {
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
         input_dispatched: false,
+        resized: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -2789,6 +2792,7 @@ fn test_stdin_gap_reasserts_terminal_modes_like_cc_ink() {
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
         input_dispatched: false,
+        resized: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -2841,6 +2845,7 @@ fn test_same_size_resize_event_is_ignored() {
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
         input_dispatched: false,
+        resized: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -2969,6 +2974,7 @@ fn test_synchronized_update_wraps_clear_canvas_when_it_writes() {
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
         input_dispatched: false,
+        resized: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -3019,6 +3025,7 @@ fn test_synchronized_update_stays_lazy_for_identical_canvas_write() {
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
         input_dispatched: false,
+        resized: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -3066,6 +3073,7 @@ fn test_synchronized_update_wraps_current_damage_canvas_write() {
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
         input_dispatched: false,
+        resized: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -3124,6 +3132,7 @@ fn test_synchronized_update_wraps_previous_damage_canvas_write() {
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
         input_dispatched: false,
+        resized: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -3179,6 +3188,7 @@ fn test_synchronized_update_stays_lazy_for_identical_fullscreen_canvas_write() {
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
         input_dispatched: false,
+        resized: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -3255,6 +3265,7 @@ fn test_synchronized_update_wraps_pending_wrap_resolution() {
         query_queue: VecDeque::new(),
         pending_ctrl_c: Vec::new(),
         input_dispatched: false,
+        resized: false,
         received_ctrl_c: false,
         ignore_ctrl_c: false,
         suspend_on_ctrl_z: false,
@@ -3979,6 +3990,55 @@ fn test_inline_resize_forces_full_rewrite_even_when_canvas_identical() {
         diff.contains("hello") && diff.contains("world"),
         "resize reset should repaint the full canvas: {diff:?}"
     );
+}
+
+#[test]
+fn test_inline_width_resize_replays_scrollback_between_purge_and_canvas() {
+    let mut canvas = Canvas::new(10, 1);
+    canvas
+        .subview_mut(0, 0, 0, 0, 10, 1)
+        .set_text(0, 0, "live", CanvasTextStyle::default());
+
+    let (dest, diff_buf) = new_test_writer();
+    let mut term = new_inline_term_with_size(dest, canvas.height() as _, (10, 5));
+    term.prev_size_on_write = Some((12, 5));
+    term.scrollback_replay = Some(Arc::new(|width| {
+        let mut history = Canvas::new(width, 1);
+        history.subview_mut(0, 0, 0, 0, width, 1).set_text(
+            0,
+            0,
+            &format!("old@{width}"),
+            CanvasTextStyle::default(),
+        );
+        vec![history]
+    }));
+    term.write_canvas(Some(&canvas), &canvas).unwrap();
+
+    let diff = String::from_utf8_lossy(&diff_buf.lock().unwrap()).to_string();
+    let purge = diff
+        .find("\x1b[2J\x1b[3J\x1b[H")
+        .expect("width change purges");
+    let history = diff
+        .find("old@10")
+        .expect("history replays at the new width");
+    let live = diff.rfind("live").expect("canvas is rewritten");
+    assert!(purge < history && history < live, "{diff:?}");
+}
+
+#[test]
+fn test_inline_height_only_resize_keeps_scrollback() {
+    let mut canvas = Canvas::new(10, 2);
+    canvas
+        .subview_mut(0, 0, 0, 0, 10, 2)
+        .set_text(0, 0, "hello", CanvasTextStyle::default());
+
+    let (dest, diff_buf) = new_test_writer();
+    let mut term = new_inline_term_with_size(dest, canvas.height() as _, (10, 4));
+    term.prev_size_on_write = Some((10, 6));
+    term.write_canvas(Some(&canvas), &canvas).unwrap();
+
+    let diff = String::from_utf8_lossy(&diff_buf.lock().unwrap()).to_string();
+    assert!(!diff.contains("\x1b[3J"), "{diff:?}");
 }
 
 #[test]
