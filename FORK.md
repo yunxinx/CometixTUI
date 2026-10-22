@@ -13,3 +13,17 @@ It also changes how the inline renderer reacts to terminal resizes:
 - `SystemContext::set_scrollback_replay` registers a `ScrollbackReplay`. After every automatic purge (width change or offscreen reset) the renderer writes the canvases it returns for the new width above the live canvas, so applications can keep history older than their retained tree in scrollback.
 
 The regression tests live in `packages/iocraft/src/components/text_input.rs`, `packages/iocraft/src/components/keybinding_provider.rs`, `packages/iocraft/src/render/tests/render_loop.rs` (`test_resize_burst_paints_once_after_settling`, `test_resize_commits_submit_before_next_input`) and `packages/iocraft/src/terminal/tests/mod.rs` (`test_inline_width_resize_replays_scrollback_between_purge_and_canvas`, `test_inline_height_only_resize_keeps_scrollback`, `test_inline_height_shrink_restores_rows_below_cursor`). Consumers should pin a full commit SHA. Upstream MIT/Apache-2.0 licensing is unchanged.
+
+## iocraft upstream sync
+
+This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) changes up to `2158a53` on top of the base fork, which last merged `3e26e2b` (v0.9.1). Each change was re-implemented in this fork's structure; a closing `-s ours` merge records the sync point.
+
+### Ported
+
+### Fork fixes made during the sync
+
+### Breaking changes for consumers
+
+### Already covered
+
+### Not taken

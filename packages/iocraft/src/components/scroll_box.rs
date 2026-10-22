@@ -312,8 +312,10 @@ mod tests {
 
     #[component]
     fn FastScrollBoxProbe(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let mut system = hooks.use_context_mut::<SystemContext>();
         let mut handle = hooks.use_ref_default::<ScrollBoxHandle>();
         let mut did_queue = hooks.use_state(|| false);
+        let mut saw_pending = hooks.use_state(|| false);
         let mut ticks = hooks.use_state(|| 0usize);
 
         hooks.use_interval(
@@ -332,6 +334,12 @@ mod tests {
             let handle = handle.read();
             (handle.get_scroll_top(), handle.get_pending_delta())
         };
+        if pending != 0 && !saw_pending.get() {
+            saw_pending.set(true);
+        }
+        if saw_pending.get() && pending == 0 && top > 0 {
+            system.exit();
+        }
         let lines = (0..80)
             .map(|i| format!("Fast {i:02}"))
             .collect::<Vec<_>>()
@@ -351,12 +359,18 @@ mod tests {
 
     #[test]
     fn test_fast_scroll_box_defaults_to_opt_in_drain() {
-        let canvases: Vec<_> = smol::block_on(
-            element!(FastScrollBoxProbe)
+        let canvases = smol::block_on(async {
+            let mut root = element!(FastScrollBoxProbe);
+            let render_loop = root
                 .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter(vec![])))
-                .take(12)
-                .collect(),
-        );
+                .collect::<Vec<_>>();
+            let timeout = futures_timer::Delay::new(std::time::Duration::from_secs(5));
+            let result = futures::future::select(Box::pin(render_loop), Box::pin(timeout)).await;
+            let futures::future::Either::Left((canvases, _)) = result else {
+                panic!("FastScrollBox drain did not complete within 5 seconds");
+            };
+            canvases
+        });
         let outputs = canvases
             .iter()
             .map(|canvas| canvas.to_string())

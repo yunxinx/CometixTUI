@@ -108,7 +108,7 @@ pub(crate) fn detect_with_env(
     };
     if boosted > 2
         && env("TMUX").is_some_and(|v| !v.is_empty())
-        && !env("CLAUDE_CODE_TMUX_TRUECOLOR").is_some_and(|v| !v.is_empty())
+        && env("CLAUDE_CODE_TMUX_TRUECOLOR").is_none_or(|v| v.is_empty())
     {
         2
     } else {
