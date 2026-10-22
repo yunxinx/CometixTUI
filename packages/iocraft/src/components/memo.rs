@@ -336,7 +336,11 @@ mod tests {
         let last = frames.last().unwrap();
         assert!(last.contains("relay 1"), "{frames:?}");
         assert!(
-            settle_rounds.lock().unwrap().iter().any(|&rounds| rounds > 0),
+            settle_rounds
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|&rounds| rounds > 0),
             "the key frame must take a settle round for this to test anything"
         );
         assert!(

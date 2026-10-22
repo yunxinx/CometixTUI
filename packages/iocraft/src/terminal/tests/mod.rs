@@ -4042,6 +4042,103 @@ fn test_inline_height_only_resize_keeps_scrollback() {
 }
 
 #[test]
+fn test_inline_height_shrink_restores_rows_below_cursor() {
+    use crate::canvas::CursorDeclaration;
+
+    for (prev_rows, next_rows) in [(8, 4), (4, 2)] {
+        for cursor_row in [0, 3, 5] {
+            let mut canvas = Canvas::new(10, 6);
+            for y in 0..6 {
+                canvas.subview_mut(0, 0, 0, 0, 10, 6).set_text(
+                    0,
+                    y as isize,
+                    &format!("row{y}"),
+                    CanvasTextStyle::default(),
+                );
+            }
+            let (dest, buf) = new_test_writer();
+            let mut term = new_inline_term_with_size(dest, canvas.height() as _, (10, prev_rows));
+            let declaration = Some(CursorDeclaration {
+                x: 0,
+                y: cursor_row,
+                visible: true,
+            });
+            // Start from an established retained frame, as in inline_diff_vt.
+            term.prev_size_on_write = term.size;
+            canvas
+                .write_ansi_without_final_newline(&mut *term.dest)
+                .unwrap();
+            term.position_cursor(declaration).unwrap();
+            let mut vt = avt::Vt::new(10, prev_rows as usize);
+            let history = (0..8).map(|y| format!("old{y}")).collect::<Vec<_>>();
+            vt.feed_str(&(history.join("\r\n") + "\r\n"));
+            vt.feed_str(&String::from_utf8(buf.lock().unwrap().clone()).unwrap());
+            assert_eq!(vt.line(prev_rows as usize - 1).text().trim_end(), "row5");
+            assert_eq!(
+                vt.cursor().row,
+                (cursor_row + prev_rows as usize).saturating_sub(6)
+            );
+            buf.lock().unwrap().clear();
+
+            vt.resize(10, next_rows as usize);
+            term.set_size_from_resize_event(10, next_rows);
+            assert!(term.write_canvas_would_write(Some(&canvas), &canvas) || cursor_row == 5);
+            term.write_canvas(Some(&canvas), &canvas).unwrap();
+            term.position_cursor(declaration).unwrap();
+            let bytes = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            vt.feed_str(&bytes);
+            let lines = (0..next_rows as usize)
+                .map(|y| vt.line(y).text().trim_end().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                lines,
+                (6 - next_rows..6)
+                    .map(|y| format!("row{y}"))
+                    .collect::<Vec<_>>(),
+                "cursor row {cursor_row}"
+            );
+            assert_eq!(
+                vt.cursor().row,
+                (cursor_row + next_rows as usize).saturating_sub(6)
+            );
+            assert!(
+                !bytes.contains("\x1b[3J"),
+                "height repair must preserve scrollback: {bytes:?}"
+            );
+            let expected = history
+                .into_iter()
+                .chain((0..6).map(|y| format!("row{y}")))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                vt.lines()
+                    .map(|line| line.text().trim_end().to_string())
+                    .collect::<Vec<_>>(),
+                expected,
+                "restoring the cursor tail must neither lose nor duplicate history"
+            );
+
+            // A subsequent diff must still use the correct canvas-bottom baseline.
+            buf.lock().unwrap().clear();
+            let mut next = canvas.clone();
+            next.subview_mut(0, 0, 0, 0, 10, 6).set_text(
+                0,
+                5,
+                "updated",
+                CanvasTextStyle::default(),
+            );
+            term.write_canvas(Some(&canvas), &next).unwrap();
+            term.position_cursor(declaration).unwrap();
+            vt.feed_str(&String::from_utf8(buf.lock().unwrap().clone()).unwrap());
+            assert_eq!(vt.line(next_rows as usize - 1).text().trim_end(), "updated");
+            assert_eq!(
+                vt.cursor().row,
+                (cursor_row + next_rows as usize).saturating_sub(6)
+            );
+        }
+    }
+}
+
+#[test]
 fn test_fullscreen_diff_identical_canvas_is_noop() {
     let mut canvas = Canvas::new(10, 2);
     canvas

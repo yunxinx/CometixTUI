@@ -855,6 +855,9 @@ impl TerminalImpl for StdTerminal<'_> {
     }
 
     fn write_canvas(&mut self, prev: Option<&Canvas>, canvas: &Canvas) -> io::Result<()> {
+        if let Some(prev) = prev {
+            self.restore_inline_rows_after_height_shrink(prev)?;
+        }
         self.restore_cursor_baseline()?;
         let Some(prev) = prev else {
             // No previous canvas: full write.
@@ -1594,6 +1597,41 @@ impl<'a> StdTerminal<'a> {
         }
 
         Ok(true)
+    }
+
+    /// A shorter viewport may discard rows below the physical caret. CNL only
+    /// clamps at the screen bottom, so it cannot restore the retained baseline.
+    /// Replay the previous canvas's tail with CRLF to recreate any lost rows and
+    /// scroll naturally. The normal diff can then safely apply the next canvas,
+    /// without clearing native scrollback.
+    fn restore_inline_rows_after_height_shrink(&mut self, prev: &Canvas) -> io::Result<()> {
+        if self.fullscreen || self.cursor_displacement_rows == 0 {
+            return Ok(());
+        }
+        let (Some((prev_cols, prev_rows)), Some((cols, rows))) =
+            (self.prev_size_on_write, self.size)
+        else {
+            return Ok(());
+        };
+        if cols != prev_cols || rows >= prev_rows || rows == 0 {
+            return Ok(());
+        }
+
+        // A declaration above the old viewport was clamped to its top. Only
+        // replay rows that were below that physical cursor, not older history.
+        let tail_rows = self.cursor_displacement_rows.min(
+            prev_rows
+                .saturating_sub(1)
+                .saturating_sub(self.inline_bottom_gap),
+        );
+        let first_row = prev.height().saturating_sub(tail_rows as usize);
+        for y in first_row..prev.height() {
+            self.write_inline_newline()?;
+            self.write_inline_canvas_row_without_newline(prev, y)?;
+        }
+        self.cursor_displacement_rows = 0;
+        self.inline_bottom_gap = self.inline_bottom_gap.saturating_sub(prev_rows - rows);
+        Ok(())
     }
 
     /// Undoes any cursor displacement left behind by a cursor declaration, returning

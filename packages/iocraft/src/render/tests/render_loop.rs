@@ -201,6 +201,75 @@ async fn test_resize_burst_paints_once_after_settling() {
     assert_eq!(actual[1], "width: 70\n");
 }
 
+#[component]
+fn ResizeSubmitOwner(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let (mut value, mut submitted) = *hooks.use_context::<(State<String>, State<String>)>();
+    hooks.use_propagated_terminal_events(move |event| {
+        if matches!(event.event(), TerminalEvent::Key(key) if key.code == KeyCode::Enter && key.kind != KeyEventKind::Release)
+        {
+            submitted.set(value.to_string());
+            value.set(String::new());
+            event.stop_propagation();
+        }
+    });
+    element!(View(width: 0, height: 0))
+}
+
+#[component]
+fn ControlledResizeInput(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let mut value = hooks.use_state(|| "hi".to_string());
+    let submitted = hooks.use_state(String::new);
+    element! {
+        ContextProvider(value: Context::owned((value, submitted))) {
+            View(width: 20, flex_direction: FlexDirection::Column) {
+                Text(content: format!("sent={submitted}"))
+                ResizeSubmitOwner
+                TextInput(has_focus: true, value: value.to_string(), on_change: move |text| value.set(text))
+            }
+        }
+    }
+}
+
+#[apply(test!)]
+async fn test_resize_commits_submit_before_next_input() {
+    for push_wake in [true, false] {
+        crate::render::wake::set_push_wake_for_tests(Some(push_wake));
+        for throttle in [None, Some(Duration::from_secs(60))] {
+            for input in [
+                TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char('x'))),
+                TerminalEvent::Paste("x".to_string()),
+            ] {
+                // Ready events and a long throttle exercise the input interruption
+                // deterministically, without sleeps or dependence on CI scheduling.
+                let events = futures::stream::iter([
+                    TerminalEvent::Resize(90, 25),
+                    TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Enter)),
+                    input,
+                    TerminalEvent::Key(KeyEvent {
+                        kind: KeyEventKind::Press,
+                        code: KeyCode::Char('c'),
+                        modifiers: KeyModifiers::CONTROL,
+                    }),
+                ]);
+                let mut element = element!(ControlledResizeInput);
+                let helper = element.helper();
+                let (term, output) =
+                    Terminal::mock(MockTerminalConfig::with_events(events).with_size(80, 24));
+                let render_loop = async {
+                    let mut tree = Tree::new(element.props_mut(), helper);
+                    tree.terminal_render_loop(term, throttle, None)
+                        .await
+                        .unwrap();
+                };
+                let (_, canvases) = futures::join!(render_loop, output.collect::<Vec<_>>());
+                let frames = canvases.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+                assert_eq!(frames.last().unwrap(), "sent=hi\nx \n", "{frames:?}");
+            }
+        }
+    }
+    crate::render::wake::set_push_wake_for_tests(None);
+}
+
 #[derive(Default, Props)]
 struct AvailableHeightProbeProps;
 

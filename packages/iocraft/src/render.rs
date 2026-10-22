@@ -2093,6 +2093,8 @@ impl<'a> Tree<'a> {
                         break;
                     }
                     if term.take_input_dispatched() {
+                        // This input's frame also commits any pending resize.
+                        let _ = term.take_resized();
                         let _ = self.root_component.wait().now_or_never();
                         term.resolve_pending_ctrl_c();
                         break;
@@ -2320,6 +2322,7 @@ impl<'a> Tree<'a> {
             }
             if term.take_input_dispatched() {
                 // Commit controlled input state before dispatching the next input event.
+                let _ = term.take_resized();
                 let _ = self.root_component.wait().now_or_never();
                 term.resolve_pending_ctrl_c();
                 continue;
@@ -2378,6 +2381,9 @@ impl<'a> Tree<'a> {
                         Ok::<bool, io::Error>(timed_out)
                     }?;
                     if term.take_input_dispatched() {
+                        // Render the input before waiting on another event, even
+                        // when a resize arrived earlier in this throttle window.
+                        let _ = term.take_resized();
                         let _ = self.root_component.wait().now_or_never();
                         term.resolve_pending_ctrl_c();
                         break;
