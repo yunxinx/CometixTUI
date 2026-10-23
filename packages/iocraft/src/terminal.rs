@@ -447,6 +447,19 @@ impl<'a> Terminal<'a> {
         self.inner.set_scrollback_replay(replay);
     }
 
+    /// Puts back the main-screen rows a shorter terminal cut below a displaced cursor, from
+    /// the previous inline frame.
+    pub(crate) fn restore_inline_rows_after_height_shrink(
+        &mut self,
+        prev: &Canvas,
+    ) -> io::Result<()> {
+        if !self.inner.restore_inline_rows_would_write() {
+            return Ok(());
+        }
+        self.ensure_synchronized_update_started()?;
+        self.inner.restore_inline_rows_after_height_shrink(prev)
+    }
+
     pub(crate) fn write_canvas_after_repaint_check(
         &mut self,
         prev: Option<&Canvas>,

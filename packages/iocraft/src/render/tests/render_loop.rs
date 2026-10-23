@@ -1418,3 +1418,66 @@ fn test_negative_dimensions() {
     .to_string();
     assert_eq!(actual, "\n\n\n\n\n",);
 }
+
+#[component]
+fn NestedRows() -> impl Into<AnyElement<'static>> {
+    element! {
+        View(flex_direction: FlexDirection::Column) {
+            #((0..3).map(|row| element! {
+                View(key: row) {
+                    Text(content: format!("row {row}"))
+                }
+            }))
+        }
+    }
+}
+
+// Shows and hides a nested subtree under a transparent wrapper twice, then exits.
+#[component]
+fn ToggledSubtreeApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let mut system = hooks.use_context_mut::<SystemContext>();
+    let step = hooks.use_state(|| 0u8);
+    let mut step_for_future = step;
+    hooks.use_future(async move {
+        for _ in 0..4 {
+            smol::Timer::after(Duration::from_millis(20)).await;
+            step_for_future.set(step_for_future.get() + 1);
+        }
+    });
+    if step.get() == 4 {
+        system.exit();
+    }
+    element! {
+        View(flex_direction: FlexDirection::Column) {
+            Text(content: format!("step {}", step.get()))
+            #((step.get() % 2 == 1).then(|| element! {
+                Fragment {
+                    NestedRows
+                }
+            }))
+        }
+    }
+}
+
+#[apply(test!)]
+async fn test_unmounted_subtrees_leave_no_layout_nodes() {
+    let node_counts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let node_counts_cb = std::sync::Arc::clone(&node_counts);
+    let _frames = element!(ToggledSubtreeApp)
+        .mock_terminal_render_loop_with_profile(MockTerminalConfig::default(), move |event| {
+            node_counts_cb
+                .lock()
+                .unwrap()
+                .push(event.phases.layout_nodes)
+        })
+        .collect::<Vec<_>>()
+        .await;
+    let node_counts = node_counts.lock().unwrap().clone();
+    let distinct: std::collections::BTreeSet<_> = node_counts.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        2,
+        "every hidden frame has the same nodes, as does every shown one: {node_counts:?}"
+    );
+    assert_eq!(node_counts.first(), node_counts.last(), "{node_counts:?}");
+}

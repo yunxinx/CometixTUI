@@ -756,10 +756,7 @@ impl<'a, 'b, 'c, 'w> ComponentUpdater<'a, 'b, 'c, 'w> {
                     .expect("we should be able to set the children");
 
                 for component in self.children.components.iter() {
-                    self.context
-                        .layout_engine
-                        .remove(component.node_id())
-                        .expect("we should be able to remove the node");
+                    component.remove_layout_nodes(self.context.layout_engine);
                 }
                 self.children.components = used_components.into();
             });
@@ -2174,6 +2171,12 @@ impl<'a> Tree<'a> {
             let mut repaint = None;
             let sync_wrap_start = profile_enabled.then(std::time::Instant::now);
             term.synchronized_update(|mut term| {
+                // This frame may switch to an alternate screen, which keeps the main screen
+                // as it stands: first put back the rows a shorter terminal cut below the
+                // cursor, while the previous main-screen frame is at hand.
+                if let Some(prev) = prev_canvas.as_ref() {
+                    term.restore_inline_rows_after_height_shrink(prev)?;
+                }
                 let mut output = self.render(
                     terminal_size.map(|(w, _)| w as usize),
                     Some(&mut term),

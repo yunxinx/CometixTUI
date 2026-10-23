@@ -3507,75 +3507,270 @@ fn test_dynamic_alternate_screen_enters_clears_homes_and_exits() {
     );
 }
 
-fn inline_frame(rows: usize, last_row: &str) -> Canvas {
-    let mut canvas = Canvas::new(10, rows);
-    for row in 0..rows {
-        let text = if row + 1 == rows {
-            last_row.to_string()
-        } else {
-            format!("frame{row}")
-        };
-        canvas.subview_mut(0, 0, 0, 0, 10, rows).set_text(
-            0,
-            row as isize,
-            &text,
-            CanvasTextStyle::default(),
-        );
-    }
-    canvas
+/// A real inline backend fed scripted input, so a test can run the render loop and read the
+/// bytes it writes. Its size changes only through resize events.
+struct ScriptedTerminal {
+    inner: StdTerminal<'static>,
+    events: Option<BoxStream<'static, TerminalEvent>>,
 }
 
-/// Feeds an inline frame, an optional dynamic alternate-screen round trip and an edited
-/// frame through a terminal, returning every non-blank line of the screen and scrollback.
-fn inline_frames_with_round_trip(frame_rows: usize, round_trip: bool) -> Vec<String> {
-    let before = inline_frame(frame_rows, "editor");
-    let after = inline_frame(frame_rows, "edited");
-    let mut alternate = Canvas::new(10, 4);
-    alternate
-        .subview_mut(0, 0, 0, 0, 10, 4)
-        .set_text(0, 0, "alt", CanvasTextStyle::default());
-
-    let (dest, buf) = new_test_writer();
-    let mut term = new_inline_term_with_size(dest, 0, (10, 4));
-    let mut vt = avt::Vt::new(10, 4);
-    vt.feed_str("history\r\n");
-    term.write_canvas(None, &before).unwrap();
-    term.write_canvas(Some(&before), &before).unwrap();
-    if round_trip {
-        term.set_dynamic_alternate_screen(Some(crate::context::AlternateScreenRequest {
-            mouse_tracking: false,
-        }))
-        .unwrap();
-        term.write_canvas(None, &alternate).unwrap();
-        term.set_dynamic_alternate_screen(None).unwrap();
+impl Write for ScriptedTerminal {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
     }
-    term.write_canvas(Some(&before), &after).unwrap();
-    term.dest.flush().unwrap();
-    vt.feed_str(&String::from_utf8(buf.lock().unwrap().clone()).unwrap());
-    vt.text()
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl TerminalImpl for ScriptedTerminal {
+    fn size(&self) -> Option<(u16, u16)> {
+        self.inner.size()
+    }
+
+    fn set_size_from_resize_event(&mut self, width: u16, height: u16) {
+        self.inner.set_size_from_resize_event(width, height);
+    }
+
+    fn is_raw_mode_enabled(&self) -> bool {
+        self.inner.is_raw_mode_enabled()
+    }
+
+    fn is_fullscreen(&self) -> bool {
+        self.inner.is_fullscreen()
+    }
+
+    fn set_dynamic_alternate_screen(
+        &mut self,
+        request: Option<crate::context::AlternateScreenRequest>,
+    ) -> io::Result<bool> {
+        self.inner.set_dynamic_alternate_screen(request)
+    }
+
+    fn set_scrollback_replay(&mut self, replay: Option<crate::context::ScrollbackReplay>) {
+        self.inner.set_scrollback_replay(replay);
+    }
+
+    fn set_decstbm_safe(&mut self, safe: bool) {
+        self.inner.set_decstbm_safe(safe);
+    }
+
+    fn position_cursor(
+        &mut self,
+        declaration: Option<crate::canvas::CursorDeclaration>,
+    ) -> io::Result<()> {
+        self.inner.position_cursor(declaration)
+    }
+
+    fn position_cursor_would_write(
+        &self,
+        declaration: Option<crate::canvas::CursorDeclaration>,
+    ) -> bool {
+        self.inner.position_cursor_would_write(declaration)
+    }
+
+    fn clear_canvas_would_write(&self) -> bool {
+        self.inner.clear_canvas_would_write()
+    }
+
+    fn clear_canvas(&mut self) -> io::Result<()> {
+        self.inner.clear_canvas()
+    }
+
+    fn clear_screen(&mut self) -> io::Result<()> {
+        self.inner.clear_screen()
+    }
+
+    fn clear_terminal(&mut self) -> io::Result<()> {
+        self.inner.clear_terminal()
+    }
+
+    fn restore_inline_rows_would_write(&self) -> bool {
+        self.inner.restore_inline_rows_would_write()
+    }
+
+    fn restore_inline_rows_after_height_shrink(&mut self, prev: &Canvas) -> io::Result<()> {
+        self.inner.restore_inline_rows_after_height_shrink(prev)
+    }
+
+    fn write_canvas_would_write(&self, prev: Option<&Canvas>, canvas: &Canvas) -> bool {
+        self.inner.write_canvas_would_write(prev, canvas)
+    }
+
+    fn write_canvas(&mut self, prev: Option<&Canvas>, canvas: &Canvas) -> io::Result<()> {
+        self.inner.write_canvas(prev, canvas)
+    }
+
+    fn event_stream(&mut self) -> io::Result<BoxStream<'static, io::Result<TerminalEvent>>> {
+        Ok(self
+            .events
+            .take()
+            .map(|events| events.map(Ok).chain(stream::pending()).boxed())
+            .unwrap_or_else(|| stream::pending().boxed()))
+    }
+
+    fn dest(&mut self) -> &mut dyn Write {
+        self.inner.dest()
+    }
+
+    fn alt(&mut self) -> &mut dyn Write {
+        self.inner.alt()
+    }
+}
+
+#[derive(Default, Props)]
+struct CaretProps {
+    text: String,
+}
+
+#[component]
+fn Caret(mut hooks: Hooks, props: &CaretProps) -> impl Into<AnyElement<'static>> {
+    hooks.use_declared_cursor(0, props.text.len() as isize, true);
+    element!(Text(content: props.text.clone()))
+}
+
+/// History rows, a caret row with two blank rows below it, and an alternate screen: `e` edits
+/// the first row, `t` types at the caret, `o` opens the alternate screen, `q` closes it and
+/// `x` exits.
+#[component]
+fn MainScreenWithAlternate(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let mut system = hooks.use_context_mut::<SystemContext>();
+    let mut edited = hooks.use_state(|| false);
+    let mut typed = hooks.use_state(|| false);
+    let mut alternate = hooks.use_state(|| false);
+    let mut exit = hooks.use_state(|| false);
+    hooks.use_terminal_events(move |event| {
+        if let TerminalEvent::Key(KeyEvent {
+            code: KeyCode::Char(key),
+            kind: KeyEventKind::Press,
+            ..
+        }) = event
+        {
+            match key {
+                'e' => edited.set(true),
+                't' => typed.set(true),
+                'o' => alternate.set(true),
+                'q' => alternate.set(false),
+                'x' => exit.set(true),
+                _ => {}
+            }
+        }
+    });
+    if exit.get() {
+        system.exit();
+    }
+    if alternate.get() {
+        return element! {
+            AlternateScreen {
+                Text(content: "alt")
+            }
+        }
+        .into_any();
+    }
+    let first = if edited.get() { "edited" } else { "frame0" };
+    element! {
+        View(flex_direction: FlexDirection::Column) {
+            #((0..4).map(|row| element! {
+                Text(key: row, content: if row == 0 { first.to_string() } else { format!("frame{row}") })
+            }))
+            Caret(text: if typed.get() { "> t" } else { "> " })
+            View(height: 2)
+        }
+    }
+    .into_any()
+}
+
+/// Runs the render loop over a real inline backend on a `size` terminal, then replays the bytes
+/// into a virtual terminal that holds a line of earlier history and resizes where the backend
+/// saw each resize event. Returns the non-blank lines of scrollback and screen, and the bytes.
+fn run_main_screen_with_alternate(
+    size: (u16, u16),
+    events: Vec<TerminalEvent>,
+) -> (Vec<String>, String) {
+    let (dest, buf) = new_test_writer();
+    let resizes = Arc::new(Mutex::new(Vec::new()));
+    let events = {
+        let buf = buf.clone();
+        let resizes = resizes.clone();
+        stream::iter(events)
+            .inspect(move |event| {
+                if let TerminalEvent::Resize(width, height) = event {
+                    resizes
+                        .lock()
+                        .unwrap()
+                        .push((buf.lock().unwrap().len(), *width, *height));
+                }
+            })
+            .boxed()
+    };
+    let (mut terminal, _output) = Terminal::mock(MockTerminalConfig::default());
+    terminal.inner = Box::new(ScriptedTerminal {
+        inner: new_inline_term_with_size(dest, 0, size),
+        events: Some(events),
+    });
+    smol::block_on(crate::render::terminal_render_loop(
+        &mut element!(MainScreenWithAlternate),
+        terminal,
+        None,
+        None,
+    ))
+    .unwrap();
+
+    let bytes = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let mut vt = avt::Vt::new(size.0 as usize, size.1 as usize);
+    vt.feed_str("history\r\n");
+    let mut replayed = 0;
+    for &(offset, width, height) in resizes.lock().unwrap().iter() {
+        vt.feed_str(&bytes[replayed..offset]);
+        vt.resize(width as usize, height as usize);
+        replayed = offset;
+    }
+    vt.feed_str(&bytes[replayed..]);
+    let lines = vt
+        .text()
         .into_iter()
         .map(|line| line.trim_end().to_string())
         .filter(|line| !line.is_empty())
-        .collect()
+        .collect();
+    (lines, bytes)
 }
 
-/// Leaving a dynamic alternate screen resumes the inline frame the main screen still
-/// shows: the next frame diffs against it, so screen and scrollback end up exactly as
-/// if the alternate screen had never been shown, including for frames taller than the
-/// terminal.
+/// Leaving a dynamic alternate screen resumes the inline frame the main screen still shows,
+/// so scrollback and screen end up as if the alternate screen had never been shown; the
+/// frames are taller than the terminal. Right after the first frame, nothing on the main
+/// screen has changed and nothing is rewritten. After a height shrink, the rows the terminal
+/// cut below the cursor come back before the main screen is set aside.
 #[test]
 fn test_dynamic_alternate_screen_round_trip_leaves_no_trace_on_the_main_screen() {
-    assert_eq!(
-        inline_frames_with_round_trip(3, true),
-        ["history", "frame0", "frame1", "edited"]
+    let key = |character| {
+        TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char(character)))
+    };
+
+    let (lines, bytes) =
+        run_main_screen_with_alternate((10, 4), vec![key('o'), key('q'), key('x')]);
+    let (untouched, _) = run_main_screen_with_alternate((10, 4), vec![key('x')]);
+    assert_eq!(lines, untouched);
+    assert!(
+        !bytes.contains("\x1b[3J"),
+        "an unchanged main screen must keep scrollback: {bytes:?}"
     );
-    for frame_rows in [3, 6] {
-        assert_eq!(
-            inline_frames_with_round_trip(frame_rows, true),
-            inline_frames_with_round_trip(frame_rows, false),
-            "frame of {frame_rows} rows"
-        );
-    }
+
+    let shrink = TerminalEvent::Resize(10, 5);
+    let (lines, _) = run_main_screen_with_alternate(
+        (10, 6),
+        vec![
+            key('e'),
+            shrink.clone(),
+            key('o'),
+            key('q'),
+            key('t'),
+            key('x'),
+        ],
+    );
+    let (untouched, _) =
+        run_main_screen_with_alternate((10, 6), vec![key('e'), shrink, key('t'), key('x')]);
+    assert_eq!(lines, untouched);
 }
 
 #[test]

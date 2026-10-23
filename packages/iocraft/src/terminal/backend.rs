@@ -174,6 +174,15 @@ pub(super) trait TerminalImpl: Write + Send {
     fn clear_terminal(&mut self) -> io::Result<()> {
         self.clear_canvas()
     }
+    /// Whether [`Self::restore_inline_rows_after_height_shrink`] has anything to do.
+    fn restore_inline_rows_would_write(&self) -> bool {
+        false
+    }
+    /// Puts back, from the previous inline frame, the rows a shorter viewport cut below a
+    /// displaced cursor, returning the cursor to the canvas's last row.
+    fn restore_inline_rows_after_height_shrink(&mut self, _prev: &Canvas) -> io::Result<()> {
+        Ok(())
+    }
     #[cfg_attr(not(test), allow(dead_code))]
     fn write_canvas_would_write(&self, _prev: Option<&Canvas>, _canvas: &Canvas) -> bool {
         true
@@ -826,7 +835,40 @@ impl TerminalImpl for StdTerminal<'_> {
         Ok(())
     }
 
+    fn restore_inline_rows_would_write(&self) -> bool {
+        self.inline_height_shrink_below_cursor().is_some()
+    }
+
+    /// A shorter viewport may discard rows below the physical caret. CNL only
+    /// clamps at the screen bottom, so it cannot restore the retained baseline.
+    /// Replay the previous canvas's tail with CRLF to recreate any lost rows and
+    /// scroll naturally. The normal diff can then safely apply the next canvas,
+    /// without clearing native scrollback.
+    fn restore_inline_rows_after_height_shrink(&mut self, prev: &Canvas) -> io::Result<()> {
+        let Some((prev_rows, rows)) = self.inline_height_shrink_below_cursor() else {
+            return Ok(());
+        };
+        // A declaration above the old viewport was clamped to its top. Only
+        // replay rows that were below that physical cursor, not older history.
+        let tail_rows = self.cursor_displacement_rows.min(
+            prev_rows
+                .saturating_sub(1)
+                .saturating_sub(self.inline_bottom_gap),
+        );
+        let first_row = prev.height().saturating_sub(tail_rows as usize);
+        for y in first_row..prev.height() {
+            self.write_inline_newline()?;
+            self.write_inline_canvas_row_without_newline(prev, y)?;
+        }
+        self.cursor_displacement_rows = 0;
+        self.inline_bottom_gap = self.inline_bottom_gap.saturating_sub(prev_rows - rows);
+        Ok(())
+    }
+
     fn write_canvas_would_write(&self, prev: Option<&Canvas>, canvas: &Canvas) -> bool {
+        if self.inline_full_rewrite_deferred(prev, canvas) {
+            return false;
+        }
         if self.inline_pending_wrap || self.cursor_displacement_rows > 0 {
             return true;
         }
@@ -876,6 +918,9 @@ impl TerminalImpl for StdTerminal<'_> {
     }
 
     fn write_canvas(&mut self, prev: Option<&Canvas>, canvas: &Canvas) -> io::Result<()> {
+        if self.inline_full_rewrite_deferred(prev, canvas) {
+            return Ok(());
+        }
         if let Some(prev) = prev {
             self.restore_inline_rows_after_height_shrink(prev)?;
         }
@@ -1620,39 +1665,30 @@ impl<'a> StdTerminal<'a> {
         Ok(true)
     }
 
-    /// A shorter viewport may discard rows below the physical caret. CNL only
-    /// clamps at the screen bottom, so it cannot restore the retained baseline.
-    /// Replay the previous canvas's tail with CRLF to recreate any lost rows and
-    /// scroll naturally. The normal diff can then safely apply the next canvas,
-    /// without clearing native scrollback.
-    fn restore_inline_rows_after_height_shrink(&mut self, prev: &Canvas) -> io::Result<()> {
+    /// Whether an inline frame repeats what the screen holds, the same canvas at the size it
+    /// was written at, while the full rewrite owed to the first diff is still pending. The
+    /// rewrite waits for a frame that changes something, so returning from a dynamic
+    /// alternate screen to an unchanged main screen writes nothing.
+    fn inline_full_rewrite_deferred(&self, prev: Option<&Canvas>, canvas: &Canvas) -> bool {
+        !self.fullscreen
+            && self.inline_force_full_rewrite_next_diff
+            && self.prev_size_on_write == self.size
+            && !canvas.should_force_full_repaint()
+            && prev == Some(canvas)
+    }
+
+    /// The previous and current viewport rows, when the viewport got shorter at the
+    /// same width while a cursor declaration held the cursor above the canvas's last row.
+    fn inline_height_shrink_below_cursor(&self) -> Option<(u16, u16)> {
         if self.fullscreen || self.cursor_displacement_rows == 0 {
-            return Ok(());
+            return None;
         }
         let (Some((prev_cols, prev_rows)), Some((cols, rows))) =
             (self.prev_size_on_write, self.size)
         else {
-            return Ok(());
+            return None;
         };
-        if cols != prev_cols || rows >= prev_rows || rows == 0 {
-            return Ok(());
-        }
-
-        // A declaration above the old viewport was clamped to its top. Only
-        // replay rows that were below that physical cursor, not older history.
-        let tail_rows = self.cursor_displacement_rows.min(
-            prev_rows
-                .saturating_sub(1)
-                .saturating_sub(self.inline_bottom_gap),
-        );
-        let first_row = prev.height().saturating_sub(tail_rows as usize);
-        for y in first_row..prev.height() {
-            self.write_inline_newline()?;
-            self.write_inline_canvas_row_without_newline(prev, y)?;
-        }
-        self.cursor_displacement_rows = 0;
-        self.inline_bottom_gap = self.inline_bottom_gap.saturating_sub(prev_rows - rows);
-        Ok(())
+        (cols == prev_cols && rows < prev_rows && rows > 0).then_some((prev_rows, rows))
     }
 
     /// Undoes any cursor displacement left behind by a cursor declaration, returning
