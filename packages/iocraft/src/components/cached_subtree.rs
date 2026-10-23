@@ -26,6 +26,7 @@ struct CachedSubtreeSnapshot {
     key: String,
     width: u16,
     height: u16,
+    clip_rect: taffy::Rect<u16>,
     canvas: Canvas,
 }
 
@@ -52,6 +53,8 @@ impl Hook for CachedSubtreeHook {
         if snapshot.key != self.key
             || snapshot.width != size.width
             || snapshot.height != size.height
+            // Descendant hit regions must be refreshed when ancestor clipping changes.
+            || snapshot.clip_rect != drawer.clip_rect()
         {
             return;
         }
@@ -87,6 +90,7 @@ impl Hook for CachedSubtreeHook {
         }
         let size = drawer.size();
         let pos = drawer.canvas_position();
+        let clip_rect = drawer.clip_rect();
         if size.width == 0 || size.height == 0 || pos.x < 0 || pos.y < 0 {
             self.snapshot = None;
             return;
@@ -104,6 +108,7 @@ impl Hook for CachedSubtreeHook {
             key: self.key.clone(),
             width: size.width,
             height: size.height,
+            clip_rect,
             canvas,
         });
     }

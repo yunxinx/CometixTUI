@@ -29,14 +29,14 @@ pub struct ButtonState {
 #[non_exhaustive]
 #[derive(Default, Props)]
 pub struct ButtonProps<'a> {
-    /// The children of the component. Exactly one child is expected.
+    /// Any number of children, laid out together inside a single [`View`].
     pub children: Vec<AnyElement<'a>>,
 
     /// The handler to invoke when the button is triggered.
     ///
     /// The button can be triggered two ways:
     ///
-    /// - By clicking on it with the mouse while in fullscreen mode.
+    /// - By clicking on it with the primary mouse button while in fullscreen mode.
     /// - By pressing the Enter or Space key while [`has_focus`](Self::has_focus) is `true`,
     ///   or while the button is registered with a [`FocusScope`](super::FocusScope)
     ///   via [`focusable`](Self::focusable).

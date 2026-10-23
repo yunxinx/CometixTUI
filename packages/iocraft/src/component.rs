@@ -17,7 +17,7 @@ use core::{
 };
 use futures::future::poll_fn;
 use std::sync::Arc;
-use taffy::NodeId;
+use taffy::{NodeId, Rect};
 
 pub(crate) struct ComponentHelper<C: Component> {
     _marker: PhantomData<C>,
@@ -164,6 +164,9 @@ pub(crate) struct InstantiatedComponent {
     // Absolute canvas rectangle this subtree drew into last frame. A blit is
     // only attempted when the current layout resolves to the same rectangle.
     cached_blit_bounds: Option<(usize, usize, usize, usize)>,
+    // A changed ancestor clip requires drawing again so descendant event
+    // regions and local mouse coordinates reflect the visible output.
+    cached_blit_clip_rect: Rect<u16>,
     // Push-mode wake routing (Phase W): the dirty bit any wake from this
     // component's hooks/futures lands on, plus the shared route to the render
     // loop. `proxy_waker` is the cached `Waker` built from it.
@@ -193,6 +196,7 @@ impl InstantiatedComponent {
             subtree_retained: false,
             children_updated_since_draw: false,
             cached_blit_bounds: None,
+            cached_blit_clip_rect: Rect::default(),
             wake_state,
             proxy_waker,
         }
@@ -277,7 +281,10 @@ impl InstantiatedComponent {
                 };
                 if self.subtree_retained && single_child {
                     if let Some(rect) = subtree_rect {
-                        if self.cached_blit_bounds == Some(rect) && drawer.try_retained_blit(rect) {
+                        if self.cached_blit_bounds == Some(rect)
+                            && self.cached_blit_clip_rect == drawer.clip_rect()
+                            && drawer.try_retained_blit(rect)
+                        {
                             return;
                         }
                     }
@@ -300,6 +307,7 @@ impl InstantiatedComponent {
             self.cached_blit_bounds = None;
         }
 
+        self.cached_blit_clip_rect = drawer.clip_rect();
         if !drawer.take_skip_children() {
             drawer.with_clip_rect_for_children(|drawer| {
                 self.children.draw(drawer);

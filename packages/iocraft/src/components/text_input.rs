@@ -96,7 +96,8 @@ struct TextInputHandleInner {
 impl TextInputHandle {
     /// Sets the cursor position to the specified offset.
     ///
-    /// The offset is in bytes, not characters.
+    /// The offset is in bytes, not characters. Offsets past the end are clamped to the value's
+    /// length. An offset inside a UTF-8 character is rounded down to that character's start.
     pub fn set_cursor_offset(&mut self, offset: usize) {
         if let Some(inner) = &mut self.inner {
             inner.requested_cursor_offset.set(Some(offset));
@@ -142,6 +143,7 @@ pub struct TextInputProps {
     pub on_change: HandlerMut<'static, String>,
 
     /// If true, the input will fill 100% of the height of its container and handle multiline input.
+    /// If false, line breaks in pasted text are replaced with spaces.
     pub multiline: bool,
 
     /// An optional handle which can be used for imperative control of the input.
@@ -616,7 +618,8 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
                     modifiers,
                     ..
                 }) if kind != KeyEventKind::Release
-                    && modifiers.contains(KeyModifiers::CONTROL) =>
+                    && modifiers.contains(KeyModifiers::CONTROL)
+                    && !is_altgr_char(code, modifiers) =>
                 {
                     match code {
                         KeyCode::Char('a') => {
@@ -638,7 +641,8 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
                     modifiers,
                     ..
                 }) if kind != KeyEventKind::Release
-                    && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    && (!modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        || is_altgr_char(code, modifiers)) =>
                 {
                     let mut clear_vertical_movement_col_preference = true;
 
@@ -756,6 +760,16 @@ enum NewCursorOffsetHint {
     None,
     Backspace,
     Deletion,
+}
+
+/// Returns whether a keypress is using AltGr, always false for platforms other than Windows.
+/// Windows reports AltGr (used for characters like '@', '{' and '€' on many keyboard layouts)
+/// as Ctrl+Alt, so these key presses should be typed rather than treated as shortcuts.
+/// Letters and digits are excluded, since they are used for shortcuts.
+fn is_altgr_char(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    cfg!(windows)
+        && modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && matches!(code, KeyCode::Char(c) if !c.is_control() && !c.is_ascii_alphanumeric())
 }
 
 fn clamp_to_char_boundary(value: &str, offset: usize) -> usize {
@@ -1406,5 +1420,23 @@ mod tests {
             new_cursor_offset("éx", 1, "é!x", NewCursorOffsetHint::None),
             4
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_is_altgr_char() {
+        let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert!(is_altgr_char(KeyCode::Char('@'), ctrl_alt));
+        assert!(is_altgr_char(KeyCode::Char('€'), ctrl_alt));
+        assert!(!is_altgr_char(KeyCode::Char('a'), ctrl_alt));
+        assert!(!is_altgr_char(KeyCode::Char('1'), ctrl_alt));
+        assert!(!is_altgr_char(KeyCode::Char('@'), KeyModifiers::CONTROL));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_is_altgr_char() {
+        let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert!(!is_altgr_char(KeyCode::Char('@'), ctrl_alt));
     }
 }

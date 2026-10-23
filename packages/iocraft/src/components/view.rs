@@ -609,7 +609,7 @@ struct ViewCaptureHandler<T> {
 struct ViewHitRecord {
     id: ViewId,
     parent: Option<ViewId>,
-    rect: Arc<Mutex<Option<Rect<i32>>>>,
+    region: Arc<Mutex<Option<ViewEventRegion>>>,
     handler: Option<Arc<Mutex<HandlerMut<'static, ViewClickEvent>>>>,
     focus: Option<(FocusId, FocusContext)>,
 }
@@ -618,21 +618,36 @@ struct ViewHitRecord {
 struct ViewHoverRecord {
     id: ViewId,
     parent: Option<ViewId>,
-    rect: Arc<Mutex<Option<Rect<i32>>>>,
+    region: Arc<Mutex<Option<ViewEventRegion>>>,
     on_enter: Option<Arc<Mutex<HandlerMut<'static, ()>>>>,
     on_leave: Option<Arc<Mutex<HandlerMut<'static, ()>>>>,
 }
 
-fn view_record_contains(rect: &Arc<Mutex<Option<Rect<i32>>>>, column: u16, row: u16) -> bool {
-    rect.lock()
+#[derive(Clone, Copy)]
+struct ViewEventRegion {
+    rect: Rect<i32>,
+    visible_rect: Rect<u16>,
+}
+
+impl ViewEventRegion {
+    fn contains(&self, column: u16, row: u16) -> bool {
+        column >= self.visible_rect.left
+            && column < self.visible_rect.right
+            && row >= self.visible_rect.top
+            && row < self.visible_rect.bottom
+    }
+}
+
+fn view_region_contains(
+    region: &Arc<Mutex<Option<ViewEventRegion>>>,
+    column: u16,
+    row: u16,
+) -> bool {
+    region
+        .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
-        .is_some_and(|rect| {
-            (column as i32) >= rect.left
-                && (column as i32) < rect.right
-                && (row as i32) >= rect.top
-                && (row as i32) < rect.bottom
-        })
+        .is_some_and(|region| region.contains(column, row))
 }
 
 fn dispatch_hover(records: &[ViewHoverRecord], hovered: &mut Vec<ViewId>, column: u16, row: u16) {
@@ -640,7 +655,7 @@ fn dispatch_hover(records: &[ViewHoverRecord], hovered: &mut Vec<ViewId>, column
     let mut current = records
         .iter()
         .rev()
-        .find(|record| view_record_contains(&record.rect, column, row))
+        .find(|record| view_region_contains(&record.region, column, row))
         .map(|record| record.id);
 
     while let Some(id) = current {
@@ -1003,7 +1018,7 @@ pub struct View {
     opaque: bool,
     no_select: bool,
     no_select_from_left_edge: bool,
-    event_rect: Arc<Mutex<Option<Rect<i32>>>>,
+    event_region: Arc<Mutex<Option<ViewEventRegion>>>,
     hovered_descendants: Arc<Mutex<Vec<ViewId>>>,
     pending_click: Arc<Mutex<Option<PendingClick>>>,
     focus_ctx: Option<FocusContext>,
@@ -1028,7 +1043,7 @@ impl Default for View {
             opaque: false,
             no_select: false,
             no_select_from_left_edge: false,
-            event_rect: Arc::new(Mutex::new(None)),
+            event_region: Arc::new(Mutex::new(None)),
             hovered_descendants: Arc::new(Mutex::new(Vec::new())),
             pending_click: Arc::new(Mutex::new(None)),
             focus_ctx: None,
@@ -1320,7 +1335,7 @@ impl Component for View {
             .push(ViewHoverRecord {
                 id: self.view_id,
                 parent: parent_view_context.view_id,
-                rect: self.event_rect.clone(),
+                region: self.event_region.clone(),
                 on_enter: hover_enter_handler,
                 on_leave: hover_leave_handler,
             });
@@ -1747,7 +1762,7 @@ impl Component for View {
             }
         });
 
-        let rect_for_click = self.event_rect.clone();
+        let region_for_click = self.event_region.clone();
         let pending_click = self.pending_click.clone();
         let on_click = props.on_click.take();
         let click_handler = (!on_click.is_default()).then(|| Arc::new(Mutex::new(on_click)));
@@ -1755,7 +1770,7 @@ impl Component for View {
         let click_record = ViewHitRecord {
             id: self.view_id,
             parent: parent_view_context.view_id,
-            rect: rect_for_click.clone(),
+            region: region_for_click.clone(),
             handler: click_handler.clone(),
             focus: if props.focusable || props.tab_index.is_some() {
                 self.focus_id.zip(self.focus_ctx)
@@ -1785,33 +1800,22 @@ impl Component for View {
                     return;
                 };
 
-                let rect = *rect_for_click
+                let region = *region_for_click
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let Some(rect) = rect else {
+                let Some(region) = region else {
                     return;
                 };
-                let inside = (*column as i32) >= rect.left
-                    && (*column as i32) < rect.right
-                    && (*row as i32) >= rect.top
-                    && (*row as i32) < rect.bottom;
+                let rect = region.rect;
+                let inside = region.contains(*column, *row);
                 let records = click_registry
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
-                let target_record = records.iter().rev().find(|record| {
-                    record
-                        .rect
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .as_ref()
-                        .is_some_and(|rect| {
-                            (*column as i32) >= rect.left
-                                && (*column as i32) < rect.right
-                                && (*row as i32) >= rect.top
-                                && (*row as i32) < rect.bottom
-                        })
-                });
+                let target_record = records
+                    .iter()
+                    .rev()
+                    .find(|record| view_region_contains(&record.region, *column, *row));
                 if target_record.is_none_or(|record| record.id != view_id) {
                     return;
                 }
@@ -1877,11 +1881,12 @@ impl Component for View {
                                         break;
                                     };
                                     if let Some(handler_ref) = &record.handler {
-                                        let handler_rect = *record
-                                            .rect
+                                        let handler_region = *record
+                                            .region
                                             .lock()
                                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                        if let Some(handler_rect) = handler_rect {
+                                        if let Some(handler_region) = handler_region {
+                                            let handler_rect = handler_region.rect;
                                             handled = true;
                                             let phase = if record.id == view_id {
                                                 ViewEventPhase::AtTarget
@@ -1986,20 +1991,24 @@ impl Component for View {
         let position = drawer.canvas_position();
         let size = drawer.size();
         *self
-            .event_rect
+            .event_region
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Rect {
-            left: position.x as i32,
-            right: position.x as i32 + size.width as i32,
-            top: position.y as i32,
-            bottom: position.y as i32 + size.height as i32,
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ViewEventRegion {
+            rect: Rect {
+                left: position.x as i32,
+                right: position.x as i32 + size.width as i32,
+                top: position.y as i32,
+                bottom: position.y as i32 + size.height as i32,
+            },
+            visible_rect: drawer.visible_rect(),
         });
 
         if drawer.zero_height_sibling_shares_y() {
             // CC Ink's siblingSharesY guard: don't let a zero-height Box paint
             // children that can leave stale tail glyphs under a sibling on the
-            // same row. Keep View hooks/event metadata alive; only skip output.
-            drawer.skip_children();
+            // same row. Traverse with an empty clip so descendant event regions
+            // are refreshed even though their output is hidden.
+            drawer.hide_children();
             return;
         }
 
@@ -4635,5 +4644,76 @@ mod tests {
         }
         assert!(!canvases[0].is_no_select(4, 0));
         assert!(!canvases[0].is_no_select(5, 0));
+    }
+
+    #[derive(Props)]
+    struct ClippedClickAppProps {
+        clip: bool,
+    }
+
+    #[component]
+    fn ClippedClickApp(
+        mut hooks: Hooks,
+        props: &ClippedClickAppProps,
+    ) -> impl Into<AnyElement<'static>> {
+        let mut system = hooks.use_context_mut::<SystemContext>();
+        let mut inner = hooks.use_state(|| 0usize);
+        let mut outer = hooks.use_state(|| 0usize);
+        let mut local_column = hooks.use_state(|| None);
+        let mut quit = hooks.use_state(|| false);
+        hooks.use_terminal_events(move |event| {
+            if matches!(event, TerminalEvent::Key(_)) {
+                quit.set(true);
+            }
+        });
+        if quit.get() {
+            system.exit();
+        }
+        element! {
+            View(width: 20, height: 2, flex_direction: FlexDirection::Column) {
+                View(width: 4, height: 1, overflow: if props.clip { Overflow::Hidden } else { Overflow::Visible }, on_click: move |_| outer += 1) {
+                    View(position: Position::Absolute, left: -3, width: 10, height: 1,
+                        on_click: move |event: ViewClickEvent| { inner += 1; local_column.set(Some(event.local_column)); })
+                }
+                Text(content: format!("{}/{}/{:?}", inner.get(), outer.get(), local_column.get()))
+            }
+        }
+    }
+
+    #[test]
+    fn test_view_click_respects_ancestor_clip_without_moving_origin() {
+        for push_wake in [false, true] {
+            crate::render::wake::set_push_wake_for_tests(Some(push_wake));
+            for (clip, column, expected) in [
+                (true, 6, "0/0/None"),
+                (true, 0, "1/1/Some(3)"),
+                (false, 6, "1/1/Some(9)"),
+            ] {
+                let canvases: Vec<_> = smol::block_on(
+                    element!(ClippedClickApp(clip))
+                        .mock_terminal_render_loop(MockTerminalConfig::with_events(
+                            futures::stream::iter(vec![
+                                TerminalEvent::FullscreenMouse(FullscreenMouseEvent::new(
+                                    MouseEventKind::Down(MouseButton::Left),
+                                    column,
+                                    0,
+                                )),
+                                TerminalEvent::FullscreenMouse(FullscreenMouseEvent::new(
+                                    MouseEventKind::Up(MouseButton::Left),
+                                    column,
+                                    0,
+                                )),
+                                TerminalEvent::Key(KeyEvent::new(
+                                    KeyEventKind::Press,
+                                    KeyCode::Char('q'),
+                                )),
+                            ]),
+                        ))
+                        .collect(),
+                );
+                assert_eq!(canvases.last().unwrap().to_string().trim(), expected);
+            }
+            crate::render::wake::set_push_wake_for_tests(None);
+        }
     }
 }

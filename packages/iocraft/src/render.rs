@@ -830,6 +830,7 @@ pub struct ComponentDrawer<'a> {
     clip_rect: Rect<u16>,
     vertical_clip_active: bool,
     skip_children: bool,
+    hide_children: bool,
     context: DrawContext<'a>,
 }
 
@@ -976,18 +977,31 @@ impl ComponentDrawer<'_> {
 
     /// Gets the visible component size inside the current canvas clip.
     pub fn visible_size(&self) -> Size<u16> {
-        let x = self.node_position.x as isize;
-        let y = self.node_position.y as isize;
-        let node_right = x + self.node_size.width as isize;
-        let node_bottom = y + self.node_size.height as isize;
-        let left = x.max(self.clip_rect.left as isize).max(0);
-        let top = y.max(self.clip_rect.top as isize).max(0);
-        let right = node_right.min(self.clip_rect.right as isize).max(0);
-        let bottom = node_bottom.min(self.clip_rect.bottom as isize).max(0);
+        let rect = self.visible_rect();
         Size {
-            width: (right - left).max(0) as u16,
-            height: (bottom - top).max(0) as u16,
+            width: rect.right - rect.left,
+            height: rect.bottom - rect.top,
         }
+    }
+
+    /// The component's canvas rectangle intersected with its inherited clip.
+    pub(crate) fn visible_rect(&self) -> Rect<u16> {
+        let x = i32::from(self.node_position.x);
+        let y = i32::from(self.node_position.y);
+        let left = x.max(i32::from(self.clip_rect.left));
+        let top = y.max(i32::from(self.clip_rect.top));
+        let right = (x + i32::from(self.node_size.width)).min(i32::from(self.clip_rect.right));
+        let bottom = (y + i32::from(self.node_size.height)).min(i32::from(self.clip_rect.bottom));
+        Rect {
+            left: left as u16,
+            right: right.max(left) as u16,
+            top: top as u16,
+            bottom: bottom.max(top) as u16,
+        }
+    }
+
+    pub(crate) fn clip_rect(&self) -> Rect<u16> {
+        self.clip_rect
     }
 
     /// Gets the component size remaining before the root canvas edge.
@@ -1200,6 +1214,11 @@ impl ComponentDrawer<'_> {
         self.skip_children = true;
     }
 
+    /// Hides child output while still drawing to refresh descendant event regions.
+    pub(crate) fn hide_children(&mut self) {
+        self.hide_children = true;
+    }
+
     pub(crate) fn take_skip_children(&mut self) -> bool {
         let skip = self.skip_children;
         self.skip_children = false;
@@ -1251,7 +1270,9 @@ impl ComponentDrawer<'_> {
         let old_node_position = self.node_position;
         let old_node_size = self.node_size;
         let old_skip_children = self.skip_children;
+        let old_hide_children = self.hide_children;
         self.skip_children = false;
+        self.hide_children = false;
         self.node_id = node_id;
         let layout = self.layout();
         let mut next_position = Point {
@@ -1277,10 +1298,12 @@ impl ComponentDrawer<'_> {
         };
         f(self);
         let requested_skip_children = self.skip_children;
+        let requested_hide_children = self.hide_children;
         self.node_id = old_node_id;
         self.node_position = old_node_position;
         self.node_size = old_node_size;
         self.skip_children = old_skip_children || requested_skip_children;
+        self.hide_children = old_hide_children || requested_hide_children;
     }
 
     /// Returns whether this component is a zero-height box sharing a row with a sibling.
@@ -1321,7 +1344,8 @@ impl ComponentDrawer<'_> {
         F: FnOnce(&mut Self),
     {
         let overflow = self.style().overflow;
-        if overflow.x == Overflow::Visible && overflow.y == Overflow::Visible {
+        let hide_children = std::mem::take(&mut self.hide_children);
+        if !hide_children && overflow.x == Overflow::Visible && overflow.y == Overflow::Visible {
             // No need to do anything.
             f(self);
             return;
@@ -1329,6 +1353,10 @@ impl ComponentDrawer<'_> {
 
         let old_clip_rect = self.clip_rect;
         let old_vertical_clip_active = self.vertical_clip_active;
+        if hide_children {
+            self.clip_rect = Rect::default();
+            self.vertical_clip_active = true;
+        }
         let layout = self.layout();
         if overflow.x != Overflow::Visible {
             self.clip_rect.left = self
@@ -1970,6 +1998,7 @@ impl<'a> Tree<'a> {
                 },
                 vertical_clip_active: false,
                 skip_children: false,
+                hide_children: false,
                 context: DrawContext {
                     layout_engine: &self.layout_engine,
                     canvas: &mut canvas,

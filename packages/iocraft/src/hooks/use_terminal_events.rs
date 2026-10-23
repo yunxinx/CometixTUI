@@ -6,7 +6,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll},
 };
-use taffy::{Point, Size};
+use taffy::{Point, Rect};
 
 mod private {
     pub trait Sealed {}
@@ -106,16 +106,17 @@ pub trait UseTerminalEvents: private::Sealed {
 
     /// Defines a callback to be invoked whenever a terminal event occurs within a component.
     ///
-    /// Unlike [`Self::use_terminal_events`], this hook will not be called for events such as mouse
-    /// events that occur outside of the component. Furthermore, coordinates will be translated to
-    /// component-local coordinates.
+    /// Unlike [`Self::use_terminal_events`], this hook ignores mouse events outside the component's
+    /// visible area, including ancestor clipping. Coordinates are relative to the component's
+    /// original, unclipped origin.
     fn use_local_terminal_events<F>(&mut self, f: F)
     where
         F: FnMut(TerminalEvent) + Send + 'static;
 
     /// Defines a propagation-aware callback for terminal events within a component.
     ///
-    /// Mouse coordinates are translated to component-local coordinates as with
+    /// Mouse events are filtered to the visible area, including ancestor clipping, and coordinates
+    /// are relative to the original, unclipped origin as with
     /// [`Self::use_local_terminal_events`]. Keyboard, resize, and paste events are
     /// delivered unchanged. The callback may call
     /// [`PropagatedTerminalEvent::stop_propagation`] to hide handled events from
@@ -299,7 +300,7 @@ type EventCallback = Box<dyn FnMut(&PropagatedTerminalEvent) + Send + 'static>;
 
 struct UseTerminalEventsImpl {
     events: Option<TerminalEvents>,
-    component_location: (Point<i16>, Size<u16>),
+    component_location: (Point<i16>, Rect<u16>),
     in_component: bool,
     propagation_aware: bool,
     observe_stopped: bool,
@@ -332,24 +333,27 @@ impl Hook for UseTerminalEventsImpl {
                 continue;
             }
             if self.in_component {
-                let (location, size) = self.component_location;
+                let (location, visible_rect) = self.component_location;
                 match event {
                     TerminalEvent::FullscreenMouse(event) => {
-                        if event.row as i16 >= location.y && event.column as i16 >= location.x {
-                            let row = (event.row as i16 - location.y) as u16;
-                            let column = (event.column as i16 - location.x) as u16;
-                            if row < size.height && column < size.width {
-                                if let Some(f) = &mut self.f {
-                                    f(&PropagatedTerminalEvent::new(
-                                        TerminalEvent::FullscreenMouse(FullscreenMouseEvent {
-                                            row,
-                                            column,
-                                            ..event
-                                        }),
-                                        state,
-                                    ));
-                                }
-                            }
+                        if event.column < visible_rect.left
+                            || event.column >= visible_rect.right
+                            || event.row < visible_rect.top
+                            || event.row >= visible_rect.bottom
+                        {
+                            continue;
+                        }
+                        let row = (i32::from(event.row) - i32::from(location.y)) as u16;
+                        let column = (i32::from(event.column) - i32::from(location.x)) as u16;
+                        if let Some(f) = &mut self.f {
+                            f(&PropagatedTerminalEvent::new(
+                                TerminalEvent::FullscreenMouse(FullscreenMouseEvent {
+                                    row,
+                                    column,
+                                    ..event
+                                }),
+                                state,
+                            ));
                         }
                     }
                     TerminalEvent::Key(_)
@@ -390,7 +394,9 @@ impl Hook for UseTerminalEventsImpl {
     }
 
     fn post_component_draw(&mut self, drawer: &mut crate::ComponentDrawer) {
-        self.component_location = (drawer.canvas_position(), drawer.size());
+        if self.in_component {
+            self.component_location = (drawer.canvas_position(), drawer.visible_rect());
+        }
     }
 }
 
@@ -611,5 +617,83 @@ mod tests {
             .await;
         let actual = canvases.iter().map(|c| c.to_string()).collect::<Vec<_>>();
         assert_eq!(actual, vec!["", "caught ctrl-c\n"]);
+    }
+
+    #[derive(Props)]
+    struct ClippedMouseTargetProps {
+        #[iocraft(required)]
+        hits: std::sync::Arc<std::sync::Mutex<Vec<(u16, u16)>>>,
+        propagated: bool,
+    }
+
+    #[component]
+    fn ClippedMouseTarget(
+        mut hooks: Hooks,
+        props: &ClippedMouseTargetProps,
+    ) -> impl Into<AnyElement<'static>> {
+        let mut quit = hooks.use_state(|| false);
+        let hits = props.hits.clone();
+        if props.propagated {
+            hooks.use_local_propagated_terminal_events(move |event| match event.event() {
+                TerminalEvent::FullscreenMouse(event) => {
+                    hits.lock().unwrap().push((event.column, event.row));
+                }
+                TerminalEvent::Key(_) => quit.set(true),
+                _ => {}
+            });
+        } else {
+            hooks.use_local_terminal_events(move |event| match event {
+                TerminalEvent::FullscreenMouse(event) => {
+                    hits.lock().unwrap().push((event.column, event.row));
+                }
+                TerminalEvent::Key(_) => quit.set(true),
+                _ => {}
+            });
+        }
+        if quit.get() {
+            hooks.use_context_mut::<SystemContext>().exit();
+        }
+        element! {
+            View(position: Position::Absolute, left: -3, width: 10, height: 1)
+        }
+    }
+
+    async fn run_clipped_mouse_events(propagated: bool) -> Vec<(u16, u16)> {
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        element! {
+            View(width: 10, height: 1) {
+                View(width: 4, height: 1, overflow: Overflow::Hidden) {
+                    ClippedMouseTarget(hits: hits.clone(), propagated)
+                }
+            }
+        }
+        .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter(vec![
+            TerminalEvent::FullscreenMouse(FullscreenMouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                0,
+                0,
+            )),
+            TerminalEvent::FullscreenMouse(FullscreenMouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                4,
+                0,
+            )),
+            TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char('q'))),
+        ])))
+        .for_each(|_| async {})
+        .await;
+        let recorded_hits = hits.lock().unwrap().clone();
+        recorded_hits
+    }
+
+    #[apply(test!)]
+    async fn test_local_mouse_respects_ancestor_clip_without_moving_origin() {
+        for push_wake in [false, true] {
+            crate::render::wake::set_push_wake_for_tests(Some(push_wake));
+            for propagated in [false, true] {
+                assert_eq!(run_clipped_mouse_events(propagated).await, vec![(3, 0)]);
+            }
+            crate::render::wake::set_push_wake_for_tests(None);
+        }
     }
 }

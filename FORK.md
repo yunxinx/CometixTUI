@@ -35,8 +35,12 @@ This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) chang
 - Synchronized frame-ending write errors propagate to the render loop, with update errors taking precedence and panic cleanup still ending the update (`iocraft#281`). Covered by `test_end_of_synchronized_update_reports_errors` in `packages/iocraft/src/terminal/tests/mod.rs`.
 - Leading Unicode whitespace no longer panics during `Text` or `MixedText` alignment (`iocraft#270`). Covered by `test_alignment_preserves_unicode_indentation` in `packages/iocraft/src/components/text.rs`.
 - Wide glyphs crossing an internal clip boundary leave underlying cells unchanged; `SpacerHead` is only written at the canvas's right edge, preventing right-hand siblings from shifting left in terminal output (this fork's variant of `iocraft#241`). Covered by `test_wide_text_clipping_preserves_right_sibling` in `packages/iocraft/src/components/text.rs`, including an `avt` assertion on the sibling's terminal column.
+- Windows `TextInput` accepts non-control, non-ASCII-alphanumeric AltGr characters reported as Ctrl+Alt, while retaining Ctrl+Alt letter/digit shortcuts (`iocraft#233`). Covered by the platform-specific `test_is_altgr_char` tests in `packages/iocraft/src/components/text_input.rs`.
+- Local mouse hooks ignore events outside the component's visible area, including ancestor clipping; coordinates remain relative to the original, unclipped origin (`iocraft#276`). Covered for both plain and propagated hooks by `test_local_mouse_respects_ancestor_clip_without_moving_origin` in `packages/iocraft/src/hooks/use_terminal_events.rs`.
 
 ### Fork fixes made during the sync
+
+- View click and hover targets use the same visible-area calculation as local mouse hooks, retaining unclipped local coordinates and hit testing for visible overflow. Covered by `test_view_click_respects_ancestor_clip_without_moving_origin` in `packages/iocraft/src/components/view.rs`. Ancestor clip changes invalidate Memo retained blits and CachedSubtree snapshots so descendant event regions are refreshed. Zero-height sibling suppression traverses children under an empty clip to keep hidden descendants out of hit testing.
 
 ### Breaking changes for consumers
 
@@ -53,8 +57,13 @@ This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) chang
 - Drawing and forced wrapping preserve grapheme clusters, including joined emoji (`iocraft#264`); a double-width cluster that cannot fit the canvas width is clipped whole.
 - Text wrapping preserves leading blank lines (`iocraft#271`).
 - Text reuses its measure function for style-only changes; content, wrap mode, and structured-mode changes reinstall it, while `MeasureMemo` caches layout probes (`iocraft#287`).
+- Single-line paste normalizes LF, CR, and CRLF to spaces, while multiline input preserves line breaks (`iocraft#243`, paste portion of `iocraft#244`).
+- Requested TextInput cursor offsets are clamped to the value length and rounded down to UTF-8 character boundaries (`iocraft#252`); the handle documentation now states this behavior.
+- TextInput auto-grow derives layout from current props and text rows, so disabling and re-enabling it restores the height (`iocraft#266`).
+- Button uses View's primary-button release-click handling, so right and middle buttons do not activate it (`iocraft#295`); its documentation now specifies the primary button.
 
 ### Not taken
 
 - Zero-width glyphs are not emitted and measure as zero, keeping layout and output aligned without a blank base (`iocraft#242` and the zero-width portion of `iocraft#264`).
 - Empty `Text` remains 0×0 rather than reserving a line (`iocraft#287`).
+- Button accepts any number of children and lays them out inside a View, so the multiple-child panic is not taken (`iocraft#236`); the children documentation reflects this contract.
