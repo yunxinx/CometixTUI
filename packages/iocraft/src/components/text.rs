@@ -522,9 +522,9 @@ impl<'a, 'b> TextDrawer<'a, 'b> {
             }
             if self.skip_leading_whitespace && !self.line_encountered_non_whitespace {
                 let to_skip = line
-                    .chars()
-                    .position(|c| !c.is_whitespace())
-                    .unwrap_or(line.len());
+                    .char_indices()
+                    .find(|(_, c)| !c.is_whitespace())
+                    .map_or(line.len(), |(offset, _)| offset);
                 let (whitespace, remaining) = line.split_at(to_skip);
                 self.x += crate::canvas::string_display_width_from_col(
                     whitespace,
@@ -910,6 +910,41 @@ mod tests {
             ""
         );
         assert_eq!(element!(Text(content: "legacy")).to_string(), "legacy\n");
+    }
+
+    #[test]
+    fn test_alignment_preserves_unicode_indentation() {
+        let actual = element! {
+            View(width: 12, flex_direction: FlexDirection::Column) {
+                Text(content: "\u{2003}hello", align: TextAlign::Right)
+                Text(content: "footer")
+            }
+        }
+        .to_string();
+        assert_eq!(actual, "       hello\nfooter\n");
+    }
+
+    #[test]
+    fn test_wide_text_clipping_preserves_right_sibling() {
+        let canvas = element! {
+            View(flex_direction: FlexDirection::Row, width: 3) {
+                View(width: 1, overflow: Overflow::Hidden) {
+                    Text(content: "界", wrap: TextWrap::NoWrap)
+                }
+                Text(content: "R")
+            }
+        }
+        .render(None);
+
+        let mut output = Vec::new();
+        canvas
+            .write_ansi_without_final_newline(&mut output)
+            .unwrap();
+        let mut vt = avt::Vt::new(3, 1);
+        vt.feed_str(&String::from_utf8(output).unwrap());
+        assert_eq!(vt.line(0).cells()[0].char(), ' ');
+        assert_eq!(vt.line(0).cells()[1].char(), 'R');
+        assert_eq!(canvas.to_string(), " R\n");
     }
 
     #[test]

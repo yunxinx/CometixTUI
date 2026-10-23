@@ -1827,8 +1827,13 @@ impl Canvas {
                 continue;
             }
             if end_x - 1 > max_x {
-                // Do not render a partial wide grapheme at the right edge. VT
-                // terminals wrap when a double-width glyph crosses the margin;
+                if max_x < self.width as isize - 1 {
+                    // At an internal clip boundary, leave underlying cells untouched.
+                    // SpacerHead is reserved for the canvas's right edge.
+                    break;
+                }
+                // Do not render a partial wide grapheme at the canvas's right edge.
+                // VT terminals wrap when a double-width glyph crosses the margin;
                 // CC Ink's output layer writes a SpacerHead placeholder and
                 // later skips it during terminal output, preserving the virtual
                 // cursor model without leaving stale cells behind.

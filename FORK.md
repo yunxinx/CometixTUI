@@ -33,6 +33,8 @@ This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) chang
 - State and ref setters drop replaced values after releasing the write borrow, so destructors can read the replacement (`iocraft#299`). Covered by `test_replaced_value_drop_can_read_replacement` in both `packages/iocraft/src/hooks/use_state.rs` and `packages/iocraft/src/hooks/use_ref.rs`.
 - Output formatting, wakers, writers, and acknowledgement callbacks can enqueue output without deadlocking (`iocraft#279`), re-implemented in this fork's `use_output`; draining remains in `post_component_effects`, and messages queued while writing wait for the next drain. Covered by `test_formatting_and_waking_can_enqueue_output` and, with `unstable-output-streams`, `test_backend_output_is_flushed_on_the_next_update` in `packages/iocraft/src/hooks/use_output.rs`.
 - Synchronized frame-ending write errors propagate to the render loop, with update errors taking precedence and panic cleanup still ending the update (`iocraft#281`). Covered by `test_end_of_synchronized_update_reports_errors` in `packages/iocraft/src/terminal/tests/mod.rs`.
+- Leading Unicode whitespace no longer panics during `Text` or `MixedText` alignment (`iocraft#270`). Covered by `test_alignment_preserves_unicode_indentation` in `packages/iocraft/src/components/text.rs`.
+- Wide glyphs crossing an internal clip boundary leave underlying cells unchanged; `SpacerHead` is only written at the canvas's right edge, preventing right-hand siblings from shifting left in terminal output (this fork's variant of `iocraft#241`). Covered by `test_wide_text_clipping_preserves_right_sibling` in `packages/iocraft/src/components/text.rs`, including an `avt` assertion on the sibling's terminal column.
 
 ### Fork fixes made during the sync
 
@@ -44,4 +46,15 @@ This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) chang
 
 ### Already covered
 
+- VS16 padding uses saturating subtraction, so a standalone variation selector cannot underflow (`iocraft#244`, canvas portion).
+- Wide-cell relationships are cleared before partial overwrites or erasure, preventing stale wide heads and tails (`iocraft#246`).
+- Text extraction skips wide-character tail cells (`iocraft#249`); starting inside a tail retains this fork's selection behavior without an extra leading space.
+- Bold and dim are independent attributes, and intensity transitions emit SGR 22 before enabling the next attributes (`iocraft#259`).
+- Drawing and forced wrapping preserve grapheme clusters, including joined emoji (`iocraft#264`); a double-width cluster that cannot fit the canvas width is clipped whole.
+- Text wrapping preserves leading blank lines (`iocraft#271`).
+- Text reuses its measure function for style-only changes; content, wrap mode, and structured-mode changes reinstall it, while `MeasureMemo` caches layout probes (`iocraft#287`).
+
 ### Not taken
+
+- Zero-width glyphs are not emitted and measure as zero, keeping layout and output aligned without a blank base (`iocraft#242` and the zero-width portion of `iocraft#264`).
+- Empty `Text` remains 0×0 rather than reserving a line (`iocraft#287`).
