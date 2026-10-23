@@ -41,6 +41,8 @@ pub(crate) struct UpdateContext<'a, 'w> {
     did_clear_terminal_output: bool,
     force_full_repaint: bool,
     invalidate_prev_frame: bool,
+    /// A layout node that had been drawn was removed: what it covered has moved.
+    drawn_node_removed: bool,
     layout_invalidations: LayoutInvalidations,
 }
 
@@ -756,7 +758,8 @@ impl<'a, 'b, 'c, 'w> ComponentUpdater<'a, 'b, 'c, 'w> {
                     .expect("we should be able to set the children");
 
                 for component in self.children.components.iter() {
-                    component.remove_layout_nodes(self.context.layout_engine);
+                    self.context.drawn_node_removed |=
+                        component.remove_layout_nodes(self.context.layout_engine);
                 }
                 self.children.components = used_components.into();
             });
@@ -787,6 +790,9 @@ struct DrawContext<'a> {
     overlays: Vec<CanvasRect>,
     /// A component found itself drawn at a size other than the one it laid itself out at.
     layout_pass_requested: bool,
+    /// A drawn node moved or changed height since it was last drawn, or a drawn node was
+    /// removed. CC Ink's `layoutShifted`: the frame is damaged as a whole.
+    layout_shifted: bool,
 }
 
 /// A canvas rectangle as `(x, y, width, height)`.
@@ -1309,6 +1315,24 @@ impl ComponentDrawer<'_> {
         self.context.overlays.len()
     }
 
+    /// Records where the current node is drawn, flagging a layout shift when it was last drawn at
+    /// another position or height. Only drawn nodes are compared, as CC Ink's `renderNodeToOutput`
+    /// compares only the nodes it visits: a subtree restored from the previous canvas cannot have
+    /// moved inside.
+    fn record_drawn_layout(&mut self, layout: &Layout) {
+        let Some(node_context) = self.context.layout_engine.get_node_context(self.node_id) else {
+            return;
+        };
+        let drawn = LayoutSnapshot::from(layout);
+        if node_context
+            .drawn_layout
+            .replace(Some(drawn))
+            .is_some_and(|previous| previous != drawn)
+        {
+            self.context.layout_shifted = true;
+        }
+    }
+
     /// Prepares to begin drawing a node by moving to the node's position and invoking the given
     /// closure.
     pub(crate) fn for_child_node_layout<F>(&mut self, node_id: NodeId, f: F)
@@ -1324,6 +1348,7 @@ impl ComponentDrawer<'_> {
         self.hide_children = false;
         self.node_id = node_id;
         let layout = self.layout();
+        self.record_drawn_layout(&layout);
         let mut next_position = Point {
             x: self.node_position.x + layout.location.x as i16,
             y: self.node_position.y + layout.location.y as i16,
@@ -1466,6 +1491,8 @@ pub(crate) struct LayoutEngineNodeContext {
     measure_memo: MeasureMemo,
     /// The component whose node this is, for `IOCRAFT_DEBUG=layout-dump`.
     component_name: Option<&'static str>,
+    /// Where the node was last drawn; `None` until it is.
+    drawn_layout: std::cell::Cell<Option<LayoutSnapshot>>,
 }
 
 impl LayoutEngineNodeContext {
@@ -1632,6 +1659,12 @@ impl LayoutEngine {
     pub fn new() -> Self {
         Self(TaffyTree::new())
     }
+
+    /// Whether the node has been drawn since it was created.
+    pub(crate) fn was_drawn(&self, node_id: NodeId) -> bool {
+        self.get_node_context(node_id)
+            .is_some_and(|node_context| node_context.drawn_layout.get().is_some())
+    }
 }
 
 impl std::ops::Deref for LayoutEngine {
@@ -1648,21 +1681,24 @@ impl std::ops::DerefMut for LayoutEngine {
     }
 }
 
+/// A node's position relative to its parent and its height. Width is left out: a width-only
+/// change is no layout shift for the damage backstop, since the rebuilt canvas diff already
+/// catches the visible cells and a clean cached blit should not turn dirty because a descendant
+/// recomputed a different intrinsic width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LayoutSnapshot {
     x: i16,
     y: i16,
-    width: u16,
     height: u16,
 }
 
-impl LayoutSnapshot {
-    fn shifts_from(self, previous: Self) -> bool {
-        // Width-only changes are not layout shifts for the terminal damage
-        // backstop: the rebuilt canvas diff already catches visible cells and
-        // clean cached blits should not become dirty just because skipped
-        // descendants recomputed a different intrinsic width.
-        self.x != previous.x || self.y != previous.y || self.height != previous.height
+impl From<&Layout> for LayoutSnapshot {
+    fn from(layout: &Layout) -> Self {
+        Self {
+            x: layout.location.x as i16,
+            y: layout.location.y as i16,
+            height: layout.size.height as u16,
+        }
     }
 }
 
@@ -1676,7 +1712,6 @@ struct Tree<'a> {
     // One animation clock per tree, provided at the root the way Ink's own
     // root `App` mounts `ClockProvider` (CC `ink/components/App.tsx:219`).
     clock: crate::components::Clock,
-    prev_layout_snapshots: HashMap<NodeId, LayoutSnapshot>,
     /// The absolutely positioned rectangles of the last rendered canvas.
     overlays: Vec<CanvasRect>,
 }
@@ -1717,7 +1752,6 @@ impl<'a> Tree<'a> {
             system_context: SystemContext::new(),
             root_view_event_context: crate::components::ViewFocusParentContext::shared_root(),
             clock: crate::components::Clock::new(),
-            prev_layout_snapshots: HashMap::new(),
             overlays: Vec::new(),
         }
     }
@@ -1809,6 +1843,7 @@ impl<'a> Tree<'a> {
         let mut did_clear_terminal_output = false;
         let mut force_full_repaint = false;
         let mut invalidate_prev_frame = false;
+        let mut drawn_node_removed = false;
         // Render-phase update settling (push mode): an update body that writes
         // a State would otherwise schedule a whole extra frame just to let the
         // tree observe the new value — the frame renders with the stale value
@@ -1822,13 +1857,14 @@ impl<'a> Tree<'a> {
         let mut layout_invalidations = LayoutInvalidations::default();
         loop {
             wrapper_child_node_ids.truncate(1);
-            let (did_clear, force_full, invalidate, invalidations) = {
+            let (did_clear, force_full, invalidate, removed, invalidations) = {
                 let mut context = UpdateContext {
                     terminal: terminal.as_deref_mut(),
                     layout_engine: &mut self.layout_engine,
                     did_clear_terminal_output: false,
                     force_full_repaint: false,
                     invalidate_prev_frame: false,
+                    drawn_node_removed: false,
                     layout_invalidations: LayoutInvalidations::default(),
                 };
                 let mut component_context_stack = ContextStack::root(&mut self.system_context);
@@ -1864,6 +1900,7 @@ impl<'a> Tree<'a> {
                     context.did_clear_terminal_output,
                     context.force_full_repaint,
                     context.invalidate_prev_frame,
+                    context.drawn_node_removed,
                     context.layout_invalidations,
                 )
             };
@@ -1871,6 +1908,7 @@ impl<'a> Tree<'a> {
             did_clear_terminal_output |= did_clear;
             force_full_repaint |= force_full;
             invalidate_prev_frame |= invalidate;
+            drawn_node_removed |= removed;
             if settle_rounds_left == 0 {
                 break;
             }
@@ -1953,15 +1991,6 @@ impl<'a> Tree<'a> {
                 .set_style(self.wrapper_node_id, wrapper_style)
                 .expect("we should be able to set the wrapper style");
         }
-
-        // Read BEFORE compute_layout clears it: if no style, measure function,
-        // child list or explicit mark_dirty touched the tree since the last
-        // frame, the layout output cannot have moved and the whole-tree
-        // layout-shift snapshot below can be skipped.
-        let layout_inputs_dirty = self
-            .layout_engine
-            .dirty(self.wrapper_node_id)
-            .unwrap_or(true);
 
         self.layout_engine
             .compute_layout_with_measure(
@@ -2076,14 +2105,6 @@ impl<'a> Tree<'a> {
         }
 
         debug_dump_layout_tree(&self.layout_engine, self.wrapper_node_id);
-        // Whole-tree snapshot walk (every node + a layout-engine lock each)
-        // only runs when some layout input actually changed this frame;
-        // otherwise the previous verdict trivially holds: nothing moved.
-        let layout_shifted = if layout_inputs_dirty {
-            self.update_layout_shift_state()
-        } else {
-            false
-        };
         let layout_duration = layout_start.map_or(Duration::ZERO, |start| start.elapsed());
         let draw_start = profile_enabled.then(std::time::Instant::now);
         let wrapper_layout = self
@@ -2104,7 +2125,7 @@ impl<'a> Tree<'a> {
             .layout_engine
             .layout(self.root_component.node_id())
             .expect("we should be able to get the root layout");
-        let (overlays, layout_pass_requested) = {
+        let (overlays, layout_pass_requested, layout_shifted) = {
             let mut drawer = ComponentDrawer {
                 node_id: self.root_component.node_id(),
                 node_position: Point {
@@ -2142,14 +2163,17 @@ impl<'a> Tree<'a> {
                     prev_overlays,
                     overlays: Vec::new(),
                     layout_pass_requested: false,
+                    layout_shifted: drawn_node_removed,
                 },
             };
+            drawer.record_drawn_layout(root_layout);
             self.root_component.draw(&mut drawer);
             drawer.replay_deferred_no_select();
             drawer.clear_deferred_no_select();
             (
                 drawer.context.overlays,
                 drawer.context.layout_pass_requested,
+                drawer.context.layout_shifted,
             )
         };
         if force_full_repaint {
@@ -2178,39 +2202,6 @@ impl<'a> Tree<'a> {
                 canvas_alloc,
                 settle_rounds: settle_rounds_taken,
             },
-        }
-    }
-
-    fn update_layout_shift_state(&mut self) -> bool {
-        let mut current = HashMap::new();
-        self.collect_layout_snapshots(self.wrapper_node_id, &mut current);
-        let shifted = !self.prev_layout_snapshots.is_empty()
-            && (self.prev_layout_snapshots.len() != current.len()
-                || current.iter().any(|(node_id, snapshot)| {
-                    self.prev_layout_snapshots
-                        .get(node_id)
-                        .is_none_or(|previous| snapshot.shifts_from(*previous))
-                }));
-        self.prev_layout_snapshots = current;
-        shifted
-    }
-
-    fn collect_layout_snapshots(&self, node_id: NodeId, out: &mut HashMap<NodeId, LayoutSnapshot>) {
-        if let Ok(layout) = self.layout_engine.layout(node_id) {
-            out.insert(
-                node_id,
-                LayoutSnapshot {
-                    x: layout.location.x as i16,
-                    y: layout.location.y as i16,
-                    width: layout.size.width as u16,
-                    height: layout.size.height as u16,
-                },
-            );
-        }
-        if let Ok(children) = self.layout_engine.children(node_id) {
-            for child in children {
-                self.collect_layout_snapshots(child, out);
-            }
         }
     }
 

@@ -1042,6 +1042,62 @@ async fn test_main_screen_layout_shift_marks_next_canvas_damage() {
     );
 }
 
+// Shows an absolutely positioned overlay, then removes it; nothing else moves.
+#[component]
+fn OverlayToggleComponent(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let mut system = hooks.use_context_mut::<SystemContext>();
+    let mut step = hooks.use_state(|| 0u8);
+
+    hooks.use_future(async move {
+        for _ in 0..2 {
+            smol::Timer::after(Duration::from_millis(20)).await;
+            step.set(step.get() + 1);
+        }
+    });
+
+    if step.get() == 2 {
+        system.exit();
+    }
+
+    element! {
+        View(flex_direction: FlexDirection::Column, width: 8) {
+            Text(content: "one")
+            Text(content: "two")
+            #((step.get() == 1).then(|| element! {
+                View(position: Position::Absolute, top: 0, left: 4) {
+                    Text(content: "menu")
+                }
+            }))
+        }
+    }
+}
+
+#[apply(test!)]
+async fn test_removed_drawn_node_marks_canvas_damage_but_added_node_does_not() {
+    let canvases: Vec<_> = element!(OverlayToggleComponent)
+        .mock_terminal_render_loop(MockTerminalConfig::default())
+        .collect()
+        .await;
+
+    let frames: Vec<_> = canvases.iter().map(|canvas| canvas.to_string()).collect();
+    assert_eq!(frames, ["one\ntwo\n", "one menu\ntwo\n", "one\ntwo\n"]);
+    assert_eq!(
+        canvases[1].damage_region(),
+        None,
+        "a node that appears moves nothing that was drawn"
+    );
+    assert_eq!(
+        canvases[2].damage_region(),
+        Some(DamageRegion {
+            x: 0,
+            y: 0,
+            width: canvases[2].width(),
+            height: canvases[2].height(),
+        }),
+        "CC Ink counts a removed child as a layout shift"
+    );
+}
+
 /// A component that updates state rapidly (every poll) until 20 updates have
 /// occurred. With throttling enabled, many updates coalesce into few frames.
 #[component]
