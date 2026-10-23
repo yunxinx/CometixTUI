@@ -389,13 +389,25 @@ pub(super) fn unregister_terminal_for_panic_restore(fullscreen: bool) {
     }
 }
 
+/// Main-screen state kept while a dynamic alternate screen is shown. The main
+/// screen still holds the inline frame when the alternate screen is left, with the
+/// cursor back on its baseline, so the inline renderer resumes exactly here.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SavedMainScreen {
+    mouse_capture: bool,
+    prev_canvas_height: u16,
+    prev_size_on_write: Option<(u16, u16)>,
+    inline_bottom_gap: u16,
+    inline_force_full_rewrite_next_diff: bool,
+}
+
 pub(super) struct StdTerminal<'a> {
     pub(super) input_is_terminal: bool,
     pub(super) dest: Box<dyn Write + Send + 'a>,
     pub(super) alt: Box<dyn Write + Send + 'a>,
     pub(super) fullscreen: bool,
     pub(super) mouse_capture: bool,
-    pub(super) dynamic_alternate_saved_mouse_capture: Option<bool>,
+    pub(super) dynamic_alternate_saved_main_screen: Option<SavedMainScreen>,
     pub(super) raw_mode_enabled: bool,
     pub(super) supports_keyboard_enhancement: bool,
     pub(super) enabled_keyboard_enhancement: bool,
@@ -660,7 +672,13 @@ impl TerminalImpl for StdTerminal<'_> {
                     .queue(terminal::Clear(terminal::ClearType::All))?
                     .queue(cursor::MoveTo(0, 0))?;
                 self.fullscreen = true;
-                self.dynamic_alternate_saved_mouse_capture = Some(self.mouse_capture);
+                self.dynamic_alternate_saved_main_screen = Some(SavedMainScreen {
+                    mouse_capture: self.mouse_capture,
+                    prev_canvas_height: self.prev_canvas_height,
+                    prev_size_on_write: self.prev_size_on_write,
+                    inline_bottom_gap: self.inline_bottom_gap,
+                    inline_force_full_rewrite_next_diff: self.inline_force_full_rewrite_next_diff,
+                });
                 register_fullscreen_mode_for_panic_restore();
                 self.set_mouse_capture(request.mouse_tracking)?;
                 self.reset_retained_output_state();
@@ -673,15 +691,19 @@ impl TerminalImpl for StdTerminal<'_> {
             }
             (true, None) => {
                 self.restore_cursor_baseline()?;
-                let restore_mouse_capture = self
-                    .dynamic_alternate_saved_mouse_capture
-                    .take()
-                    .unwrap_or(false);
-                self.set_mouse_capture(restore_mouse_capture)?;
+                let saved = self.dynamic_alternate_saved_main_screen.take();
+                self.set_mouse_capture(saved.is_some_and(|saved| saved.mouse_capture))?;
                 self.dest.queue(terminal::LeaveAlternateScreen)?;
                 self.fullscreen = false;
                 unregister_fullscreen_mode_for_panic_restore();
                 self.reset_retained_output_state();
+                if let Some(saved) = saved {
+                    self.prev_canvas_height = saved.prev_canvas_height;
+                    self.prev_size_on_write = saved.prev_size_on_write;
+                    self.inline_bottom_gap = saved.inline_bottom_gap;
+                    self.inline_force_full_rewrite_next_diff =
+                        saved.inline_force_full_rewrite_next_diff;
+                }
                 self.dest.flush()?;
                 Ok(true)
             }
@@ -1161,7 +1183,7 @@ impl<'a> StdTerminal<'a> {
             input_is_terminal,
             fullscreen,
             mouse_capture,
-            dynamic_alternate_saved_mouse_capture: None,
+            dynamic_alternate_saved_main_screen: None,
             raw_mode_enabled: false,
             supports_keyboard_enhancement,
             enabled_keyboard_enhancement: false,

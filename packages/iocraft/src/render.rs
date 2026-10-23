@@ -1248,6 +1248,12 @@ impl ComponentDrawer<'_> {
         self.context.canvas
     }
 
+    /// The whole frame drawn so far. In `post_component_draw` it holds everything this
+    /// component and its children drew, which is the screen a fullscreen selection copies from.
+    pub fn root_canvas(&self) -> &Canvas {
+        self.context.canvas
+    }
+
     /// Gets the region of the canvas that the component should be drawn to.
     pub fn canvas(&mut self) -> CanvasSubviewMut<'_> {
         self.context.canvas.subview_mut(
@@ -2006,7 +2012,10 @@ impl<'a> Tree<'a> {
                     // Invalidated alongside the render-loop's own prev_canvas
                     // (clear-terminal / resize / resume all pass None), so a
                     // blit can never copy from a stale or cleared frame.
-                    prev_canvas: if invalidate_prev_frame || did_clear_terminal_output {
+                    prev_canvas: if invalidate_prev_frame
+                        || did_clear_terminal_output
+                        || alternate_screen_changed
+                    {
                         None
                     } else {
                         prev_canvas
@@ -2085,6 +2094,8 @@ impl<'a> Tree<'a> {
     ) -> io::Result<()> {
         term.start_event_stream()?;
         let mut prev_canvas: Option<Canvas> = None;
+        // The last inline frame, held while a dynamic alternate screen is shown.
+        let mut main_screen_canvas: Option<Canvas> = None;
         let mut prev_terminal_size: Option<(u16, u16)> = None;
         let mut mouse_capture_enabled: Option<bool> = None;
         loop {
@@ -2261,12 +2272,26 @@ impl<'a> Tree<'a> {
                         canvas_height: output.canvas.height(),
                     });
                     let write_start = profile_enabled.then(std::time::Instant::now);
-                    let prev =
-                        if output.did_clear_terminal_output || output.alternate_screen_changed {
+                    // The main screen keeps the inline frame while an alternate screen
+                    // is shown; leaving it diffs against that frame instead of writing
+                    // a second copy below it.
+                    let resumed_main_screen = if output.alternate_screen_changed {
+                        if term.is_fullscreen() {
+                            main_screen_canvas = prev_canvas.take();
                             None
                         } else {
-                            prev_canvas.as_ref()
-                        };
+                            main_screen_canvas.take()
+                        }
+                    } else {
+                        None
+                    };
+                    let prev = if output.did_clear_terminal_output {
+                        None
+                    } else if output.alternate_screen_changed {
+                        resumed_main_screen.as_ref()
+                    } else {
+                        prev_canvas.as_ref()
+                    };
                     term.write_canvas_after_repaint_check(prev, &output.canvas)?;
                     // Position (or hide) the physical cursor after the frame has been
                     // committed, so IMEs and screen readers can anchor to the caret of

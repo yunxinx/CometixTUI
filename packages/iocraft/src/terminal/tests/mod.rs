@@ -944,7 +944,7 @@ fn new_fullscreen_term(
         alt: Box::new(io::sink()),
         fullscreen: true,
         mouse_capture: false,
-        dynamic_alternate_saved_mouse_capture: None,
+        dynamic_alternate_saved_main_screen: None,
         raw_mode_enabled: false,
         supports_keyboard_enhancement: false,
         enabled_keyboard_enhancement: false,
@@ -980,7 +980,7 @@ fn new_inline_term_with_size(
         alt: Box::new(io::sink()),
         fullscreen: false,
         mouse_capture: false,
-        dynamic_alternate_saved_mouse_capture: None,
+        dynamic_alternate_saved_main_screen: None,
         raw_mode_enabled: false,
         supports_keyboard_enhancement: false,
         enabled_keyboard_enhancement: false,
@@ -3505,6 +3505,77 @@ fn test_dynamic_alternate_screen_enters_clears_homes_and_exits() {
         output.contains("\x1b[?1049l"),
         "unmounting AlternateScreen should leave alt screen: {output:?}"
     );
+}
+
+fn inline_frame(rows: usize, last_row: &str) -> Canvas {
+    let mut canvas = Canvas::new(10, rows);
+    for row in 0..rows {
+        let text = if row + 1 == rows {
+            last_row.to_string()
+        } else {
+            format!("frame{row}")
+        };
+        canvas.subview_mut(0, 0, 0, 0, 10, rows).set_text(
+            0,
+            row as isize,
+            &text,
+            CanvasTextStyle::default(),
+        );
+    }
+    canvas
+}
+
+/// Feeds an inline frame, an optional dynamic alternate-screen round trip and an edited
+/// frame through a terminal, returning every non-blank line of the screen and scrollback.
+fn inline_frames_with_round_trip(frame_rows: usize, round_trip: bool) -> Vec<String> {
+    let before = inline_frame(frame_rows, "editor");
+    let after = inline_frame(frame_rows, "edited");
+    let mut alternate = Canvas::new(10, 4);
+    alternate
+        .subview_mut(0, 0, 0, 0, 10, 4)
+        .set_text(0, 0, "alt", CanvasTextStyle::default());
+
+    let (dest, buf) = new_test_writer();
+    let mut term = new_inline_term_with_size(dest, 0, (10, 4));
+    let mut vt = avt::Vt::new(10, 4);
+    vt.feed_str("history\r\n");
+    term.write_canvas(None, &before).unwrap();
+    term.write_canvas(Some(&before), &before).unwrap();
+    if round_trip {
+        term.set_dynamic_alternate_screen(Some(crate::context::AlternateScreenRequest {
+            mouse_tracking: false,
+        }))
+        .unwrap();
+        term.write_canvas(None, &alternate).unwrap();
+        term.set_dynamic_alternate_screen(None).unwrap();
+    }
+    term.write_canvas(Some(&before), &after).unwrap();
+    term.dest.flush().unwrap();
+    vt.feed_str(&String::from_utf8(buf.lock().unwrap().clone()).unwrap());
+    vt.text()
+        .into_iter()
+        .map(|line| line.trim_end().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// Leaving a dynamic alternate screen resumes the inline frame the main screen still
+/// shows: the next frame diffs against it, so screen and scrollback end up exactly as
+/// if the alternate screen had never been shown, including for frames taller than the
+/// terminal.
+#[test]
+fn test_dynamic_alternate_screen_round_trip_leaves_no_trace_on_the_main_screen() {
+    assert_eq!(
+        inline_frames_with_round_trip(3, true),
+        ["history", "frame0", "frame1", "edited"]
+    );
+    for frame_rows in [3, 6] {
+        assert_eq!(
+            inline_frames_with_round_trip(frame_rows, true),
+            inline_frames_with_round_trip(frame_rows, false),
+            "frame of {frame_rows} rows"
+        );
+    }
 }
 
 #[test]
