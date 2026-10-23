@@ -2869,6 +2869,49 @@ fn test_same_size_resize_event_is_ignored() {
 }
 
 #[test]
+fn test_end_of_synchronized_update_reports_errors() {
+    struct FailOnSyncEnd(Arc<AtomicUsize>);
+    impl Write for FailOnSyncEnd {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf
+                .windows(b"\x1b[?2026l".len())
+                .any(|bytes| bytes == b"\x1b[?2026l")
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut terminal = Terminal::new(
+        Box::new(FailOnSyncEnd(attempts.clone())),
+        Box::new(io::sink()),
+        Output::Stdout,
+        false,
+        false,
+    )
+    .unwrap();
+    terminal.synchronized_update_supported = true;
+
+    let result = terminal.synchronized_update(|terminal| terminal.write_all(b"frame"));
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    let result = terminal.synchronized_update(|terminal| {
+        terminal.write_all(b"frame")?;
+        Err(io::Error::from(io::ErrorKind::InvalidData))
+    });
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[test]
 fn test_synchronized_update_is_lazy() {
     let (dest, buf) = new_test_writer();
     let mut term = Terminal::new(

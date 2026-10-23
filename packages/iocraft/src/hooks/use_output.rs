@@ -96,7 +96,20 @@ struct UseOutputState {
     closed: bool,
     queue: Vec<Message>,
     waker: Option<Waker>,
-    appended_newline: Option<u16>,
+}
+
+fn enqueue(state: &Mutex<UseOutputState>, message: Message) {
+    let waker = {
+        let mut state = state.lock().unwrap();
+        if state.closed && matches!(message, Message::StdoutControlAcknowledged(..)) {
+            return;
+        }
+        state.queue.push(message);
+        state.waker.take()
+    };
+    if let Some(waker) = waker {
+        waker.wake();
+    }
 }
 
 fn normalize_terminal_newlines(text: &str) -> Cow<'_, str> {
@@ -200,7 +213,13 @@ fn advance_terminal_column(col: u16, text: &str, terminal_width: Option<usize>) 
     col
 }
 
-impl UseOutputState {
+#[derive(Default)]
+struct OutputBatch {
+    queue: Vec<Message>,
+    appended_newline: Option<u16>,
+}
+
+impl OutputBatch {
     fn exec(&mut self, updater: &mut ComponentUpdater) {
         if self.queue.is_empty() {
             return;
@@ -343,15 +362,10 @@ impl StdoutHandle {
         sequence: String,
     ) -> BoxFuture<'static, io::Result<()>> {
         let (sender, receiver) = oneshot::channel();
-        let mut state = self.state.lock().unwrap();
-        if !state.closed {
-            state
-                .queue
-                .push(Message::StdoutControlAcknowledged(sequence, sender));
-            if let Some(waker) = state.waker.take() {
-                waker.wake();
-            }
-        }
+        enqueue(
+            &self.state,
+            Message::StdoutControlAcknowledged(sequence, sender),
+        );
         Box::pin(async move {
             receiver.await.unwrap_or_else(|_| {
                 Err(io::Error::new(
@@ -365,11 +379,7 @@ impl StdoutHandle {
     /// Queues a message to be written asynchronously to stdout, above the rendered component
     /// output.
     pub fn println<S: ToString>(&self, msg: S) {
-        let mut state = self.state.lock().unwrap();
-        state.queue.push(Message::Stdout(msg.to_string()));
-        if let Some(waker) = state.waker.take() {
-            waker.wake();
-        }
+        enqueue(&self.state, Message::Stdout(msg.to_string()));
     }
 
     /// Queues a message to be written asynchronously to stdout without a newline, above the
@@ -379,11 +389,7 @@ impl StdoutHandle {
         if msg.is_empty() {
             return;
         }
-        let mut state = self.state.lock().unwrap();
-        state.queue.push(Message::StdoutNoNewline(msg));
-        if let Some(waker) = state.waker.take() {
-            waker.wake();
-        }
+        enqueue(&self.state, Message::StdoutNoNewline(msg));
     }
 
     /// Queues a raw terminal control sequence to stdout.
@@ -396,11 +402,7 @@ impl StdoutHandle {
         if sequence.is_empty() {
             return;
         }
-        let mut state = self.state.lock().unwrap();
-        state.queue.push(Message::StdoutControl(sequence));
-        if let Some(waker) = state.waker.take() {
-            waker.wake();
-        }
+        enqueue(&self.state, Message::StdoutControl(sequence));
     }
 
     /// Queues an OSC 52 clipboard write to stdout.
@@ -428,13 +430,10 @@ impl StdoutHandle {
         text: S,
         multiplexer: ClipboardMultiplexer,
     ) {
-        let mut state = self.state.lock().unwrap();
-        state
-            .queue
-            .push(Message::StdoutClipboard(text.to_string(), multiplexer));
-        if let Some(waker) = state.waker.take() {
-            waker.wake();
-        }
+        enqueue(
+            &self.state,
+            Message::StdoutClipboard(text.to_string(), multiplexer),
+        );
     }
 
     /// Copies a fullscreen [`SelectionState`] from a [`Canvas`] to the terminal
@@ -551,11 +550,7 @@ impl StderrHandle {
     /// Queues a message to be written asynchronously to stderr, above the rendered component
     /// output.
     pub fn println<S: ToString>(&self, msg: S) {
-        let mut state = self.state.lock().unwrap();
-        state.queue.push(Message::Stderr(msg.to_string()));
-        if let Some(waker) = state.waker.take() {
-            waker.wake();
-        }
+        enqueue(&self.state, Message::Stderr(msg.to_string()));
     }
 
     /// Queues a message to be written asynchronously to stderr without a newline, above the
@@ -565,11 +560,7 @@ impl StderrHandle {
         if msg.is_empty() {
             return;
         }
-        let mut state = self.state.lock().unwrap();
-        state.queue.push(Message::StderrNoNewline(msg));
-        if let Some(waker) = state.waker.take() {
-            waker.wake();
-        }
+        enqueue(&self.state, Message::StderrNoNewline(msg));
     }
 }
 
@@ -577,28 +568,37 @@ impl StderrHandle {
 struct UseOutputImpl {
     state: Arc<Mutex<UseOutputState>>,
     clipboard: Option<Clipboard>,
+    pending: OutputBatch,
 }
 
 impl Drop for UseOutputImpl {
     fn drop(&mut self) {
-        let mut state = self.state.lock().unwrap();
-        state.closed = true;
-        state.queue.clear();
+        let queue = {
+            let mut state = self.state.lock().unwrap();
+            state.closed = true;
+            std::mem::take(&mut state.queue)
+        };
+        // Dropping acknowledgements can wake consumers that enqueue output.
+        drop(queue);
     }
 }
 
 impl Hook for UseOutputImpl {
     fn poll_change(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
+        let waker = cx.waker().clone();
         let mut state = self.state.lock().unwrap();
         // Register-then-check (see UseState::poll_change): the Ready path
         // must stay armed so output queued after this frame's drain still
         // wakes the component under push-wake harvesting.
-        state.waker = Some(cx.waker().clone());
-        if state.queue.is_empty() {
+        let old_waker = state.waker.replace(waker);
+        let result = if state.queue.is_empty() {
             Poll::Pending
         } else {
             Poll::Ready(())
-        }
+        };
+        drop(state);
+        drop(old_waker);
+        result
     }
 
     // Drain after every hook's `post_component_update`, so output queued by
@@ -607,8 +607,16 @@ impl Hook for UseOutputImpl {
     // left anything queued by a later hook for the next pass, and the render
     // loop exits before that pass when the same render called `exit()`.
     fn post_component_effects(&mut self, updater: &mut ComponentUpdater) {
-        let mut state = self.state.lock().unwrap();
-        state.exec(updater);
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.queue.is_empty() || updater.terminal_mut().is_none() {
+                return;
+            }
+            std::mem::swap(&mut self.pending.queue, &mut state.queue);
+        }
+        // Callbacks enqueue into state.queue for the next pass. Keep partial-line
+        // bookkeeping with the output owner across batches.
+        self.pending.exec(updater);
     }
 }
 
@@ -634,6 +642,143 @@ mod tests {
     use futures::{task::noop_waker, StreamExt};
     use macro_rules_attribute::apply;
     use smol_macros::test;
+
+    #[test]
+    fn test_formatting_and_waking_can_enqueue_output() {
+        struct NestedMessage(StdoutHandle);
+        impl std::fmt::Display for NestedMessage {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.println("inner");
+                f.write_str("outer")
+            }
+        }
+        struct WriteOnWake(StdoutHandle);
+        impl std::task::Wake for WriteOnWake {
+            fn wake(self: Arc<Self>) {
+                self.0.println("wake");
+            }
+        }
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut output = UseOutputImpl::default();
+            let stdout = output.use_stdout();
+            let waker = Waker::from(Arc::new(WriteOnWake(stdout.clone())));
+            assert!(Pin::new(&mut output)
+                .poll_change(&mut core::task::Context::from_waker(&waker))
+                .is_pending());
+            stdout.println(NestedMessage(stdout.clone()));
+            let messages: Vec<_> = output
+                .state
+                .lock()
+                .unwrap()
+                .queue
+                .iter()
+                .map(|message| match message {
+                    Message::Stdout(content) => content.clone(),
+                    _ => panic!("expected stdout message"),
+                })
+                .collect();
+            sender.send(messages).unwrap();
+        });
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("reentrant output must not deadlock"),
+            ["inner", "wake", "outer"]
+        );
+        worker.join().unwrap();
+    }
+
+    #[cfg(feature = "unstable-output-streams")]
+    #[test]
+    fn test_backend_output_is_flushed_on_the_next_update() {
+        #[derive(Default)]
+        struct Trace {
+            stdout: Option<StdoutHandle>,
+            updates: usize,
+            writes: Vec<(usize, String)>,
+            bytes: Vec<u8>,
+        }
+
+        struct ReentrantWriter(Arc<Mutex<Trace>>);
+        impl io::Write for ReentrantWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let nested = {
+                    let mut trace = self.0.lock().unwrap();
+                    trace.bytes.extend_from_slice(bytes);
+                    if bytes == b"outer" || bytes == b"nested" {
+                        let update = trace.updates;
+                        trace
+                            .writes
+                            .push((update, String::from_utf8(bytes.to_vec()).unwrap()));
+                    }
+                    (bytes == b"outer").then(|| trace.stdout.as_ref().unwrap().clone())
+                };
+                if let Some(stdout) = nested {
+                    stdout.print("nested");
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[component]
+        fn FlushingComponent(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+            let trace = hooks.use_context::<Arc<Mutex<Trace>>>().clone();
+            let (stdout, _) = hooks.use_output();
+            let updates = {
+                let mut trace = trace.lock().unwrap();
+                trace.stdout = Some(stdout.clone());
+                trace.updates += 1;
+                trace.updates
+            };
+            hooks.use_effect(move || stdout.print("outer"), ());
+            if updates == 2 {
+                hooks.use_context_mut::<SystemContext>().exit();
+            }
+            element!(View)
+        }
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            for push_wake in [true, false] {
+                crate::render::wake::set_push_wake_for_tests(Some(push_wake));
+                let trace = Arc::new(Mutex::new(Trace::default()));
+                smol::block_on(
+                    element! {
+                        ContextProvider(value: crate::Context::owned(trace.clone())) {
+                            FlushingComponent
+                        }
+                    }
+                    .render_loop()
+                    .stdout(ReentrantWriter(trace.clone())),
+                )
+                .unwrap();
+                crate::render::wake::set_push_wake_for_tests(None);
+                let trace = trace.lock().unwrap();
+                assert_eq!(
+                    trace.writes,
+                    [(1, "outer".to_string()), (2, "nested".to_string())]
+                );
+                assert!(
+                    trace
+                        .bytes
+                        .windows(b"\x1b[1A\x1b[5C".len())
+                        .any(|bytes| bytes == b"\x1b[1A\x1b[5C"),
+                    "the next batch must resume after the previous partial line"
+                );
+            }
+            sender.send(()).unwrap();
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("writer output must not deadlock");
+        worker.join().unwrap();
+    }
 
     #[test]
     fn test_normalize_terminal_newlines_preserves_carriage_return_alignment() {

@@ -695,12 +695,13 @@ impl<'a> Terminal<'a> {
         Ok(())
     }
 
-    fn end_synchronized_update(&mut self) {
+    fn end_synchronized_update(&mut self) -> io::Result<()> {
         self.synchronized_update_depth = self.synchronized_update_depth.saturating_sub(1);
         if self.synchronized_update_depth == 0 && self.synchronized_update_started {
-            let _ = self.inner.dest().execute(terminal::EndSynchronizedUpdate);
             self.synchronized_update_started = false;
+            self.inner.dest().execute(terminal::EndSynchronizedUpdate)?;
         }
+        Ok(())
     }
 
     /// Wraps a series of terminal updates in a synchronized update block, making sure to end the
@@ -709,8 +710,9 @@ impl<'a> Terminal<'a> {
     where
         F: FnOnce(&mut Self) -> io::Result<()>,
     {
-        let t = SynchronizedUpdate::begin(self);
-        f(t.inner)
+        let mut t = SynchronizedUpdate::begin(self);
+        let result = f(t.inner.as_deref_mut().unwrap());
+        result.and(t.finish())
     }
 
     pub fn start_event_stream(&mut self) -> io::Result<()> {
@@ -965,21 +967,29 @@ impl Write for Terminal<'_> {
 }
 
 /// Synchronized update terminal guard.
-/// Enters synchronized update on creation, exits when dropped.
+/// Enters synchronized update on creation, exits when finished or dropped.
 pub(crate) struct SynchronizedUpdate<'a, 'b> {
-    inner: &'a mut Terminal<'b>,
+    inner: Option<&'a mut Terminal<'b>>,
 }
 
 impl<'a, 'b> SynchronizedUpdate<'a, 'b> {
     pub fn begin(terminal: &'a mut Terminal<'b>) -> Self {
         terminal.synchronized_update_depth += 1;
-        Self { inner: terminal }
+        Self {
+            inner: Some(terminal),
+        }
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        self.inner.take().unwrap().end_synchronized_update()
     }
 }
 
 impl Drop for SynchronizedUpdate<'_, '_> {
     fn drop(&mut self) {
-        self.inner.end_synchronized_update();
+        if let Some(inner) = self.inner.as_deref_mut() {
+            let _ = inner.end_synchronized_update();
+        }
     }
 }
 
