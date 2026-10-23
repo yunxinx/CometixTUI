@@ -205,6 +205,12 @@ impl<'a> Hooks<'a, '_> {
         }
     }
 
+    /// The owning component's wake proxy, for a hook that learns of a change outside the
+    /// update phase, such as a size seen while drawing.
+    pub(crate) fn component_waker(&self) -> Option<&Waker> {
+        self.waker
+    }
+
     /// If this is the component's first render, this function adds a new hook to the component and
     /// returns it.
     ///

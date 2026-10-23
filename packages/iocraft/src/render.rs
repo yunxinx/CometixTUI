@@ -779,6 +779,21 @@ struct DrawContext<'a> {
     /// clear-terminal, resize, resume, or on the first frame). Enables the
     /// retained-blit fast path for memo-retained subtrees.
     prev_canvas: Option<&'a Canvas>,
+    /// The absolutely positioned rectangles `prev_canvas` was drawn with, in draw order.
+    prev_overlays: &'a [CanvasRect],
+    /// The absolutely positioned rectangles drawn so far this frame, in draw order. An overlay
+    /// paints over whatever lies under it, so a subtree restored from the previous canvas
+    /// would bring back an overlay that has since moved, shrunk or gone.
+    overlays: Vec<CanvasRect>,
+    /// A component found itself drawn at a size other than the one it laid itself out at.
+    layout_pass_requested: bool,
+}
+
+/// A canvas rectangle as `(x, y, width, height)`.
+pub(crate) type CanvasRect = (usize, usize, usize, usize);
+
+fn rects_intersect(a: CanvasRect, b: CanvasRect) -> bool {
+    a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
 }
 
 /// Gate for the retained-blit draw fast path (B3-α): a memo-retained subtree
@@ -882,8 +897,17 @@ impl ComponentDrawer<'_> {
     /// * the rectangle is fully inside both canvases (a clipped or shifted
     ///   node falls back to a normal draw);
     /// * the previous frame's cursor declaration is not inside the rectangle
-    ///   (a blitted subtree runs no draw hooks, so it could not re-declare it).
-    pub(crate) fn try_retained_blit(&mut self, rect: (usize, usize, usize, usize)) -> bool {
+    ///   (a blitted subtree runs no draw hooks, so it could not re-declare it);
+    /// * no absolutely positioned node outside the subtree painted into the
+    ///   rectangle on the previous canvas: `own_overlays` is the range of
+    ///   [`Self::overlay_count`] values the subtree's own draw spanned there.
+    ///   CC Ink drops `prevScreen` after an absolute node is removed and skips
+    ///   blitting rows under one that shrank; this covers both, and moves.
+    pub(crate) fn try_retained_blit(
+        &mut self,
+        rect: CanvasRect,
+        own_overlays: std::ops::Range<usize>,
+    ) -> bool {
         if !retained_blit_enabled() {
             return false;
         }
@@ -918,9 +942,20 @@ impl ComponentDrawer<'_> {
                 return false;
             }
         }
-        // Baseline variant: `prev` here is exactly the terminal diff baseline
-        // (the previous committed frame), so the copied rows stay unmarked and
-        // the diff writer can skip their cell scans.
+        let prev_overlays = self.context.prev_overlays;
+        let own_start = own_overlays.start.min(prev_overlays.len());
+        let own_end = own_overlays.end.clamp(own_start, prev_overlays.len());
+        if prev_overlays[..own_start]
+            .iter()
+            .chain(&prev_overlays[own_end..])
+            .any(|overlay| rects_intersect(*overlay, rect))
+        {
+            return false;
+        }
+        // Baseline variant: `prev` here is the terminal diff baseline (the
+        // previous committed frame), so the copied rows stay unmarked and the
+        // diff writer can skip their cell scans. A layout pass blits from the
+        // frame's first pass instead and damages its whole canvas.
         self.context
             .canvas
             .blit_region_from_baseline(prev, x, y, width, height);
@@ -1263,6 +1298,17 @@ impl ComponentDrawer<'_> {
         )
     }
 
+    /// Asks for the frame to be rendered again before it is written: the component laid itself
+    /// out at a size other than the one it is drawn at, and has woken itself to update with it.
+    pub(crate) fn request_layout_pass(&mut self) {
+        self.context.layout_pass_requested = true;
+    }
+
+    /// How many absolutely positioned rectangles this frame has drawn so far.
+    pub(crate) fn overlay_count(&self) -> usize {
+        self.context.overlays.len()
+    }
+
     /// Prepares to begin drawing a node by moving to the node's position and invoking the given
     /// closure.
     pub(crate) fn for_child_node_layout<F>(&mut self, node_id: NodeId, f: F)
@@ -1299,6 +1345,17 @@ impl ComponentDrawer<'_> {
             width: layout.size.width as u16,
             height: layout.size.height as u16,
         };
+        if self.style().position == Position::Absolute {
+            let (x, y) = (i32::from(next_position.x), i32::from(next_position.y));
+            let right = (x + i32::from(self.node_size.width)).max(0) as usize;
+            let bottom = (y + i32::from(self.node_size.height)).max(0) as usize;
+            let (left, top) = (x.max(0) as usize, y.max(0) as usize);
+            if right > left && bottom > top {
+                self.context
+                    .overlays
+                    .push((left, top, right - left, bottom - top));
+            }
+        }
         f(self);
         let requested_skip_children = self.skip_children;
         let requested_hide_children = self.hide_children;
@@ -1620,12 +1677,16 @@ struct Tree<'a> {
     // root `App` mounts `ClockProvider` (CC `ink/components/App.tsx:219`).
     clock: crate::components::Clock,
     prev_layout_snapshots: HashMap<NodeId, LayoutSnapshot>,
+    /// The absolutely positioned rectangles of the last rendered canvas.
+    overlays: Vec<CanvasRect>,
 }
 
 struct RenderOutput {
     canvas: Canvas,
+    overlays: Vec<CanvasRect>,
     did_clear_terminal_output: bool,
     alternate_screen_changed: bool,
+    layout_pass_requested: bool,
     phase_profile: RenderPhaseProfile,
 }
 
@@ -1657,6 +1718,7 @@ impl<'a> Tree<'a> {
             root_view_event_context: crate::components::ViewFocusParentContext::shared_root(),
             clock: crate::components::Clock::new(),
             prev_layout_snapshots: HashMap::new(),
+            overlays: Vec::new(),
         }
     }
 
@@ -1666,6 +1728,66 @@ impl<'a> Tree<'a> {
         mut terminal: Option<&mut Terminal<'_>>,
         profile_enabled: bool,
         prev_canvas: Option<&Canvas>,
+    ) -> RenderOutput {
+        let prev_overlays = std::mem::take(&mut self.overlays);
+        let mut first = self.render_pass(
+            max_width,
+            terminal.as_deref_mut(),
+            profile_enabled,
+            prev_canvas,
+            &prev_overlays,
+        );
+        // Layout effects: a component that lays itself out at the size it was drawn at
+        // (`TextInput` wraps its value to its width) requests another pass when that size
+        // changed, and the frame is rendered again before anything is written, as React
+        // re-renders a layout effect's state write before paint. Sizes come from the parents, so
+        // one more pass settles them; a change it leaves is harvested for the next frame.
+        if !first.layout_pass_requested
+            || !wake::push_wake_enabled()
+            || !self.root_component.settle_render_phase()
+        {
+            self.overlays = std::mem::take(&mut first.overlays);
+            return first;
+        }
+        let mut output = self.render_pass(
+            max_width,
+            terminal,
+            profile_enabled,
+            Some(&first.canvas),
+            &first.overlays,
+        );
+        self.overlays = std::mem::take(&mut output.overlays);
+        output.did_clear_terminal_output |= first.did_clear_terminal_output;
+        output.alternate_screen_changed |= first.alternate_screen_changed;
+        if first.canvas.should_force_full_repaint() {
+            output.canvas.force_full_repaint();
+        }
+        // The second pass copies retained subtrees from the first pass's canvas, which the
+        // terminal never saw: the whole frame is diffed against the one it did.
+        let (width, height) = (output.canvas.width(), output.canvas.height());
+        output.canvas.mark_damage(DamageRegion {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        });
+        let (first_profile, profile) = (first.phase_profile, &mut output.phase_profile);
+        profile.update += first_profile.update;
+        profile.layout += first_profile.layout;
+        profile.draw += first_profile.draw;
+        profile.layout_measures += first_profile.layout_measures;
+        profile.canvas_alloc += first_profile.canvas_alloc;
+        profile.settle_rounds += first_profile.settle_rounds;
+        output
+    }
+
+    fn render_pass(
+        &mut self,
+        max_width: Option<usize>,
+        mut terminal: Option<&mut Terminal<'_>>,
+        profile_enabled: bool,
+        prev_canvas: Option<&Canvas>,
+        prev_overlays: &[CanvasRect],
     ) -> RenderOutput {
         self.system_context.begin_render_frame();
         let update_start = profile_enabled.then(std::time::Instant::now);
@@ -1982,7 +2104,7 @@ impl<'a> Tree<'a> {
             .layout_engine
             .layout(self.root_component.node_id())
             .expect("we should be able to get the root layout");
-        {
+        let (overlays, layout_pass_requested) = {
             let mut drawer = ComponentDrawer {
                 node_id: self.root_component.node_id(),
                 node_position: Point {
@@ -2017,12 +2139,19 @@ impl<'a> Tree<'a> {
                     } else {
                         prev_canvas
                     },
+                    prev_overlays,
+                    overlays: Vec::new(),
+                    layout_pass_requested: false,
                 },
             };
             self.root_component.draw(&mut drawer);
             drawer.replay_deferred_no_select();
             drawer.clear_deferred_no_select();
-        }
+            (
+                drawer.context.overlays,
+                drawer.context.layout_pass_requested,
+            )
+        };
         if force_full_repaint {
             canvas.force_full_repaint();
         }
@@ -2037,8 +2166,10 @@ impl<'a> Tree<'a> {
         let draw_duration = draw_start.map_or(Duration::ZERO, |start| start.elapsed());
         RenderOutput {
             canvas,
+            overlays,
             did_clear_terminal_output,
             alternate_screen_changed,
+            layout_pass_requested,
             phase_profile: RenderPhaseProfile {
                 update: update_duration,
                 layout: layout_duration,

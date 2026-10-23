@@ -8,6 +8,10 @@ use crate::{
     Hook, Hooks, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, LayoutStyle, Overflow, Position,
     Props, Size, StyleOverlay, TerminalEvent, Weight,
 };
+use core::{
+    pin::Pin,
+    task::{Poll, Waker},
+};
 use std::sync::Arc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -86,6 +90,8 @@ impl Hook for CursorOverlayState {
 #[derive(Default)]
 pub struct TextInputHandle {
     inner: Option<TextInputHandleInner>,
+    /// An offset set while no input was mounted, applied by the next one to mount.
+    pending_cursor_offset: Option<usize>,
 }
 
 struct TextInputHandleInner {
@@ -98,9 +104,14 @@ impl TextInputHandle {
     ///
     /// The offset is in bytes, not characters. Offsets past the end are clamped to the value's
     /// length. An offset inside a UTF-8 character is rounded down to that character's start.
+    /// Set while the input is unmounted, the offset applies when an input mounts with this
+    /// handle.
     pub fn set_cursor_offset(&mut self, offset: usize) {
-        if let Some(inner) = &mut self.inner {
-            inner.requested_cursor_offset.set(Some(offset));
+        match &mut self.inner {
+            Some(inner) if inner.requested_cursor_offset.try_get().is_some() => {
+                inner.requested_cursor_offset.set(Some(offset));
+            }
+            _ => self.pending_cursor_offset = Some(offset),
         }
     }
 
@@ -110,7 +121,9 @@ impl TextInputHandle {
     pub fn cursor_offset(&self) -> usize {
         self.inner
             .as_ref()
-            .map_or(0, |inner| inner.cursor_offset.get())
+            .and_then(|inner| inner.cursor_offset.try_get())
+            .or(self.pending_cursor_offset)
+            .unwrap_or(0)
     }
 }
 
@@ -142,6 +155,11 @@ pub struct TextInputProps {
     /// The handler to invoke when the value changes.
     pub on_change: HandlerMut<'static, String>,
 
+    /// The handler to invoke when input moves the cursor, with the new offset in bytes. An edit
+    /// reports its value through [`Self::on_change`] first, so a parent that mirrors both sees
+    /// them together, in the same event.
+    pub on_change_cursor_offset: HandlerMut<'static, usize>,
+
     /// If true, the input will fill 100% of the height of its container and handle multiline input.
     /// If false, line breaks in pasted text are replaced with spaces.
     pub multiline: bool,
@@ -167,24 +185,59 @@ pub struct TextInputProps {
 }
 
 trait UseSize<'a> {
-    fn use_size(&mut self) -> (u16, u16);
+    /// The size the input was last drawn at. A render that laid the text out at another size
+    /// (the first one sees zero) is redone before its frame is written; `uses_height` says
+    /// whether the layout read the height as well as the width.
+    fn use_size(&mut self, uses_height: bool) -> (u16, u16);
 }
 
 impl<'a> UseSize<'a> for Hooks<'a, '_> {
-    fn use_size(&mut self) -> (u16, u16) {
-        self.use_hook(UseSizeImpl::default).size
+    fn use_size(&mut self, uses_height: bool) -> (u16, u16) {
+        let waker = self.component_waker().cloned();
+        let hook = self.use_hook(UseSizeImpl::default);
+        if hook.waker.is_none() {
+            hook.waker = waker;
+        }
+        hook.rendered = Some((hook.size.0, uses_height.then_some(hook.size.1)));
+        hook.size
     }
 }
 
 #[derive(Default)]
 struct UseSizeImpl {
     size: (u16, u16),
+    /// The width, and the height when it was read, of the last render's layout.
+    rendered: Option<(u16, Option<u16>)>,
+    resized: bool,
+    waker: Option<Waker>,
 }
 
 impl Hook for UseSizeImpl {
+    fn poll_change(mut self: Pin<&mut Self>, _cx: &mut core::task::Context) -> Poll<()> {
+        if std::mem::take(&mut self.resized) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn settle_render_phase_change(&mut self, _waker: &Waker) -> bool {
+        std::mem::take(&mut self.resized)
+    }
+
     fn pre_component_draw(&mut self, drawer: &mut ComponentDrawer) {
-        let s = drawer.size();
-        self.size = (s.width, s.height);
+        let size = drawer.size();
+        self.size = (size.width, size.height);
+        let Some((width, height)) = self.rendered else {
+            return;
+        };
+        if width != size.width || height.is_some_and(|height| height != size.height) {
+            self.resized = true;
+            if let Some(waker) = &self.waker {
+                waker.wake_by_ref();
+            }
+            drawer.request_layout_pass();
+        }
     }
 }
 
@@ -442,18 +495,20 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
     let mut prev_value = hooks.use_state(|| "".to_string());
     let mut cursor_offset = hooks.use_state(|| 0usize);
     let mut requested_cursor_offset = hooks.use_state(|| None);
-    let mut new_cursor_offset_hint = hooks.use_state(|| NewCursorOffsetHint::None);
     let mut scroll_offset_row = hooks.use_state(|| 0u16);
     let mut scroll_offset_col = hooks.use_state(|| 0u16);
     let mut vertical_movement_col_preference = hooks.use_state(|| None);
-    let (width, height) = hooks.use_size();
+    let (width, height) = hooks.use_size(!auto_grow);
 
+    let mut pending_cursor_offset = None;
     if let Some(handle_ref) = props.handle.as_mut() {
+        pending_cursor_offset = handle_ref.write().pending_cursor_offset.take();
         handle_ref.set(TextInputHandle {
             inner: Some(TextInputHandleInner {
                 cursor_offset,
                 requested_cursor_offset,
             }),
+            pending_cursor_offset: None,
         });
     }
 
@@ -486,28 +541,27 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
         scroll_offset_row.set(max_scroll_row);
     }
 
-    // Update the cursor position if the value has changed.
+    // Input sets the cursor along with the value it edits; a value the parent changed on its own
+    // moves the cursor by the edit that most likely produced it.
     if props.value.as_str() != prev_value.read().as_str() {
-        let new_cursor_offset = new_cursor_offset(
-            &prev_value.read(),
-            cursor_offset.get(),
-            &props.value,
-            new_cursor_offset_hint.get(),
-        );
+        let new_cursor_offset =
+            new_cursor_offset(&prev_value.read(), cursor_offset.get(), &props.value);
         if cursor_offset != new_cursor_offset {
             cursor_offset.set(new_cursor_offset);
         }
         prev_value.set(props.value.clone());
-        new_cursor_offset_hint.set(NewCursorOffsetHint::None);
     }
 
     // Update the cursor position if the user requested it.
-    if let Some(requested) = requested_cursor_offset.get() {
+    let requested = requested_cursor_offset.get();
+    if requested.is_some() {
+        requested_cursor_offset.set(None);
+    }
+    if let Some(requested) = requested.or(pending_cursor_offset) {
         let requested = clamp_to_char_boundary(&props.value, requested);
         if cursor_offset != requested {
             cursor_offset.set(requested);
         }
-        requested_cursor_offset.set(None);
     }
 
     let safe_cursor_offset = clamp_to_char_boundary(&props.value, cursor_offset.get());
@@ -571,14 +625,17 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
     hooks.use_propagated_terminal_events({
         let buffer = buffer.clone();
         let mut value = props.value.clone();
-        let mut temp_cursor_offset = safe_cursor_offset;
         let mut on_change = props.on_change.take();
+        let mut on_change_cursor_offset = props.on_change_cursor_offset.take();
         move |event| {
             if !has_focus {
                 return;
             }
             let propagated = event;
             let event = propagated.event().clone();
+            let cursor = clamp_to_char_boundary(&value, cursor_offset.get());
+            // The cursor after an edit of `value`.
+            let mut edited = None;
             let mut handled = false;
 
             match event {
@@ -606,9 +663,8 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
                         }
                         normalized
                     };
-                    value.insert_str(temp_cursor_offset, &text);
-                    temp_cursor_offset += text.len();
-                    on_change(value.clone());
+                    value.insert_str(cursor, &text);
+                    edited = Some(cursor + text.len());
                     vertical_movement_col_preference.set(None);
                     handled = true;
                 }
@@ -623,12 +679,12 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
                 {
                     match code {
                         KeyCode::Char('a') => {
-                            cursor_offset.set(buffer.row_start_offset(cursor_offset.get()));
+                            cursor_offset.set(buffer.row_start_offset(cursor));
                             vertical_movement_col_preference.set(None);
                             handled = true;
                         }
                         KeyCode::Char('e') => {
-                            cursor_offset.set(buffer.row_end_offset(cursor_offset.get()));
+                            cursor_offset.set(buffer.row_end_offset(cursor));
                             vertical_movement_col_preference.set(None);
                             handled = true;
                         }
@@ -648,76 +704,66 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
 
                     match code {
                         KeyCode::Char(c) => {
-                            value.insert(temp_cursor_offset, c);
-                            temp_cursor_offset += c.len_utf8();
-                            on_change(value.clone());
+                            value.insert(cursor, c);
+                            edited = Some(cursor + c.len_utf8());
                             handled = true;
                         }
                         KeyCode::Backspace => {
-                            if temp_cursor_offset > 0 {
-                                temp_cursor_offset -= value[..temp_cursor_offset]
-                                    .chars()
-                                    .last()
-                                    .unwrap()
-                                    .len_utf8();
-                                value.remove(temp_cursor_offset);
+                            if let Some(previous) = value[..cursor].chars().next_back() {
+                                let start = cursor - previous.len_utf8();
+                                value.remove(start);
+                                edited = Some(start);
                             }
-                            on_change(value.clone());
-                            new_cursor_offset_hint.set(NewCursorOffsetHint::Backspace);
                             handled = true;
                         }
                         KeyCode::Delete => {
-                            if temp_cursor_offset < value.len() {
-                                value.remove(temp_cursor_offset);
+                            if cursor < value.len() {
+                                value.remove(cursor);
+                                edited = Some(cursor);
                             }
-                            on_change(value.clone());
-                            new_cursor_offset_hint.set(NewCursorOffsetHint::Deletion);
                             handled = true;
                         }
                         KeyCode::Enter if multiline => {
-                            value.insert(temp_cursor_offset, '\n');
-                            temp_cursor_offset += 1;
-                            on_change(value.clone());
+                            value.insert(cursor, '\n');
+                            edited = Some(cursor + 1);
                             handled = true;
                         }
                         KeyCode::Left => {
-                            cursor_offset.set(buffer.left_of_offset(cursor_offset.get()));
+                            cursor_offset.set(buffer.left_of_offset(cursor));
                             handled = true;
                         }
                         KeyCode::Right => {
-                            cursor_offset.set(buffer.right_of_offset(cursor_offset.get()));
+                            cursor_offset.set(buffer.right_of_offset(cursor));
                             handled = true;
                         }
                         KeyCode::Up if multiline => {
                             clear_vertical_movement_col_preference = false;
                             if vertical_movement_col_preference.get().is_none() {
-                                let (_, col) = buffer.row_column_for_offset(cursor_offset.get());
+                                let (_, col) = buffer.row_column_for_offset(cursor);
                                 vertical_movement_col_preference.set(Some(col));
                             }
-                            cursor_offset.set(buffer.above_offset(
-                                cursor_offset.get(),
-                                vertical_movement_col_preference.get(),
-                            ));
+                            cursor_offset.set(
+                                buffer.above_offset(cursor, vertical_movement_col_preference.get()),
+                            );
                             handled = true;
                         }
                         KeyCode::Down if multiline => {
                             clear_vertical_movement_col_preference = false;
                             if vertical_movement_col_preference.get().is_none() {
-                                let (_, col) = buffer.row_column_for_offset(cursor_offset.get());
+                                let (_, col) = buffer.row_column_for_offset(cursor);
                                 vertical_movement_col_preference.set(Some(col));
                             }
-                            cursor_offset.set(buffer.below_offset(
-                                cursor_offset.get(),
-                                vertical_movement_col_preference.get(),
-                            ));
+                            cursor_offset.set(
+                                buffer.below_offset(cursor, vertical_movement_col_preference.get()),
+                            );
                             handled = true;
                         }
                         KeyCode::Home => {
-                            cursor_offset.set(buffer.row_start_offset(cursor_offset.get()));
+                            cursor_offset.set(buffer.row_start_offset(cursor));
                             handled = true;
                         }
                         KeyCode::End => {
-                            cursor_offset.set(buffer.row_end_offset(cursor_offset.get()));
+                            cursor_offset.set(buffer.row_end_offset(cursor));
                             handled = true;
                         }
                         _ => {
@@ -730,6 +776,17 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
                     }
                 }
                 _ => {}
+            }
+            if let Some(edited) = edited {
+                // The edit's cursor is exact, so it is set here with the value it belongs to
+                // rather than guessed from the value the next render receives.
+                prev_value.set(value.clone());
+                cursor_offset.set(edited);
+                on_change(value.clone());
+            }
+            let moved = cursor_offset.get();
+            if moved != cursor {
+                on_change_cursor_offset(moved);
             }
             if handled {
                 propagated.stop_propagation();
@@ -754,14 +811,6 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-enum NewCursorOffsetHint {
-    #[default]
-    None,
-    Backspace,
-    Deletion,
-}
-
 /// Returns whether a keypress is using AltGr, always false for platforms other than Windows.
 /// Windows reports AltGr (used for characters like '@', '{' and '€' on many keyboard layouts)
 /// as Ctrl+Alt, so these key presses should be typed rather than treated as shortcuts.
@@ -780,12 +829,7 @@ fn clamp_to_char_boundary(value: &str, offset: usize) -> usize {
     offset
 }
 
-fn new_cursor_offset(
-    prev_value: &str,
-    cursor_offset: usize,
-    value: &str,
-    hint: NewCursorOffsetHint,
-) -> usize {
+fn new_cursor_offset(prev_value: &str, cursor_offset: usize, value: &str) -> usize {
     let cursor_offset = clamp_to_char_boundary(prev_value, cursor_offset);
     let prev_head = &prev_value[..cursor_offset];
     let prev_tail = &prev_value[cursor_offset..];
@@ -797,16 +841,8 @@ fn new_cursor_offset(
     let offset = if value.len() >= prev_value.len() && has_same_head && has_same_tail {
         // insertion (or no change)
         cursor_offset + (value.len() - prev_value.len())
-    } else if value.len() < prev_value.len() && has_same_tail && has_same_head {
-        // ambiguous case, could be backspace or deletion
-        if hint == NewCursorOffsetHint::Deletion {
-            cursor_offset
-        } else {
-            // bias towards backspace
-            cursor_offset.saturating_sub(prev_value.len() - value.len())
-        }
     } else if value.len() < prev_value.len() && has_same_tail {
-        // backspace
+        // backspace, which also wins when a deletion would explain the value as well
         cursor_offset.saturating_sub(prev_value.len() - value.len())
     } else if value.len() < prev_value.len() && has_same_head {
         // deletion
@@ -969,6 +1005,89 @@ mod tests {
             .collect()
             .await;
         assert_eq!(frames.last().unwrap().to_string(), "sent=hi\nx\n");
+    }
+
+    #[component]
+    fn MirroredInput(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let mut value = hooks.use_state(String::new);
+        let mut cursor = hooks.use_state(|| 0usize);
+        let mut shown = hooks.use_state(|| false);
+        let mut handle = hooks.use_ref_default::<TextInputHandle>();
+        let mut system = hooks.use_context_mut::<SystemContext>();
+        let mut should_exit = hooks.use_state(|| false);
+        hooks.use_terminal_events(move |event| match event {
+            TerminalEvent::Key(KeyEvent {
+                code: KeyCode::Tab, ..
+            }) => {
+                if !shown.get() {
+                    handle.write().set_cursor_offset(cursor.get());
+                }
+                shown.set(!shown.get());
+            }
+            TerminalEvent::Resize(..) => should_exit.set(true),
+            _ => {}
+        });
+        if should_exit.get() {
+            system.exit();
+        }
+        element! {
+            View(width: 16, flex_direction: FlexDirection::Column) {
+                Text(content: format!("{}|{}", value, cursor))
+                #(shown.get().then(|| element! {
+                    TextInput(
+                        has_focus: true,
+                        multiline: true,
+                        auto_grow: true,
+                        max_height: Some(6),
+                        value: value.to_string(),
+                        on_change: move |text| value.set(text),
+                        on_change_cursor_offset: move |offset| cursor.set(offset),
+                        handle,
+                    )
+                }))
+            }
+        }
+    }
+
+    #[apply(test!)]
+    async fn test_input_reports_its_cursor_with_its_value_and_mounts_at_its_width() {
+        let key = |code| TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, code));
+        let events = [
+            key(KeyCode::Tab),
+            key(KeyCode::Char('a')),
+            key(KeyCode::Char('b')),
+            key(KeyCode::Left),
+            TerminalEvent::Paste(" two words".to_string()),
+            key(KeyCode::Tab),
+            key(KeyCode::Tab),
+            TerminalEvent::Resize(80, 24),
+        ];
+        let canvases: Vec<_> = element!(MirroredInput)
+            .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter(events)))
+            .collect()
+            .await;
+        let frames: Vec<_> = canvases.iter().map(Canvas::to_string).collect();
+        // Each edit's frame already carries the cursor it leaves behind.
+        let mut mirrored: Vec<&str> = frames
+            .iter()
+            .map(|frame| frame.lines().next().unwrap_or_default())
+            .collect();
+        mirrored.dedup();
+        assert_eq!(mirrored, ["|0", "a|1", "ab|2", "ab|1", "a two wordsb|11"]);
+        // Mounted again with its value, the input lays it out at its width from the first frame.
+        let hidden = frames
+            .iter()
+            .rposition(|frame| frame.lines().count() == 1)
+            .expect("the input is hidden before it mounts again");
+        assert!(
+            frames[hidden + 1..]
+                .iter()
+                .all(|frame| frame.lines().count() == 2),
+            "{frames:?}"
+        );
+        // The offset set while it was unmounted places its cursor.
+        let cursor = canvases.last().unwrap().cursor_declaration().unwrap();
+        assert_eq!((cursor.x, cursor.y), (11, 1));
     }
 
     #[apply(test!)]
@@ -1205,7 +1324,7 @@ mod tests {
         let one_row = element!(AutoGrowInput(value: "a".to_string()))
             .render(None)
             .to_string();
-        let three_rows = element!(AutoGrowInput(value: "abc".to_string()))
+        let three_rows = element!(AutoGrowInput(value: "one two six".to_string()))
             .render(None)
             .to_string();
 
@@ -1356,57 +1475,17 @@ mod tests {
         let mixed_text = "你好世界，Hello World";
         let cursor_offset = mixed_text.find('W').unwrap();
         assert_eq!(
-            new_cursor_offset(
-                mixed_text,
-                cursor_offset,
-                "你好世界，Hello aWorld",
-                NewCursorOffsetHint::None
-            ),
+            new_cursor_offset(mixed_text, cursor_offset, "你好世界，Hello aWorld"),
             cursor_offset + 1
         );
 
-        assert_eq!(
-            new_cursor_offset("", 0, "foo", NewCursorOffsetHint::None),
-            3
-        );
-        assert_eq!(
-            new_cursor_offset("foo", 3, "foobar", NewCursorOffsetHint::None),
-            6
-        );
-        assert_eq!(
-            new_cursor_offset("foobar", 3, "foobar", NewCursorOffsetHint::None),
-            3
-        );
-        assert_eq!(
-            new_cursor_offset("foobar", 3, "fooar", NewCursorOffsetHint::None),
-            3
-        );
-        assert_eq!(
-            new_cursor_offset("foobar", 3, "fooasdbar", NewCursorOffsetHint::None),
-            6
-        );
-        assert_eq!(
-            new_cursor_offset("a\n", 0, "\n", NewCursorOffsetHint::None),
-            0
-        );
-        assert_eq!(
-            new_cursor_offset(
-                "asddasd\nasdasd",
-                3,
-                "asdasd\nasdasd",
-                NewCursorOffsetHint::Backspace
-            ),
-            2
-        );
-        assert_eq!(
-            new_cursor_offset(
-                "asddasd\nasdasd",
-                3,
-                "asdasd\nasdasd",
-                NewCursorOffsetHint::Deletion
-            ),
-            3
-        );
+        assert_eq!(new_cursor_offset("", 0, "foo"), 3);
+        assert_eq!(new_cursor_offset("foo", 3, "foobar"), 6);
+        assert_eq!(new_cursor_offset("foobar", 3, "foobar"), 3);
+        assert_eq!(new_cursor_offset("foobar", 3, "fooar"), 3);
+        assert_eq!(new_cursor_offset("foobar", 3, "fooasdbar"), 6);
+        assert_eq!(new_cursor_offset("a\n", 0, "\n"), 0);
+        assert_eq!(new_cursor_offset("asddasd\nasdasd", 3, "asdasd\nasdasd"), 2);
     }
 
     #[test]
@@ -1416,10 +1495,7 @@ mod tests {
         assert_eq!(clamp_to_char_boundary("éx", 2), 2);
         assert_eq!(clamp_to_char_boundary("éx", 99), 3);
 
-        assert_eq!(
-            new_cursor_offset("éx", 1, "é!x", NewCursorOffsetHint::None),
-            4
-        );
+        assert_eq!(new_cursor_offset("éx", 1, "é!x"), 4);
     }
 
     #[cfg(windows)]

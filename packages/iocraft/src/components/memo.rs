@@ -349,6 +349,68 @@ mod tests {
         );
     }
 
+    /// Rows of an absolute layer over a retained memo: 3, then 1, then none.
+    #[component]
+    fn OverlaidMemoApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let mut system = hooks.use_context_mut::<SystemContext>();
+        let mut layer_rows = hooks.use_state(|| 3u16);
+        let mut should_exit = hooks.use_state(|| false);
+        hooks.use_terminal_events(move |event| match event {
+            TerminalEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                layer_rows.set(layer_rows.get().saturating_sub(2));
+            }
+            TerminalEvent::Resize(..) => should_exit.set(true),
+            _ => {}
+        });
+        if should_exit.get() {
+            system.exit();
+        }
+        let rows = layer_rows.get();
+        element! {
+            View(flex_direction: FlexDirection::Column, width: 8) {
+                Memo(memo_key: "history".to_string(), compare: memo_key_eq as MemoComparator) {
+                    Text(content: "one\ntwo\nthree\nfour")
+                }
+                View(height: 1) {
+                    Text(content: "input")
+                    #((rows > 0).then(|| element! {
+                        View(position: Position::Absolute, bottom: 100pct, left: 0, width: 100pct, height: rows, opaque: true) {
+                            Text(content: "menu")
+                        }
+                    }))
+                }
+            }
+        }
+    }
+
+    /// A layer drawn over a retained memo leaves its pixels on the previous
+    /// canvas: once it shrinks or goes, the memo's rows must not be restored
+    /// from there.
+    #[test]
+    fn test_retained_blit_does_not_restore_an_overlay_that_shrank_or_went() {
+        crate::render::set_retained_blit_for_tests(Some(true));
+        let key = TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char('x')));
+        let frames: Vec<String> = smol::block_on(
+            element!(OverlaidMemoApp)
+                .mock_terminal_render_loop(MockTerminalConfig::with_events(futures::stream::iter(
+                    vec![key.clone(), key, TerminalEvent::Resize(80, 24)],
+                )))
+                .map(|canvas| canvas.to_string())
+                .collect(),
+        );
+        crate::render::set_retained_blit_for_tests(None);
+        let mut distinct = frames.clone();
+        distinct.dedup();
+        assert_eq!(
+            distinct,
+            [
+                "one\nmenu\n\n\ninput\n",
+                "one\ntwo\nthree\nmenu\ninput\n",
+                "one\ntwo\nthree\nfour\ninput\n",
+            ]
+        );
+    }
+
     #[component]
     fn NoComparatorMemoApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         let mut system = hooks.use_context_mut::<SystemContext>();
