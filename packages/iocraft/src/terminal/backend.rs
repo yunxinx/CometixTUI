@@ -721,7 +721,6 @@ impl TerminalImpl for StdTerminal<'_> {
                     self.cursor_displacement_rows = rows_up;
                 }
                 if decl.visible && !self.cursor_visible {
-                    self.dest.queue(cursor::SetCursorStyle::SteadyBlock)?;
                     self.dest.queue(cursor::Show)?;
                     self.cursor_visible = true;
                 } else if !decl.visible && self.cursor_visible {
@@ -1708,7 +1707,6 @@ impl Drop for StdTerminal<'_> {
         } else if self.prev_canvas_height > 0 {
             let _ = self.dest.write_all(b"\r\n");
         }
-        let _ = self.dest.queue(cursor::SetCursorStyle::DefaultUserShape);
         let _ = self.dest.queue(cursor::Show);
         // CC Ink's unmount path ends with these two so side-band state set via
         // `progress(...)` / `use_tab_status` cannot outlive the app. The

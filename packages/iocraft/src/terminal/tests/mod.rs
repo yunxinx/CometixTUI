@@ -1263,6 +1263,29 @@ fn test_position_cursor_inline_displacement_and_baseline_restore() {
     );
 }
 
+/// Showing the cursor and exiting leave the shape the user configured in their terminal:
+/// no DECSCUSR (`CSI Ps SP q`) is ever written.
+#[test]
+fn test_cursor_show_and_exit_keep_the_user_cursor_shape() {
+    use crate::canvas::CursorDeclaration;
+
+    let (dest, buf) = new_test_writer();
+    let mut term = new_inline_term(dest, 1);
+    term.position_cursor(Some(CursorDeclaration {
+        x: 0,
+        y: 0,
+        visible: true,
+    }))
+    .unwrap();
+    drop(term);
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        output.contains("\x1b[?25h"),
+        "the cursor is shown: {output:?}"
+    );
+    assert!(!output.contains(" q"), "no cursor shape is set: {output:?}");
+}
+
 /// Fullscreen-mode cursor positioning uses absolute coordinates and leaves no
 /// displacement to restore.
 #[test]
