@@ -2,6 +2,11 @@ use core::marker::PhantomData;
 
 /// This trait makes a struct available for use as component properties.
 ///
+/// With `#[derive(Props)]`, [`element!`](crate::element!) initializes omitted optional fields
+/// using each field type's `Default`, not the props struct's `Default` implementation.
+/// Mark fields that callers must supply with `#[iocraft(required)]`; their types do not
+/// need to implement `Default`. Deriving `Default` on the props struct is optional.
+///
 /// # Examples
 ///
 /// ```
