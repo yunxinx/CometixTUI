@@ -49,8 +49,8 @@ pub struct ScrollViewportChildDecision<K> {
 /// their previous cached height; culled children request subtree-cache drops
 /// unless `preserve_culled_cache` is set for the DECSTBM/blit fast path.
 ///
-/// The helper only computes metadata. It does not mutate [`RendererNodeCache`],
-/// inspect iocraft's component tree, draw to a [`Canvas`], write terminal output,
+/// The helper only computes metadata. It does not mutate [`RendererNodeCache`](crate::RendererNodeCache),
+/// inspect iocraft's component tree, draw to a [`Canvas`](crate::Canvas), write terminal output,
 /// or change screen mode.
 pub fn plan_scroll_viewport_child_render<K>(
     scroll_top: i32,

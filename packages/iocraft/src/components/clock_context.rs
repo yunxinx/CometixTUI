@@ -19,7 +19,7 @@
 //!   terminal is blurred, so every animation slows without any consumer
 //!   reading the focus state — `useAnimationFrame` documents exactly that.
 //!
-//! Here the render root ([`Tree::render`](crate::render)) provides one
+//! Here the render root (`Tree::render`) provides one
 //! [`Clock`] per tree, the way Ink's root mounts `ClockProvider`, and sets
 //! its base tick from the terminal's focus state on each render, as
 //! `ClockProvider` does from `useTerminalFocus`. iocraft has no base ticker

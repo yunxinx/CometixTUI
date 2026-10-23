@@ -165,7 +165,7 @@ pub(super) fn is_xterm_js_with_env_and_xtversion(
 /// Returns a DECRQM query sequence (`CSI ? mode $ p`).
 ///
 /// Terminals that support the queried DEC private mode reply with DECRPM,
-/// parsed as [`TerminalResponse::Decrpm`] by [`parse_terminal_response`].
+/// parsed as [`TerminalResponse::Decrpm`](crate::TerminalResponse::Decrpm) by [`parse_terminal_response`](crate::parse_terminal_response).
 pub fn decrqm_query_sequence(mode: u32) -> String {
     format!("\x1b[?{mode}$p")
 }

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 const MAX_FOCUS_STACK: usize = 32;
 
-/// A unique identifier for a focusable element within a single [`FocusScope`].
+/// A unique identifier for a focusable element within a single [`FocusScope`](crate::components::FocusScope).
 ///
 /// `FocusId`s are allocated by the enclosing scope and are only meaningful within that scope.
 /// They are intentionally `Copy` so they can be passed through closures and props with zero
@@ -82,7 +82,7 @@ struct FocusEntry {
     parent: Option<FocusId>,
 }
 
-/// Description of the most recent focus transition in a [`FocusScope`].
+/// Description of the most recent focus transition in a [`FocusScope`](crate::components::FocusScope).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FocusChange {
     /// Element that previously held focus, if any.
@@ -91,7 +91,7 @@ pub struct FocusChange {
     pub current: Option<FocusId>,
 }
 
-/// The mutable state owned by a single [`FocusScope`].
+/// The mutable state owned by a single [`FocusScope`](crate::components::FocusScope).
 ///
 /// This is intentionally not part of the public API: callers interact with it through the
 /// [`FocusContext`] handle, [`FocusHandle`], and [`FocusManager`].
@@ -417,7 +417,7 @@ impl FocusState {
     }
 }
 
-/// A `Copy` handle to a [`FocusScope`]'s focus state.
+/// A `Copy` handle to a [`FocusScope`](crate::components::FocusScope)'s focus state.
 ///
 /// `FocusContext` is what gets propagated to descendants via the context stack. It is cheap to
 /// copy and safe to capture inside event closures: internally it points at two backing slots
@@ -444,7 +444,7 @@ impl FocusContext {
     }
 
     /// Run the given closure with exclusive access to the underlying [`FocusState`], returning
-    /// `None` if the owning [`FocusScope`] has already been dropped.
+    /// `None` if the owning [`FocusScope`](crate::components::FocusScope) has already been dropped.
     ///
     /// All mutating helpers funnel through this method so the local-binding / drop-order
     /// dance only has to be written once.
@@ -497,7 +497,7 @@ impl FocusContext {
         self.with_ref(|s| s.active).unwrap_or(None)
     }
 
-    /// Returns the most recent focus transition in a [`FocusScope`], if any.
+    /// Returns the most recent focus transition in a [`FocusScope`](crate::components::FocusScope), if any.
     pub fn last_focus_change(&self) -> Option<FocusChange> {
         self.with_ref(|s| s.last_focus_change).unwrap_or(None)
     }
@@ -613,7 +613,7 @@ impl FocusContext {
     }
 }
 
-/// Hook installed by every [`FocusScope`] that fires once children have finished updating
+/// Hook installed by every [`FocusScope`](crate::components::FocusScope) that fires once children have finished updating
 /// and rewrites the scope's entry order to match the render-time UI order.
 ///
 /// The work happens in `post_component_update` because that is guaranteed to run *after*

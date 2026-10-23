@@ -42,6 +42,7 @@ This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) chang
 ### Fork fixes made during the sync
 
 - The chalk tmux truecolor guard uses an equivalent boolean expression accepted by Rust 1.94.0 clippy.
+- Intra-doc links that pointed at private or unresolved items now resolve, so `cargo doc` passes with `-D warnings` on Rust 1.94.0.
 - The FastScrollBox drain regression exits when draining completes and fails after five seconds if it does not. Covered by `test_fast_scroll_box_defaults_to_opt_in_drain` in `packages/iocraft/src/components/scroll_box.rs`; production scroll behavior is unchanged.
 - View click and hover targets use the same visible-area calculation as local mouse hooks, retaining unclipped local coordinates and hit testing for visible overflow. Covered by `test_view_click_respects_ancestor_clip_without_moving_origin` in `packages/iocraft/src/components/view.rs`. Ancestor clip changes invalidate Memo retained blits and CachedSubtree snapshots so descendant event regions are refreshed. Zero-height sibling suppression traverses children under an empty clip to keep hidden descendants out of hit testing.
 

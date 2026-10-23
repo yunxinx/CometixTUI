@@ -1865,8 +1865,8 @@ impl Canvas {
     /// pipeline where selection, query search, and current-match search styling
     /// are applied sequentially to the same screen cell.
     ///
-    /// If the cell is [`CellWidth::Wide`], the overlay is automatically extended to the
-    /// trailing [`CellWidth::WidthTail`] cell as well, preventing the "half-character
+    /// If the cell is `CellWidth::Wide`, the overlay is automatically extended to the
+    /// trailing `CellWidth::WidthTail` cell as well, preventing the "half-character
     /// inverted" artefact for CJK and emoji characters. Conversely, if the target cell
     /// is a `WidthTail`, the overlay is applied to both the tail and its leading `Wide`
     /// cell. Callers do not need to know whether a cell is wide.
