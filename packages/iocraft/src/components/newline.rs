@@ -2,16 +2,10 @@ use crate::{Component, ComponentUpdater, Hooks, Props};
 use taffy::{geometry::Size, style::Dimension};
 
 /// Props for [`Newline`].
-#[derive(Props)]
+#[derive(Default, Props)]
 pub struct NewlineProps {
     /// Number of blank terminal rows to reserve. Defaults to `1`.
-    pub count: i32,
-}
-
-impl Default for NewlineProps {
-    fn default() -> Self {
-        Self { count: 1 }
-    }
+    pub count: Option<i32>,
 }
 
 /// Adds one or more blank rows to a layout.
@@ -38,7 +32,7 @@ impl Component for Newline {
         _hooks: Hooks,
         updater: &mut ComponentUpdater,
     ) {
-        self.count = props.count.max(0) as u16;
+        self.count = props.count.unwrap_or(1).max(0) as u16;
         updater.set_layout_style_if_changed(taffy::style::Style {
             size: Size {
                 width: Dimension::length(0.0),

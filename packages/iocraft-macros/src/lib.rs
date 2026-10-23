@@ -4,18 +4,31 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::Span;
-use quote::{quote, ToTokens};
+use quote::{format_ident, quote, quote_spanned, ToTokens};
 use std::sync::atomic::{AtomicU64, Ordering};
 use syn::{
     braced, parenthesized,
     parse::{Parse, ParseStream, Parser},
-    parse_macro_input,
+    parse_macro_input, parse_quote,
     punctuated::Punctuated,
     spanned::Spanned,
     token::{Brace, Comma, Paren},
-    DeriveInput, Error, Expr, FieldValue, FnArg, GenericParam, Generics, Ident, ItemFn, ItemStruct,
-    Lifetime, Lit, Member, Pat, Result, Token, Type, TypePath, WhereClause, WherePredicate,
+    DeriveInput, Error, Expr, FieldValue, Fields, FnArg, GenericParam, Generics, Ident, ItemFn,
+    ItemStruct, Lifetime, Lit, Member, Pat, Result, Token, Type, TypePath, WhereClause,
+    WherePredicate,
 };
+
+fn iocraft_path() -> Result<proc_macro2::TokenStream> {
+    match proc_macro_crate::crate_name("iocraft")
+        .map_err(|error| Error::new(Span::call_site(), error))?
+    {
+        proc_macro_crate::FoundCrate::Itself => Ok(quote!(::iocraft)),
+        proc_macro_crate::FoundCrate::Name(name) => {
+            let name = Ident::new_raw(&name, Span::call_site());
+            Ok(quote!(::#name))
+        }
+    }
+}
 
 enum ParsedElementChild {
     Element(ParsedElement),
@@ -71,6 +84,13 @@ impl Parse for ParsedElement {
 
 impl ToTokens for ParsedElement {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+        let iocraft = match iocraft_path() {
+            Ok(path) => path,
+            Err(error) => {
+                tokens.extend(error.into_compile_error());
+                return;
+            }
+        };
         let ty = &self.ty;
 
         // Use module_path!() combined with a deterministic counter to ensure
@@ -92,7 +112,7 @@ impl ToTokens for ParsedElement {
             })
             .unwrap_or_else(|| quote!((module_path!(), #counter)));
 
-        let prop_assignments = self
+        let prop_setters = self
             .props
             .iter()
             .filter_map(|FieldValue { member, expr, .. }| match member {
@@ -101,15 +121,15 @@ impl ToTokens for ParsedElement {
                     Expr::Lit(lit) => match &lit.lit {
                         Lit::Int(lit) if lit.suffix() == "pct" => {
                             let value = lit.base10_parse::<f32>().unwrap();
-                            quote!(_iocraft_props.#member = ::iocraft::Percent(#value).into())
+                            quote!(.#member(#iocraft::Percent(#value)))
                         }
                         Lit::Float(lit) if lit.suffix() == "pct" => {
                             let value = lit.base10_parse::<f32>().unwrap();
-                            quote!(_iocraft_props.#member = ::iocraft::Percent(#value).into())
+                            quote!(.#member(#iocraft::Percent(#value)))
                         }
-                        _ => quote!(_iocraft_props.#member = (#expr).into()),
+                        _ => quote!(.#member(#expr)),
                     },
-                    _ => quote!(_iocraft_props.#member = (#expr).into()),
+                    _ => quote!(.#member(#expr)),
                 }),
             })
             .collect::<Vec<_>>();
@@ -120,7 +140,7 @@ impl ToTokens for ParsedElement {
                 ParsedElementChild::Expr(expr) => quote!(#expr),
             });
             Some(quote! {
-                #(::iocraft::extend_with_elements(&mut _iocraft_element.props.children, #children);)*
+                #(#iocraft::extend_with_elements(&mut _iocraft_element.props.children, #children);)*
             })
         } else {
             None
@@ -128,11 +148,12 @@ impl ToTokens for ParsedElement {
 
         tokens.extend(quote! {
             {
-                type Props<'a> = <#ty as ::iocraft::ElementType>::Props<'a>;
-                let mut _iocraft_props: Props = Default::default();
-                #(#prop_assignments;)*
-                let mut _iocraft_element = ::iocraft::Element::<#ty>{
-                    key: ::iocraft::ElementKey::new(#key),
+                type Props<'a> = <#ty as #iocraft::ElementType>::Props<'a>;
+                let mut _iocraft_props: Props = Props::__iocraft_builder()
+                    #(#prop_setters)*
+                    .__iocraft_build();
+                let mut _iocraft_element = #iocraft::Element::<#ty>{
+                    key: #iocraft::ElementKey::new(#key),
                     props: _iocraft_props,
                 };
                 #set_children
@@ -144,8 +165,8 @@ impl ToTokens for ParsedElement {
 
 /// Used to declare an element and its properties.
 ///
-/// Elements are declared starting with their type. All properties are optional, so the simplest
-/// use of this macro is just a type name:
+/// Elements are declared starting with their type. Properties are optional unless their
+/// [`Props`] derive marks them with `#[iocraft(required)]`, so the simplest use is just a type name:
 ///
 /// ```
 /// # use iocraft::prelude::*;
@@ -228,33 +249,106 @@ pub fn element(input: TokenStream) -> TokenStream {
 
 struct ParsedProps {
     def: ItemStruct,
+    required_fields: Vec<bool>,
 }
 
 impl Parse for ParsedProps {
     fn parse(input: ParseStream) -> Result<Self> {
         let def: ItemStruct = input.parse()?;
-
-        // Make sure there are no props named "key", as that's a reserved name.
-        for field in &def.fields {
-            if let Some(ident) = &field.ident {
-                if ident == "key" {
-                    return Err(Error::new(
-                        ident.span(),
-                        "the `key` property name is reserved",
-                    ));
-                }
-            }
+        if matches!(def.fields, Fields::Unnamed(_)) {
+            return Err(Error::new(
+                def.fields.span(),
+                "`Props` requires named fields or a unit struct",
+            ));
         }
 
-        Ok(Self { def })
+        let mut required_fields = Vec::with_capacity(def.fields.len());
+        for field in &def.fields {
+            if field.ident.as_ref().is_some_and(|ident| ident == "key") {
+                return Err(Error::new(
+                    field.span(),
+                    "the `key` property name is reserved",
+                ));
+            }
+
+            let mut required = false;
+            for attr in &field.attrs {
+                if !attr.path().is_ident("iocraft") {
+                    continue;
+                }
+                attr.parse_nested_meta(|meta| {
+                    if !meta.path.is_ident("required") {
+                        return Err(meta.error("unsupported `iocraft` property attribute"));
+                    }
+                    if required {
+                        return Err(meta.error("duplicate `required` attribute"));
+                    }
+                    if !meta.input.is_empty() {
+                        return Err(meta.error("`required` does not accept a value"));
+                    }
+                    required = true;
+                    Ok(())
+                })?;
+            }
+            required_fields.push(required);
+        }
+
+        Ok(Self {
+            def,
+            required_fields,
+        })
+    }
+}
+
+// Nested items bind their own Self; both visitors enter through the outer struct directly.
+struct FindSelf(bool);
+
+impl<'ast> syn::visit::Visit<'ast> for FindSelf {
+    fn visit_item(&mut self, _item: &'ast syn::Item) {}
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if self.0 {
+            return;
+        }
+        self.0 = path
+            .segments
+            .first()
+            .is_some_and(|segment| segment.ident == "Self");
+        if !self.0 {
+            syn::visit::visit_path(self, path);
+        }
+    }
+}
+
+struct PropsSelfPath(syn::Path);
+
+impl syn::visit_mut::VisitMut for PropsSelfPath {
+    fn visit_item_mut(&mut self, _item: &mut syn::Item) {}
+
+    fn visit_path_mut(&mut self, path: &mut syn::Path) {
+        syn::visit_mut::visit_path_mut(self, path);
+        if path
+            .segments
+            .first()
+            .is_some_and(|segment| segment.ident == "Self")
+        {
+            let suffix = std::mem::replace(path, self.0.clone());
+            path.segments.extend(suffix.segments.into_iter().skip(1));
+        }
     }
 }
 
 impl ToTokens for ParsedProps {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+        let iocraft = match iocraft_path() {
+            Ok(path) => path,
+            Err(error) => {
+                tokens.extend(error.into_compile_error());
+                return;
+            }
+        };
         let def = &self.def;
         let name = &def.ident;
-        let where_clause = &def.generics.where_clause;
 
         let has_generics = !def.generics.params.is_empty();
         let lifetime_generic_count = def
@@ -263,8 +357,6 @@ impl ToTokens for ParsedProps {
             .iter()
             .filter(|param| matches!(param, GenericParam::Lifetime(_)))
             .count();
-
-        let generics = &def.generics;
 
         let generics_names = def.generics.params.iter().map(|param| match param {
             GenericParam::Type(ty) => {
@@ -285,6 +377,23 @@ impl ToTokens for ParsedProps {
             false => quote!(),
         };
 
+        // Self in a copied field type still names the props, not the generated builder.
+        let mut finder = FindSelf(false);
+        syn::visit::visit_item_struct(&mut finder, def);
+        let builder_def = if finder.0 {
+            let mut builder_def = def.clone();
+            let mut path: syn::Path = parse_quote!(#name #bracketed_generic_names);
+            for segment in &mut path.segments {
+                if let syn::PathArguments::AngleBracketed(args) = &mut segment.arguments {
+                    args.colon2_token = Some(Default::default());
+                }
+            }
+            syn::visit_mut::visit_item_struct_mut(&mut PropsSelfPath(path), &mut builder_def);
+            std::borrow::Cow::Owned(builder_def)
+        } else {
+            std::borrow::Cow::Borrowed(def)
+        };
+
         // If the struct is generic over lifetimes, emit code that will break things at compile
         // time when the struct is not covariant with respect to its lifetimes.
         if lifetime_generic_count > 0 {
@@ -303,7 +412,20 @@ impl ToTokens for ParsedProps {
                         lifetime_index += 1;
                         quote!(#a, #b: #a)
                     }
-                    _ => quote!(#param),
+                    GenericParam::Type(ty) => {
+                        let attrs = &ty.attrs;
+                        let name = &ty.ident;
+                        let colon = &ty.colon_token;
+                        let bounds = &ty.bounds;
+                        quote!(#(#attrs)* #name #colon #bounds)
+                    }
+                    GenericParam::Const(c) => {
+                        let attrs = &c.attrs;
+                        let const_token = &c.const_token;
+                        let name = &c.ident;
+                        let ty = &c.ty;
+                        quote!(#(#attrs)* #const_token #name: #ty)
+                    }
                 })
             };
 
@@ -342,8 +464,269 @@ impl ToTokens for ParsedProps {
             });
         }
 
+        let vis = &def.vis;
+        let builder_name = format_ident!("__Iocraft{}Builder", name);
+        let fields = builder_def.fields.iter().collect::<Vec<_>>();
+        let field_names = fields
+            .iter()
+            .map(|field| {
+                field
+                    .ident
+                    .as_ref()
+                    .expect("named fields checked while parsing")
+            })
+            .collect::<Vec<_>>();
+        let required_fields = fields
+            .iter()
+            .zip(&self.required_fields)
+            .filter_map(|(field, required)| required.then_some(*field))
+            .collect::<Vec<_>>();
+        let required_state_names = required_fields
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format_ident!("__IocraftRequired{index}"))
+            .collect::<Vec<_>>();
+        let missing_state_names = required_fields
+            .iter()
+            .map(|field| {
+                let field_name = field
+                    .ident
+                    .as_ref()
+                    .expect("named fields checked while parsing")
+                    .to_string();
+                format_ident!(
+                    "__Iocraft{}MissingRequiredProperty_{}",
+                    name,
+                    field_name.trim_start_matches("r#")
+                )
+            })
+            .collect::<Vec<_>>();
+        let original_generic_args = def
+            .generics
+            .params
+            .iter()
+            .map(|param| match param {
+                GenericParam::Type(ty) => {
+                    let name = &ty.ident;
+                    quote!(#name)
+                }
+                GenericParam::Lifetime(lt) => {
+                    let name = &lt.lifetime;
+                    quote!(#name)
+                }
+                GenericParam::Const(c) => {
+                    let name = &c.ident;
+                    quote!(#name)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut builder_generics = builder_def.generics.clone();
+        for state_name in &required_state_names {
+            builder_generics.params.push(parse_quote!(#state_name));
+        }
+        let (builder_impl_generics, builder_ty_generics, builder_where_clause) =
+            builder_generics.split_for_impl();
+
+        let builder_fields = fields
+            .iter()
+            .zip(&self.required_fields)
+            .scan(0, |required_index, (field, required)| {
+                let name = field
+                    .ident
+                    .as_ref()
+                    .expect("named fields checked while parsing");
+                let ty = &field.ty;
+                let field_ty = if *required {
+                    let state_name = &required_state_names[*required_index];
+                    *required_index += 1;
+                    quote!(#state_name)
+                } else {
+                    quote!(#ty)
+                };
+                Some(quote!(#name: #field_ty))
+            })
+            .collect::<Vec<_>>();
+
+        let initial_builder_args = original_generic_args
+            .iter()
+            .cloned()
+            .chain(missing_state_names.iter().map(|name| quote!(#name)))
+            .collect::<Vec<_>>();
+        let initial_builder_type = if initial_builder_args.is_empty() {
+            quote!(#builder_name)
+        } else {
+            quote!(#builder_name<#(#initial_builder_args),*>)
+        };
+        let initial_field_values = field_names.iter().zip(&self.required_fields).scan(
+            0,
+            |required_index, (name, required)| {
+                if *required {
+                    let missing_state_name = &missing_state_names[*required_index];
+                    *required_index += 1;
+                    Some(quote!(#name: #missing_state_name))
+                } else {
+                    Some(quote!(#name: Default::default()))
+                }
+            },
+        );
+
+        let mut constructor_generics = def.generics.clone();
+        for (field, required) in fields.iter().zip(&self.required_fields) {
+            if !required {
+                let ty = &field.ty;
+                constructor_generics
+                    .make_where_clause()
+                    .predicates
+                    .push(parse_quote!(#ty: Default));
+            }
+        }
+        let (constructor_impl_generics, constructor_ty_generics, constructor_where_clause) =
+            constructor_generics.split_for_impl();
+
+        let optional_setters =
+            fields
+                .iter()
+                .zip(&self.required_fields)
+                .filter_map(|(field, required)| {
+                    if *required {
+                        return None;
+                    }
+                    let name = field
+                        .ident
+                        .as_ref()
+                        .expect("named fields checked while parsing");
+                    let ty = &field.ty;
+                    Some(quote! {
+                        #vis fn #name(mut self, value: impl Into<#ty>) -> Self {
+                            self.#name = value.into();
+                            self
+                        }
+                    })
+                });
+
+        let required_setters = required_fields
+            .iter()
+            .enumerate()
+            .map(|(current_index, field)| {
+                let field_name = field
+                    .ident
+                    .as_ref()
+                    .expect("named fields checked while parsing");
+                let field_ty = &field.ty;
+                let return_args = original_generic_args
+                    .iter()
+                    .cloned()
+                    .chain(required_fields.iter().enumerate().map(|(index, field)| {
+                        if index == current_index {
+                            let ty = &field.ty;
+                            quote!(#iocraft::RequiredPropSet<#ty>)
+                        } else {
+                            let state_name = &required_state_names[index];
+                            quote!(#state_name)
+                        }
+                    }))
+                    .collect::<Vec<_>>();
+                let return_type = quote!(#builder_name<#(#return_args),*>);
+                let moved_fields = field_names.iter().map(|name| {
+                    if *name == field_name {
+                        quote!(#name: #iocraft::RequiredPropSet(value.into()))
+                    } else {
+                        quote!(#name: self.#name)
+                    }
+                });
+                quote! {
+                    #vis fn #field_name(
+                        self,
+                        value: impl Into<#field_ty>,
+                    ) -> #return_type {
+                        #builder_name {
+                            #(#moved_fields,)*
+                            _iocraft_marker: std::marker::PhantomData,
+                        }
+                    }
+                }
+            });
+        let complete_builder_args = original_generic_args
+            .iter()
+            .cloned()
+            .chain(required_fields.iter().map(|field| {
+                let ty = &field.ty;
+                quote!(#iocraft::RequiredPropSet<#ty>)
+            }))
+            .collect::<Vec<_>>();
+        let complete_builder_type = if complete_builder_args.is_empty() {
+            quote!(#builder_name)
+        } else {
+            quote!(#builder_name<#(#complete_builder_args),*>)
+        };
+
+        let completed_field_values =
+            field_names
+                .iter()
+                .zip(&self.required_fields)
+                .map(|(name, required)| {
+                    if *required {
+                        quote!(#name: self.#name.0)
+                    } else {
+                        quote!(#name: self.#name)
+                    }
+                });
+        let missing_state_markers = missing_state_names.iter().map(|name| {
+            quote! {
+                #[allow(non_camel_case_types)]
+                #[doc(hidden)]
+                #vis struct #name;
+            }
+        });
+        let props_value = match &def.fields {
+            Fields::Unit => quote!(#name),
+            Fields::Named(_) => quote!(#name {
+                #(#completed_field_values,)*
+            }),
+            Fields::Unnamed(_) => unreachable!("tuple structs rejected while parsing"),
+        };
+        let (props_impl_generics, _, props_where_clause) = def.generics.split_for_impl();
+        let (complete_impl_generics, _, complete_where_clause) =
+            builder_def.generics.split_for_impl();
+
         tokens.extend(quote! {
-            unsafe impl #generics ::iocraft::Props for #name #bracketed_generic_names #where_clause {}
+            #(#missing_state_markers)*
+            #[doc(hidden)]
+            #vis struct #builder_name #builder_impl_generics #builder_where_clause {
+                #(#builder_fields,)*
+                _iocraft_marker: std::marker::PhantomData<#name #bracketed_generic_names>,
+            }
+
+            impl #constructor_impl_generics #name #constructor_ty_generics
+                #constructor_where_clause
+            {
+                #[doc(hidden)]
+                #vis fn __iocraft_builder() -> #initial_builder_type {
+                    #builder_name {
+                        #(#initial_field_values,)*
+                        _iocraft_marker: std::marker::PhantomData,
+                    }
+                }
+            }
+
+            impl #builder_impl_generics #builder_name #builder_ty_generics #builder_where_clause {
+                #(#optional_setters)*
+                #(#required_setters)*
+            }
+
+            impl #complete_impl_generics #complete_builder_type #complete_where_clause {
+                #[doc(hidden)]
+                #vis fn __iocraft_build(self) -> #name #bracketed_generic_names {
+                    #props_value
+                }
+            }
+        });
+
+        tokens.extend(quote! {
+            unsafe impl #props_impl_generics #iocraft::Props for
+                #name #bracketed_generic_names #props_where_clause
+            {}
         });
     }
 }
@@ -353,6 +736,44 @@ impl ToTokens for ParsedProps {
 /// Most importantly, this marks a struct as being
 /// [covariant](https://doc.rust-lang.org/nomicon/subtyping.html). If the struct is not actually
 /// covariant, compilation will fail.
+///
+/// Fields are initialized with their [`Default`] value unless they are marked as required:
+///
+/// ```
+/// # use iocraft::prelude::*;
+/// struct RequiredValue;
+///
+/// #[derive(Props)]
+/// struct MyProps {
+///     optional: String,
+///     #[iocraft(required)]
+///     required: RequiredValue,
+/// }
+///
+/// #[component]
+/// fn MyComponent(_props: &MyProps) -> impl Into<AnyElement<'static>> {
+///     element!(View)
+/// }
+///
+/// let _: Element<MyComponent> = element!(MyComponent(required: RequiredValue));
+/// ```
+///
+/// Omitting a required property fails at compile time:
+///
+/// ```compile_fail
+/// # use iocraft::prelude::*;
+/// # struct RequiredValue;
+/// # #[derive(Props)]
+/// # struct MyProps {
+/// #     #[iocraft(required)]
+/// #     required: RequiredValue,
+/// # }
+/// # #[component]
+/// # fn MyComponent(_props: &MyProps) -> impl Into<AnyElement<'static>> {
+/// #     element!(View)
+/// # }
+/// let _ = element!(MyComponent);
+/// ```
 ///
 /// Compilation will also fail if the struct contains a "key" field, as that name is reserved to
 /// facilitate tracking state across renders:
@@ -364,7 +785,7 @@ impl ToTokens for ParsedProps {
 ///     key: i32,
 /// }
 /// ```
-#[proc_macro_derive(Props)]
+#[proc_macro_derive(Props, attributes(iocraft))]
 pub fn derive_props(item: TokenStream) -> TokenStream {
     let props = parse_macro_input!(item as ParsedProps);
     quote!(#props).into()
@@ -445,6 +866,13 @@ impl Parse for ParsedComponent {
 
 impl ToTokens for ParsedComponent {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+        let iocraft = match iocraft_path() {
+            Ok(path) => path,
+            Err(error) => {
+                tokens.extend(error.into_compile_error());
+                return;
+            }
+        };
         let attrs = &self.f.attrs;
         let vis = &self.f.vis;
         let name = &self.f.sig.ident;
@@ -509,12 +937,28 @@ impl ToTokens for ParsedComponent {
             _ => None,
         });
         let impl_args = &self.impl_args;
+        let hooks_span = args
+            .iter()
+            .find_map(|arg| {
+                let FnArg::Typed(arg) = arg else {
+                    return None;
+                };
+                let Pat::Ident(pat) = &*arg.pat else {
+                    return None;
+                };
+                (pat.ident == "hooks" || pat.ident == "_hooks").then(|| arg.ty.span())
+            })
+            .unwrap_or_else(Span::call_site);
+        let context_stack = quote_spanned!(hooks_span => updater.component_context_stack());
+        let set_layout = quote_spanned!(hooks_span => updater.set_transparent_layout(true););
+        let update_children =
+            quote_spanned!(hooks_span => updater.update_children([&mut e], None););
 
         let props_type_name = self
             .props_type
             .as_ref()
             .map(|ty| quote!(#ty))
-            .unwrap_or_else(|| quote!(::iocraft::NoProps));
+            .unwrap_or_else(|| quote!(#iocraft::NoProps));
 
         tokens.extend(quote! {
             #(#attrs)*
@@ -526,7 +970,7 @@ impl ToTokens for ParsedComponent {
                 fn implementation #lifetime_impl_generics (#args) #output #lifetime_where_clause #block
             }
 
-            impl #impl_generics ::iocraft::Component for #name #ty_generics #where_clause {
+            impl #impl_generics #iocraft::Component for #name #ty_generics #where_clause {
                 type Props<'a> = #props_type_name;
 
                 fn new(_props: &Self::Props<'_>) -> Self {
@@ -535,13 +979,13 @@ impl ToTokens for ParsedComponent {
                     }
                 }
 
-                fn update(&mut self, props: &mut Self::Props<'_>, mut hooks: ::iocraft::Hooks, updater: &mut ::iocraft::ComponentUpdater) {
+                fn update(&mut self, props: &mut Self::Props<'_>, mut hooks: #iocraft::Hooks, updater: &mut #iocraft::ComponentUpdater) {
                     let mut e = {
-                        let mut hooks = hooks.with_context_stack(updater.component_context_stack());
+                        let mut hooks = hooks.with_context_stack(#context_stack);
                         Self::implementation(#(#impl_args),*).into()
                     };
-                    updater.set_transparent_layout(true);
-                    updater.update_children([&mut e], None);
+                    #set_layout
+                    #update_children
                 }
             }
         });
@@ -652,6 +1096,19 @@ impl ToTokens for ParsedComponent {
 /// ```
 ///
 /// However, note that generic type parameters must be `'static`.
+///
+/// # Lifetimes
+///
+/// Prefer inferred lifetimes on `Hooks`. Sharing an explicit lifetime between `Hooks` and the
+/// returned element can keep the context borrow alive while the component updates its children.
+///
+/// ```
+/// # use iocraft::prelude::*;
+/// #[component]
+/// fn Example<'a>(_hooks: Hooks) -> impl Into<AnyElement<'a>> {
+///     element!(Text(content: "Hooks lifetimes are inferred"))
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let component = parse_macro_input!(item as ParsedComponent);
@@ -661,190 +1118,194 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
 #[doc(hidden)]
 #[proc_macro_attribute]
 pub fn with_layout_style_props(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let iocraft = match iocraft_path() {
+        Ok(path) => path,
+        Err(error) => return error.into_compile_error().into(),
+    };
     let layout_style_fields = [
         quote! {
             /// Sets the display mode for the element. Defaults to [`Display::Flex`].
             ///
             /// See [the MDN documentation for display](https://developer.mozilla.org/en-US/docs/Web/CSS/display).
-            pub display: ::iocraft::Display
+            pub display: #iocraft::Display
         },
         quote! {
             /// Sets the width of the element.
-            pub width: ::iocraft::Size
+            pub width: #iocraft::Size
         },
         quote! {
             /// Sets the height of the element.
-            pub height: ::iocraft::Size
+            pub height: #iocraft::Size
         },
         quote! {
             /// Sets the minimum width of the element.
-            pub min_width: ::iocraft::Size
+            pub min_width: #iocraft::Size
         },
         quote! {
             /// Sets the minimum height of the element.
-            pub min_height: ::iocraft::Size
+            pub min_height: #iocraft::Size
         },
         quote! {
             /// Sets the maximum width of the element.
-            pub max_width: ::iocraft::Size
+            pub max_width: #iocraft::Size
         },
         quote! {
             /// Sets the maximum height of the element.
-            pub max_height: ::iocraft::Size
+            pub max_height: #iocraft::Size
         },
         quote! {
             /// Defines the gaps in between rows or columns of flex items.
             ///
             /// See [the MDN documentation for gap](https://developer.mozilla.org/en-US/docs/Web/CSS/gap).
-            pub gap: ::iocraft::Gap
+            pub gap: #iocraft::Gap
         },
         quote! {
             /// Defines the gaps in between columns of flex items.
             ///
             /// See [the MDN documentation for column-gap](https://developer.mozilla.org/en-US/docs/Web/CSS/column-gap).
-            pub column_gap: ::iocraft::Gap
+            pub column_gap: #iocraft::Gap
         },
         quote! {
             /// Defines the gaps in between rows of flex items.
             ///
             /// See [the MDN documentation for row-gap](https://developer.mozilla.org/en-US/docs/Web/CSS/row-gap).
-            pub row_gap: ::iocraft::Gap
+            pub row_gap: #iocraft::Gap
         },
         quote! {
             /// Defines the area to reserve around the element's content, but inside the border.
             ///
             /// See [the MDN documentation for padding](https://developer.mozilla.org/en-US/docs/Web/CSS/padding).
-            pub padding: ::iocraft::Padding
+            pub padding: #iocraft::Padding
         },
         quote! {
             /// Defines the horizontal area to reserve to the left and right of the element's content, but inside the border.
             ///
             /// This is the Rust counterpart to CC Ink's `paddingX` shorthand.
-            pub padding_x: ::iocraft::Padding
+            pub padding_x: #iocraft::Padding
         },
         quote! {
             /// Defines the vertical area to reserve above and below the element's content, but inside the border.
             ///
             /// This is the Rust counterpart to CC Ink's `paddingY` shorthand.
-            pub padding_y: ::iocraft::Padding
+            pub padding_y: #iocraft::Padding
         },
         quote! {
             /// Defines the area to reserve above the element's content, but inside the border.
             ///
             /// See [the MDN documentation for padding](https://developer.mozilla.org/en-US/docs/Web/CSS/padding).
-            pub padding_top: ::iocraft::Padding
+            pub padding_top: #iocraft::Padding
         },
         quote! {
             /// Defines the area to reserve to the right of the element's content, but inside the border.
             ///
             /// See [the MDN documentation for padding](https://developer.mozilla.org/en-US/docs/Web/CSS/padding).
-            pub padding_right: ::iocraft::Padding
+            pub padding_right: #iocraft::Padding
         },
         quote! {
             /// Defines the area to reserve below the element's content, but inside the border.
             ///
             /// See [the MDN documentation for padding](https://developer.mozilla.org/en-US/docs/Web/CSS/padding).
-            pub padding_bottom: ::iocraft::Padding
+            pub padding_bottom: #iocraft::Padding
         },
         quote! {
             /// Defines the area to reserve to the left of the element's content, but inside the border.
             ///
             /// See [the MDN documentation for padding](https://developer.mozilla.org/en-US/docs/Web/CSS/padding).
-            pub padding_left: ::iocraft::Padding
+            pub padding_left: #iocraft::Padding
         },
         quote! {
             /// Controls how the element is layed out and whether it will be controlled by the flexbox.
-            pub position: ::iocraft::Position
+            pub position: #iocraft::Position
         },
         quote! {
             /// Sets the position of a positioned element.
             ///
             /// See [the MDN documentation for inset](https://developer.mozilla.org/en-US/docs/Web/CSS/inset).
-            pub inset: ::iocraft::Inset
+            pub inset: #iocraft::Inset
         },
         quote! {
             /// Sets the vertical position of a positioned element.
             ///
             /// See [the MDN documentation for top](https://developer.mozilla.org/en-US/docs/Web/CSS/top).
-            pub top: ::iocraft::Inset
+            pub top: #iocraft::Inset
         },
         quote! {
             /// Sets the horizontal position of a positioned element.
             ///
             /// See [the MDN documentation for right](https://developer.mozilla.org/en-US/docs/Web/CSS/right).
-            pub right: ::iocraft::Inset
+            pub right: #iocraft::Inset
         },
         quote! {
             /// Sets the vertical position of a positioned element.
             ///
             /// See [the MDN documentation for bottom](https://developer.mozilla.org/en-US/docs/Web/CSS/bottom).
-            pub bottom: ::iocraft::Inset
+            pub bottom: #iocraft::Inset
         },
         quote! {
             /// Sets the horizontal position of a positioned element.
             ///
             /// See [the MDN documentation for left](https://developer.mozilla.org/en-US/docs/Web/CSS/left).
-            pub left: ::iocraft::Inset
+            pub left: #iocraft::Inset
         },
         quote! {
             /// Defines the area to reserve around the element's content, but outside the border.
             ///
             /// See [the MDN documentation for margin](https://developer.mozilla.org/en-US/docs/Web/CSS/margin).
-            pub margin: ::iocraft::Margin
+            pub margin: #iocraft::Margin
         },
         quote! {
             /// Defines the horizontal area to reserve to the left and right of the element's content, but outside the border.
             ///
             /// This is the Rust counterpart to CC Ink's `marginX` shorthand.
-            pub margin_x: ::iocraft::Margin
+            pub margin_x: #iocraft::Margin
         },
         quote! {
             /// Defines the vertical area to reserve above and below the element's content, but outside the border.
             ///
             /// This is the Rust counterpart to CC Ink's `marginY` shorthand.
-            pub margin_y: ::iocraft::Margin
+            pub margin_y: #iocraft::Margin
         },
         quote! {
             /// Defines the area to reserve above the element's content, but outside the border.
             ///
             /// See [the MDN documentation for margin](https://developer.mozilla.org/en-US/docs/Web/CSS/margin).
-            pub margin_top: ::iocraft::Margin
+            pub margin_top: #iocraft::Margin
         },
         quote! {
             /// Defines the area to reserve to the right of the element's content, but outside the border.
             ///
             /// See [the MDN documentation for margin](https://developer.mozilla.org/en-US/docs/Web/CSS/margin).
-            pub margin_right: ::iocraft::Margin
+            pub margin_right: #iocraft::Margin
         },
         quote! {
             /// Defines the area to reserve below the element's content, but outside the border.
             ///
             /// See [the MDN documentation for margin](https://developer.mozilla.org/en-US/docs/Web/CSS/margin).
-            pub margin_bottom: ::iocraft::Margin
+            pub margin_bottom: #iocraft::Margin
         },
         quote! {
             /// Defines the area to reserve to the left of the element's content, but outside the border.
             ///
             /// See [the MDN documentation for margin](https://developer.mozilla.org/en-US/docs/Web/CSS/margin).
-            pub margin_left: ::iocraft::Margin
+            pub margin_left: #iocraft::Margin
         },
         quote! {
             /// Defines how items are placed along the main axis of a flex container.
             ///
             /// See [the MDN documentation for flex-direction](https://developer.mozilla.org/en-US/docs/Web/CSS/flex-direction).
-            pub flex_direction: ::iocraft::FlexDirection
+            pub flex_direction: #iocraft::FlexDirection
         },
         quote! {
             /// Defines whether items are forced onto one line or can wrap into multiple lines.
             ///
             /// See [the MDN documentation for flex-wrap](https://developer.mozilla.org/en-US/docs/Web/CSS/flex-wrap).
-            pub flex_wrap: ::iocraft::FlexWrap
+            pub flex_wrap: #iocraft::FlexWrap
         },
         quote! {
             /// Sets the initial main size of a flex item.
             ///
             /// See [the MDN documentation for flex-basis](https://developer.mozilla.org/en-US/docs/Web/CSS/flex-basis).
-            pub flex_basis: ::iocraft::FlexBasis
+            pub flex_basis: #iocraft::FlexBasis
         },
         quote! {
             /// Sets the flex grow factor, which specifies how much free space should be assigned
@@ -864,99 +1325,99 @@ pub fn with_layout_style_props(_attr: TokenStream, item: TokenStream) -> TokenSt
             /// Controls the alignment of items along the cross axis of a flex container.
             ///
             /// See [the MDN documentation for align-items](https://developer.mozilla.org/en-US/docs/Web/CSS/align-items).
-            pub align_items: Option<::iocraft::AlignItems>
+            pub align_items: Option<#iocraft::AlignItems>
         },
         quote! {
             /// Overrides the parent's cross-axis alignment for this item.
             ///
             /// This is the Rust counterpart to CC Ink's `alignSelf` style.
-            pub align_self: Option<::iocraft::AlignSelf>
+            pub align_self: Option<#iocraft::AlignSelf>
         },
         quote! {
             /// Controls the distribution of space between and around items along a flex container's cross axis.
             ///
             /// See [the MDN documentation for align-content](https://developer.mozilla.org/en-US/docs/Web/CSS/align-content).
-            pub align_content: Option<::iocraft::AlignContent>
+            pub align_content: Option<#iocraft::AlignContent>
         },
         quote! {
             /// Controls the distribution of space between and around items along a flex container's main axis.
             ///
             /// See [the MDN documentation for justify-content](https://developer.mozilla.org/en-US/docs/Web/CSS/justify-content).
-            pub justify_content: Option<::iocraft::JustifyContent>
+            pub justify_content: Option<#iocraft::JustifyContent>
         },
         quote! {
             /// Defines the behavior when content does not fit within the element's padding box.
             ///
             /// See [the MDN documentation for overflow](https://developer.mozilla.org/en-US/docs/Web/CSS/overflow).
-            pub overflow: Option<::iocraft::Overflow>
+            pub overflow: Option<#iocraft::Overflow>
         },
         quote! {
             /// Defines the behavior when content does not fit within the element's padding box in the horizontal direction.
             ///
             /// See [the MDN documentation for overflow](https://developer.mozilla.org/en-US/docs/Web/CSS/overflow).
-            pub overflow_x: Option<::iocraft::Overflow>
+            pub overflow_x: Option<#iocraft::Overflow>
         },
         quote! {
             /// Defines the behavior when content does not fit within the element's padding box in the vertical direction.
             ///
             /// See [the MDN documentation for overflow](https://developer.mozilla.org/en-US/docs/Web/CSS/overflow).
-            pub overflow_y: Option<::iocraft::Overflow>
+            pub overflow_y: Option<#iocraft::Overflow>
         },
         quote! {
             /// Defines the column tracks of a grid container, e.g. `"12 1fr auto"`.
             /// Bare numbers are terminal cells. Requires `display: Display::Grid`.
             ///
             /// See [the MDN documentation for grid-template-columns](https://developer.mozilla.org/en-US/docs/Web/CSS/grid-template-columns).
-            pub grid_template_columns: ::iocraft::GridTemplate
+            pub grid_template_columns: #iocraft::GridTemplate
         },
         quote! {
             /// Defines the row tracks of a grid container, e.g. `"1 1fr 1"`.
             /// Bare numbers are terminal cells. Requires `display: Display::Grid`.
             ///
             /// See [the MDN documentation for grid-template-rows](https://developer.mozilla.org/en-US/docs/Web/CSS/grid-template-rows).
-            pub grid_template_rows: ::iocraft::GridTemplate
+            pub grid_template_rows: #iocraft::GridTemplate
         },
         quote! {
             /// Defines the size of implicitly created grid columns, e.g. `"1fr"`.
             ///
             /// See [the MDN documentation for grid-auto-columns](https://developer.mozilla.org/en-US/docs/Web/CSS/grid-auto-columns).
-            pub grid_auto_columns: ::iocraft::GridAutoTracks
+            pub grid_auto_columns: #iocraft::GridAutoTracks
         },
         quote! {
             /// Defines the size of implicitly created grid rows, e.g. `"1fr"`.
             ///
             /// See [the MDN documentation for grid-auto-rows](https://developer.mozilla.org/en-US/docs/Web/CSS/grid-auto-rows).
-            pub grid_auto_rows: ::iocraft::GridAutoTracks
+            pub grid_auto_rows: #iocraft::GridAutoTracks
         },
         quote! {
             /// Controls how auto-placed grid items flow into the grid.
             ///
             /// See [the MDN documentation for grid-auto-flow](https://developer.mozilla.org/en-US/docs/Web/CSS/grid-auto-flow).
-            pub grid_auto_flow: ::iocraft::GridAutoFlow
+            pub grid_auto_flow: #iocraft::GridAutoFlow
         },
         quote! {
             /// Defines named grid areas using quoted rows, e.g. `r#""header header" "nav main""#.
             ///
             /// See [the MDN documentation for grid-template-areas](https://developer.mozilla.org/en-US/docs/Web/CSS/grid-template-areas).
-            pub grid_template_areas: ::iocraft::GridAreas
+            pub grid_template_areas: #iocraft::GridAreas
         },
         quote! {
             /// Places this element in its grid container's columns, e.g. `"1 / 3"` or `"span 2"`.
             ///
             /// See [the MDN documentation for grid-column](https://developer.mozilla.org/en-US/docs/Web/CSS/grid-column).
-            pub grid_column: ::iocraft::GridPlacementSpec
+            pub grid_column: #iocraft::GridPlacementSpec
         },
         quote! {
             /// Places this element in its grid container's rows, e.g. `"2"` or `"1 / span 2"`.
             ///
             /// See [the MDN documentation for grid-row](https://developer.mozilla.org/en-US/docs/Web/CSS/grid-row).
-            pub grid_row: ::iocraft::GridPlacementSpec
+            pub grid_row: #iocraft::GridPlacementSpec
         },
         quote! {
             /// Places this element in a named grid area, e.g. `"header"`.
             ///
             /// See [the MDN documentation for grid-area](https://developer.mozilla.org/en-US/docs/Web/CSS/grid-area).
-            pub grid_area: ::iocraft::GridArea
+            pub grid_area: #iocraft::GridArea
         },
     ]
     .map(|tokens| syn::Field::parse_named.parse2(tokens).unwrap());
@@ -1005,8 +1466,8 @@ pub fn with_layout_style_props(_attr: TokenStream, item: TokenStream) -> TokenSt
 
                 impl #generics #struct_name #bracketed_generic_names #where_clause {
                     /// Returns the layout style based on the layout-related fields of this struct.
-                    pub fn layout_style(&self) -> ::iocraft::LayoutStyle {
-                        let mut ret: ::iocraft::LayoutStyle = Default::default();
+                    pub fn layout_style(&self) -> #iocraft::LayoutStyle {
+                        let mut ret: #iocraft::LayoutStyle = Default::default();
                         #(#field_assignments)*
                         ret
                     }

@@ -20,9 +20,21 @@ This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) chang
 
 ### Ported
 
+- Required props are checked at compile time with `#[iocraft(required)]`; optional props use each field type's default (`iocraft#228`). Covered by `required_prop` in `packages/iocraft-macros/tests/element.rs` and the `complete_required_props`, `missing_required_prop`, and `private_builder_fields` fixtures in `packages/iocraft-macros/tests/ui/`. `Newline` still reserves one row by default, covered by `test_newline_default_count_is_one` in `packages/iocraft/src/components/newline.rs`.
+- Hooks lifetime errors point to the component's Hooks parameter (`iocraft#240`, macro tests from `iocraft#244`). Covered by the `explicit_hooks_lifetime` fixture in `packages/iocraft-macros/tests/ui/`.
+- Covariance helpers omit type and const generic defaults (`iocraft#260`). Covered by `StructWithLifetimeAndDefaultedType` and `StructWithLifetimeAndDefaultedConst` in `packages/iocraft-macros/tests/props.rs`.
+- `Self` in props field types and bounds refers to the props struct, while nested items retain their own `Self` (`iocraft#285`). Covered by `RecursiveProps`, `GenericRecursiveProps`, `AssociatedSelfProps`, `ConstSelfProps`, `SelfBoundProps`, and `NestedItemSelfProps` in `packages/iocraft-macros/tests/props.rs`.
+- Cloning a `Handler` and converting it into a `HandlerMut` accept payloads without `Clone`, `Send`, or `Sync` (`iocraft#297`). Covered by `test_non_clone_non_send_payload_can_clone_and_convert` in `packages/iocraft/src/handler.rs`.
+- Macros resolve renamed Cargo dependencies, including this fork's 14 additional layout fields (`iocraft#301`). Covered by the `renamed_dependency` fixture in `packages/iocraft-macros/tests/ui/`.
+- The optional `serde` feature forwards to `crossterm/serde` for the re-exported color and event types, using the same serialization format as iocraft upstream (`iocraft#235`). Covered by `serde_matches_crossterm_format` in `packages/iocraft/src/style.rs`.
+
 ### Fork fixes made during the sync
 
 ### Breaking changes for consumers
+
+- `element!` initializes optional props using each field type's `Default`; a handwritten `impl Default` on the props struct is no longer used. Fields whose types do not implement `Default` must be marked `#[iocraft(required)]` and supplied by the caller.
+- `NewlineProps::count` is now `Option<i32>`. Omitting it still reserves one row, and `element!(Newline(count: 2))` remains valid.
+- `UIRouterProps::app` is required, and `UIRouterProps` no longer implements `Default`.
 
 ### Already covered
 

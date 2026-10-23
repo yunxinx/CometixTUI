@@ -110,20 +110,8 @@ pub fn use_route(hooks: &mut Hooks) -> State<RouteId> {
 
 #[derive(Props)]
 pub struct UIRouterProps {
+    #[iocraft(required)]
     pub app: Arc<RouterApp>,
-}
-
-impl Default for UIRouterProps {
-    fn default() -> Self {
-        let app = UIRouterBuilder::new()
-            .route("default", "Default", || {
-                element! { Text(content: "Default") }.into()
-            })
-            .default("default")
-            .build()
-            .expect("default router");
-        Self { app: Arc::new(app) }
-    }
 }
 
 #[component]

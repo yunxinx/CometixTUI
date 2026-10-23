@@ -682,6 +682,71 @@ mod tests {
     use super::*;
     use taffy::prelude::TaffyGridLine;
 
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_matches_crossterm_format() {
+        use crate::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+        use crossterm::event::{MediaKeyCode, ModifierKeyCode};
+
+        let modifiers = KeyModifiers::SHIFT | KeyModifiers::CONTROL;
+        let json = r#""SHIFT | CONTROL""#;
+        assert_eq!(serde_json::to_string(&modifiers).unwrap(), json);
+        assert_eq!(
+            serde_json::from_str::<KeyModifiers>(json).unwrap(),
+            modifiers
+        );
+
+        for (code, json) in [
+            (KeyCode::Char('a'), r#"{"Char":"a"}"#),
+            (KeyCode::F(5), r#"{"F":5}"#),
+            (KeyCode::Enter, r#""Enter""#),
+            (
+                KeyCode::Media(MediaKeyCode::PlayPause),
+                r#"{"Media":"PlayPause"}"#,
+            ),
+            (
+                KeyCode::Modifier(ModifierKeyCode::LeftShift),
+                r#"{"Modifier":"LeftShift"}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&code).unwrap(), json);
+            assert_eq!(serde_json::from_str::<KeyCode>(json).unwrap(), code);
+        }
+
+        let kind = MouseEventKind::Down(MouseButton::Left);
+        let json = r#"{"Down":"Left"}"#;
+        assert_eq!(serde_json::to_string(&kind).unwrap(), json);
+        assert_eq!(serde_json::from_str::<MouseEventKind>(json).unwrap(), kind);
+        let json = r#""Release""#;
+        assert_eq!(serde_json::to_string(&KeyEventKind::Release).unwrap(), json);
+        assert_eq!(
+            serde_json::from_str::<KeyEventKind>(json).unwrap(),
+            KeyEventKind::Release
+        );
+
+        for (color, json) in [
+            (Color::Reset, r#""reset""#),
+            (Color::DarkGrey, r#""dark_grey""#),
+            (Color::Grey, r#""grey""#),
+            (Color::DarkRed, r#""dark_red""#),
+            (Color::AnsiValue(42), r#""ansi_(42)""#),
+            (Color::AnsiValue(255), r#""ansi_(255)""#),
+            (Color::Rgb { r: 1, g: 2, b: 3 }, r#""rgb_(1,2,3)""#),
+            (Color::Rgb { r: 255, g: 0, b: 0 }, r#""rgb_(255,0,0)""#),
+        ] {
+            assert_eq!(serde_json::to_string(&color).unwrap(), json);
+            assert_eq!(serde_json::from_str::<Color>(json).unwrap(), color);
+        }
+        assert_eq!(
+            serde_json::from_str::<Color>(r##""#ff0000""##).unwrap(),
+            Color::Rgb { r: 255, g: 0, b: 0 }
+        );
+        assert_eq!(
+            serde_json::from_str::<Color>(r#""Dark_Red""#).unwrap(),
+            Color::DarkRed
+        );
+    }
+
     #[test]
     fn test_css_with_cell_units() {
         // Bare numbers gain px; existing units are untouched.
