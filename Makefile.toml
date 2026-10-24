@@ -34,16 +34,14 @@ args = [
     "--workspace",
 ]
 
-[tasks.codecov-coverage]
-description = "Generate Codecov coverage report"
+[tasks.coverage-html]
+description = "Generate an HTML coverage report"
 workspace = false
 command = "cargo"
 args = [
     "llvm-cov",
     "--workspace",
-    "--codecov",
-    "--output-path",
-    "target/codecov.json",
+    "--html",
 ]
 
 [tasks.checks]

@@ -7,6 +7,7 @@ on:
 jobs:
   Checks:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -24,9 +25,9 @@ jobs:
     - uses: taiki-e/install-action@cargo-make
     - uses: taiki-e/install-action@cargo-llvm-cov
     - name: Coverage
-      run: cargo make codecov-coverage
-    - uses: codecov/codecov-action@v7
+      run: cargo make coverage-html
+    - uses: actions/upload-artifact@v7
       with:
-        token: ${{ secrets.CODECOV_TOKEN }}
-        fail_ci_if_error: true
-        files: target/codecov.json
+        name: coverage-html
+        path: target/llvm-cov/html
+        if-no-files-found: error

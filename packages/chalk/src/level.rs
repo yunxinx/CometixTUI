@@ -331,14 +331,32 @@ mod tests {
         )
     }
 
+    fn assert_platform_level(
+        pairs: &[(&str, &str)],
+        args: &[&str],
+        tty: bool,
+        expected_non_windows: u8,
+        expected_windows: u8,
+    ) {
+        let expected = if cfg!(windows) {
+            expected_windows
+        } else {
+            expected_non_windows
+        };
+        assert_eq!(level(pairs, args, tty), expected, "environment: {pairs:?}");
+    }
+
     #[test]
     fn no_color_is_ignored_matching_chalk_v6_supports_color() {
         // chalk v6's vendored supports-color has no NO_COLOR handling at all:
         // detection proceeds as if the variable were absent. (CC's own output
         // behaves the same way — NO_COLOR leaves its Ink UI fully styled.)
-        assert_eq!(
-            level(&[("NO_COLOR", "1"), ("TERM", "xterm-256color")], &[], true),
-            2
+        assert_platform_level(
+            &[("NO_COLOR", "1"), ("TERM", "xterm-256color")],
+            &[],
+            true,
+            2,
+            3,
         );
         assert_eq!(
             level(&[("NO_COLOR", "1"), ("COLORTERM", "truecolor")], &[], true),
@@ -351,23 +369,22 @@ mod tests {
     }
 
     #[test]
-    fn force_color_overrides_everything() {
+    fn force_color_sets_minimum_and_zero_disables() {
         assert_eq!(level(&[("FORCE_COLOR", "0")], &[], true), 0);
         assert_eq!(level(&[("FORCE_COLOR", "3")], &[], false), 3);
-        assert_eq!(level(&[("FORCE_COLOR", "")], &[], false), 1);
-        assert_eq!(level(&[("FORCE_COLOR", "true")], &[], false), 1);
+        assert_platform_level(&[("FORCE_COLOR", "")], &[], false, 1, 3);
+        assert_platform_level(&[("FORCE_COLOR", "true")], &[], false, 1, 3);
         assert_eq!(level(&[("FORCE_COLOR", "false")], &[], true), 0);
         // Values above 3 clamp like JS Math.min(n, 3).
         assert_eq!(level(&[("FORCE_COLOR", "9")], &[], false), 3);
         // chalk v6: non-numeric values are treated as unset, so detection
-        // proceeds normally (node oracle: banana + xterm-256color tty → 2).
-        assert_eq!(
-            level(
-                &[("FORCE_COLOR", "banana"), ("TERM", "xterm-256color")],
-                &[],
-                true
-            ),
-            2
+        // proceeds normally, including Windows' truecolor short circuit.
+        assert_platform_level(
+            &[("FORCE_COLOR", "banana"), ("TERM", "xterm-256color")],
+            &[],
+            true,
+            2,
+            3,
         );
         assert_eq!(
             level(
@@ -414,24 +431,23 @@ mod tests {
             ),
             3
         );
-        assert_eq!(
-            level(
-                &[
-                    ("TERM_PROGRAM", "iTerm.app"),
-                    ("TERM_PROGRAM_VERSION", "2.1")
-                ],
-                &[],
-                true
-            ),
-            2
+        assert_platform_level(
+            &[
+                ("TERM_PROGRAM", "iTerm.app"),
+                ("TERM_PROGRAM_VERSION", "2.1"),
+            ],
+            &[],
+            true,
+            2,
+            3,
         );
-        assert_eq!(level(&[("TERM_PROGRAM", "Apple_Terminal")], &[], true), 2);
-        assert_eq!(level(&[("TERM", "xterm-256color")], &[], true), 2);
-        assert_eq!(level(&[("TERM", "screen-256")], &[], true), 2);
-        assert_eq!(level(&[("TERM", "xterm")], &[], true), 1);
-        assert_eq!(level(&[("TERM", "vt220")], &[], true), 1);
-        assert_eq!(level(&[("COLORTERM", "1")], &[], true), 1);
-        assert_eq!(level(&[], &[], true), 0);
+        assert_platform_level(&[("TERM_PROGRAM", "Apple_Terminal")], &[], true, 2, 3);
+        assert_platform_level(&[("TERM", "xterm-256color")], &[], true, 2, 3);
+        assert_platform_level(&[("TERM", "screen-256")], &[], true, 2, 3);
+        assert_platform_level(&[("TERM", "xterm")], &[], true, 1, 3);
+        assert_platform_level(&[("TERM", "vt220")], &[], true, 1, 3);
+        assert_platform_level(&[("COLORTERM", "1")], &[], true, 1, 3);
+        assert_platform_level(&[], &[], true, 0, 3);
     }
 
     #[test]
@@ -440,9 +456,9 @@ mod tests {
         // need a TTY stream (node oracle: createSupportsColor({isTTY:false})
         // is false even with GITHUB_ACTIONS set).
         assert_eq!(level(&[("CI", "1"), ("GITHUB_ACTIONS", "1")], &[], true), 3);
-        assert_eq!(level(&[("CI", "1"), ("TRAVIS", "1")], &[], true), 1);
-        assert_eq!(level(&[("CI", "1"), ("CI_NAME", "codeship")], &[], true), 1);
-        assert_eq!(level(&[("CI", "1")], &[], true), 0);
+        assert_platform_level(&[("CI", "1"), ("TRAVIS", "1")], &[], true, 1, 3);
+        assert_platform_level(&[("CI", "1"), ("CI_NAME", "codeship")], &[], true, 1, 3);
+        assert_platform_level(&[("CI", "1")], &[], true, 0, 3);
         // Azure's TF_BUILD check sits above the TTY guard.
         assert_eq!(
             level(&[("TF_BUILD", "1"), ("AGENT_NAME", "x")], &[], false),
@@ -456,10 +472,10 @@ mod tests {
 
     #[test]
     fn teamcity_version_gate() {
-        assert_eq!(level(&[("TEAMCITY_VERSION", "9.1.5")], &[], true), 1);
-        assert_eq!(level(&[("TEAMCITY_VERSION", "9.0.3")], &[], true), 0);
-        assert_eq!(level(&[("TEAMCITY_VERSION", "2023.11")], &[], true), 1);
-        assert_eq!(level(&[("TEAMCITY_VERSION", "8.1")], &[], true), 0);
+        assert_platform_level(&[("TEAMCITY_VERSION", "9.1.5")], &[], true, 1, 3);
+        assert_platform_level(&[("TEAMCITY_VERSION", "9.0.3")], &[], true, 0, 3);
+        assert_platform_level(&[("TEAMCITY_VERSION", "2023.11")], &[], true, 1, 3);
+        assert_platform_level(&[("TEAMCITY_VERSION", "8.1")], &[], true, 0, 3);
     }
 
     #[test]

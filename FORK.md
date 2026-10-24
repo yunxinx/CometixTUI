@@ -36,6 +36,8 @@ The regression tests live in `packages/iocraft/src/components/text_input.rs` (`t
 
 `rust-toolchain.toml` pins the latest stable Rust toolchain for local checks and CI. Every workspace package uses edition 2024 and inherits the workspace's `rust-version`, which is upgraded together with the pinned toolchain. Consumers need a compiler at least as new as that version. Code ported from iocraft upstream is adapted to this fork's edition and dependency versions.
 
+CI runs checks on Ubuntu and Windows independently and saves an HTML coverage report as the `coverage-html` workflow artifact. `cargo make coverage-html` generates the same report locally in `target/llvm-cov/html`.
+
 ## iocraft upstream sync
 
 This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) changes up to `2158a53` on top of the base fork, which last merged `3e26e2b` (v0.9.1). Applicable changes were applied directly or re-implemented in this fork's structure; a closing `-s ours` merge records the sync point. The 33 upstream commits are accounted for below: 18 Ported, 12 Already covered, and 3 Not taken. Code and comment cleanup was incorporated with the corresponding ports.
