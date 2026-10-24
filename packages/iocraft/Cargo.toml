@@ -16,18 +16,16 @@ serde = ["crossterm/serde"]
 [dependencies]
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 futures = "0.3.30"
-# 0.14 carries the layout-cache soundness line (#911 in 0.12, axis/eviction fixes
-# in #1010) that cures the CometixCode /resume "blank ocean" (Haleclipse/taffy#1).
-taffy = { version = "0.14.0", default-features = false, features = ["std", "flexbox", "grid", "parse", "taffy_tree"] }
+taffy = { version = "0.15.0", default-features = false, features = ["std", "flexbox", "grid", "parse", "taffy_tree"] }
 iocraft-macros = { version = "0.2.4", path = "../iocraft-macros" }
 # CC Ink renders every color through chalk; the canvas SGR encoders take
 # chalk's level detection and downgrade math from the same port.
 chalk = { version = "0.1.0", path = "../chalk" }
 bitflags = "2.6.0"
-unicode-width = "0.1.13"
+unicode-width = "0.2.2"
 unicode-segmentation = "1"
 unicode-bidi = "0.3.18"
-generational-box = "0.5.6"
+generational-box = "0.7.10"
 regex = "1.12.3"
 # Runtime-agnostic timer used for render-loop frame throttling.
 futures-timer = "3"
@@ -38,7 +36,7 @@ futures-timer = "3"
 signal-hook = "0.3"
 
 [dev-dependencies]
-avt = "0.17"
+avt = "0.18"
 serde_json = "1.0"
 indoc = "2"
 smol = "2.0.1"

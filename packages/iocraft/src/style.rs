@@ -10,8 +10,27 @@ use taffy::{
 pub use crossterm::style::Color;
 pub use taffy::style::{
     AlignContent, AlignItems, AlignSelf, Display, FlexDirection, FlexWrap, GridAutoFlow,
-    JustifyContent, Overflow, Position,
+    JustifyContent, Overflow,
 };
+
+/// Positions a component relative to its parent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Position {
+    /// Participates in normal flow, with insets applied after layout.
+    #[default]
+    Relative,
+    /// Leaves normal flow and uses its parent's bounds to resolve insets.
+    Absolute,
+}
+
+impl From<Position> for taffy::Position {
+    fn from(position: Position) -> Self {
+        match position {
+            Position::Relative => Self::Relative,
+            Position::Absolute => Self::Absolute,
+        }
+    }
+}
 
 /// Defines a type that represents a percentage [0.0-100.0] and is convertible to any of the
 /// libary's other percent types. As a shorthand, you can express this in the
@@ -661,16 +680,16 @@ impl From<LayoutStyle> for Style {
                 x: s.overflow_x.or(s.overflow).unwrap_or_default(),
                 y: s.overflow_y.or(s.overflow).unwrap_or_default(),
             },
-            position: s.position,
+            position: s.position.into(),
             flex_direction: s.flex_direction,
             flex_wrap: s.flex_wrap,
             flex_basis: s.flex_basis.into(),
             flex_grow: s.flex_grow,
             flex_shrink: s.flex_shrink.unwrap_or(1.0),
-            align_items: s.align_items,
+            align_items: s.align_items.unwrap_or_default(),
             align_self: s.align_self,
-            align_content: s.align_content,
-            justify_content: s.justify_content,
+            align_content: s.align_content.unwrap_or_default(),
+            justify_content: s.justify_content.unwrap_or_default(),
             ..Default::default()
         }
     }

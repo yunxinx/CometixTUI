@@ -12,7 +12,7 @@ use core::{
     task::{Poll, Waker},
 };
 use std::sync::Arc;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 trait UseCursorOverlay {
     fn use_cursor_overlay(&mut self) -> &mut CursorOverlayState;
@@ -260,6 +260,10 @@ struct TextBuffer {
 impl TextBuffer {
     fn row_count(&self) -> usize {
         self.rows.len()
+    }
+
+    fn max_row_width(&self) -> usize {
+        self.rows.iter().map(|row| row.width).max().unwrap_or(0)
     }
 
     fn new<S: Into<String>>(text: S, width: usize) -> Self {
@@ -600,7 +604,7 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
         }
 
         // Scroll back when the content shrinks so it isn't cut off.
-        let content_width = props.value.width() as u16;
+        let content_width = buffer.max_row_width() as u16;
         let max_scroll_offset_col = (content_width + 1).saturating_sub(width);
         if scroll_offset_col.get() > max_scroll_offset_col {
             scroll_offset_col.set(max_scroll_offset_col);
@@ -1273,6 +1277,47 @@ mod tests {
         let expected = ["  \n", " 一二! \n"];
         assert_eq!(actual.first().map(String::as_str), Some(expected[0]));
         assert_eq!(actual.last().map(String::as_str), Some(expected[1]));
+    }
+
+    #[apply(test!)]
+    async fn test_text_input_unwrapped_multiline_value_scrolls_back_when_longest_line_shrinks() {
+        #[component]
+        fn ShrinkingInput(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+            let mut value = hooks.use_state(|| "abcd\nabcdefghij".to_string());
+            let mut system = hooks.use_context_mut::<SystemContext>();
+            let mut should_exit = hooks.use_state(|| false);
+            hooks.use_terminal_events(move |event| {
+                if matches!(event, TerminalEvent::Resize(..)) {
+                    should_exit.set(true);
+                }
+            });
+            if should_exit.get() {
+                system.exit();
+            }
+            element! {
+                View(width: 6) {
+                    TextInput(
+                        has_focus: true,
+                        value: value.to_string(),
+                        on_change: move |new_value| value.set(new_value),
+                    )
+                }
+            }
+        }
+
+        let events = std::iter::repeat_n(
+            TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Backspace)),
+            5,
+        )
+        .chain([TerminalEvent::Resize(80, 24)]);
+        let frames = element!(ShrinkingInput)
+            .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter(events)))
+            .map(|canvas| canvas.to_string())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(frames.first().map(String::as_str), Some("fghij \n"));
+        assert_eq!(frames.last().map(String::as_str), Some("abcde \n"));
     }
 
     #[apply(test!)]

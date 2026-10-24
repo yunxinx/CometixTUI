@@ -212,16 +212,11 @@ impl InstantiatedComponent {
     }
 
     /// Removes the layout nodes of this component and of every component below it, with their
-    /// measure contexts; taffy's `remove` frees neither. The walk follows the component tree
+    /// measure contexts; taffy's `remove` does not free descendants. The walk follows the component tree
     /// because a transparent component's children hang off an ancestor's layout node. Returns
     /// whether any removed node had been drawn.
     pub(crate) fn remove_layout_nodes(&self, layout_engine: &mut LayoutEngine) -> bool {
         let mut drawn = layout_engine.was_drawn(self.node_id);
-        // A node goes before its children: removing it detaches them, so clearing a child's
-        // context dirties nothing above the child.
-        layout_engine
-            .set_node_context(self.node_id, None)
-            .expect("we should be able to clear the node context");
         layout_engine
             .remove(self.node_id)
             .expect("we should be able to remove the node");

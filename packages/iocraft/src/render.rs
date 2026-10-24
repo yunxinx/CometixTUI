@@ -31,8 +31,8 @@ use std::{
     time::Duration,
 };
 use taffy::{
-    AvailableSpace, Display, Layout, NodeId, Overflow, Point, Position, Rect, Size, Style,
-    TaffyTree,
+    AvailableSpace, Display, Layout, NodeId, Overflow, Point, Position as TaffyPosition, Rect,
+    Size, Style, TaffyTree,
 };
 
 pub(crate) struct UpdateContext<'a, 'w> {
@@ -535,7 +535,15 @@ impl<'a, 'b, 'c, 'w> ComponentUpdater<'a, 'b, 'c, 'w> {
     }
 
     /// Sets the layout style of the current component.
+    ///
+    /// Static positioning is treated as relative positioning so layout coordinates remain
+    /// relative to the parent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the style uses fixed or sticky positioning.
     pub fn set_layout_style(&mut self, layout_style: taffy::style::Style) {
+        let layout_style = normalize_layout_style(layout_style);
         self.context.layout_invalidations.set_style += 1;
         // The measure function receives the style, so memoized results
         // may not survive a style change.
@@ -557,7 +565,13 @@ impl<'a, 'b, 'c, 'w> ComponentUpdater<'a, 'b, 'c, 'w> {
     /// This mirrors CC Ink's style equality guard: rebuilding an equivalent
     /// style value should not dirty layout or wake Taffy recomputation.
     /// Returns `true` when the style was changed.
+    /// Static positioning is treated as relative positioning before comparing styles.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the style uses fixed or sticky positioning.
     pub fn set_layout_style_if_changed(&mut self, layout_style: taffy::style::Style) -> bool {
+        let layout_style = normalize_layout_style(layout_style);
         if self
             .context
             .layout_engine
@@ -593,10 +607,10 @@ impl<'a, 'b, 'c, 'w> ComponentUpdater<'a, 'b, 'c, 'w> {
     /// layout purposes.
     pub fn set_transparent_layout(&mut self, transparent_layout: bool) {
         if transparent_layout {
-            let transparent_style = Style {
+            let transparent_style = normalize_layout_style(Style {
                 display: Display::None,
                 ..Default::default()
-            };
+            });
             if self
                 .context
                 .layout_engine
@@ -731,7 +745,7 @@ impl<'a, 'b, 'c, 'w> ComponentUpdater<'a, 'b, 'c, 'w> {
                                     .context
                                     .layout_engine
                                     .new_leaf_with_context(
-                                        Style::default(),
+                                        normalize_layout_style(Style::default()),
                                         LayoutEngineNodeContext::for_component(
                                             child.helper().component_type_name(),
                                         ),
@@ -1356,7 +1370,7 @@ impl ComponentDrawer<'_> {
             y: self.node_position.y + layout.location.y as i32,
         };
         if next_position.y < 0
-            && self.style().position == Position::Absolute
+            && self.style().position == TaffyPosition::Absolute
             && !self.vertical_clip_active
         {
             // CC Ink's render-node-to-output.ts clamps negative screen-space Y
@@ -1372,7 +1386,7 @@ impl ComponentDrawer<'_> {
             width: layout.size.width as u32,
             height: layout.size.height as u32,
         };
-        if self.style().position == Position::Absolute {
+        if self.style().position == TaffyPosition::Absolute {
             let (x, y) = (i64::from(next_position.x), i64::from(next_position.y));
             let right = (x + i64::from(self.node_size.width)).max(0) as usize;
             let bottom = (y + i64::from(self.node_size.height)).max(0) as usize;
@@ -1655,6 +1669,18 @@ impl MeasureMemo {
 /// <https://github.com/DioxusLabs/taffy/pull/855>.
 pub(crate) struct LayoutEngine(TaffyTree<LayoutEngineNodeContext>);
 
+fn normalize_layout_style(mut style: Style) -> Style {
+    // Drawing accumulates parent offsets, so every node must establish the containing
+    // block for its absolute children, and every location must be parent-relative.
+    style.position = match style.position {
+        TaffyPosition::Static | TaffyPosition::Relative => Some(TaffyPosition::Relative),
+        TaffyPosition::Absolute => Some(TaffyPosition::Absolute),
+        TaffyPosition::Fixed | TaffyPosition::Sticky => None,
+    }
+    .expect("iocraft layout requires parent-relative coordinates; fixed and sticky positioning are unsupported");
+    style
+}
+
 unsafe impl Send for LayoutEngine {}
 
 impl LayoutEngine {
@@ -1732,12 +1758,12 @@ impl<'a> Tree<'a> {
         let mut layout_engine = LayoutEngine::new();
         let root_node_id = layout_engine
             .new_leaf_with_context(
-                Style::default(),
+                normalize_layout_style(Style::default()),
                 LayoutEngineNodeContext::for_component(helper.component_type_name()),
             )
             .expect("we should be able to add the root");
         let wrapper_node_id = layout_engine
-            .new_with_children(Style::default(), &[root_node_id])
+            .new_with_children(normalize_layout_style(Style::default()), &[root_node_id])
             .expect("we should be able to add the root");
         Self {
             layout_engine,
@@ -1969,7 +1995,7 @@ impl<'a> Tree<'a> {
                 .set_children(self.wrapper_node_id, &wrapper_child_node_ids)
                 .expect("we should be able to set the children");
         }
-        let mut wrapper_style = Style::default();
+        let mut wrapper_style = normalize_layout_style(Style::default());
         if let Some(max_width) = max_width {
             // Mirror CC Ink's root layout contract: when rendering to a
             // terminal, the root is laid out against the terminal columns, so

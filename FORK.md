@@ -4,6 +4,7 @@ This fork extends [Haleclipse/CometixTUI](https://github.com/Haleclipse/CometixT
 
 - Keyboard and paste events are dispatched individually. Component state is processed before the next input event, so typing `hi`, Enter, and `x` can submit `hi` and retain `x` as a fresh draft. Input bypasses frame throttling and resize settling, including when a resize arrived earlier in the same throttle window; non-input updates still coalesce.
 - `TextInputProps::max_height` caps the visible rows of an auto-growing multiline input. The viewport follows the cursor and resets its scroll offset when content shrinks.
+- An unwrapped `TextInput` limits horizontal scrolling by its widest buffer row, so shrinking a multiline value until every line fits returns the viewport to column zero. Covered by `test_text_input_unwrapped_multiline_value_scrolls_back_when_longest_line_shrinks`.
 - `TextInputProps::on_change_cursor_offset` reports every cursor move made by input, after `on_change` when the input also edited the value, so a parent that mirrors both sees them in the same event and frame. An edit sets the cursor together with its value instead of leaving the next render to infer it from the value it receives. A cursor offset set on a `TextInputHandle` while no input is mounted applies when one mounts with it.
 - Keybinding handlers outside a pending chord's contexts leave it for the matching context to resolve.
 
@@ -23,7 +24,7 @@ A Memo retained blit restores its rectangle from the previous canvas only if no 
 
 The full-frame damage for a layout shift is decided while drawing, as in CC Ink's `renderNodeToOutput`: a drawn node that moved or changed height since its last draw, or the removal of a node that had been drawn, damages the whole frame, while a node that only appeared does not. Subtrees restored from the previous canvas are not visited, so the check costs nothing per retained node.
 
-Unmounting a component removes the layout nodes of its whole subtree, measure contexts included; taffy's `remove` frees neither the descendants nor the context. A component replaced by one of another type under the same key is unmounted the same way. `ComponentDrawer::root_canvas` exposes the frame drawn so far to `post_component_draw` hooks, such as an application's own fullscreen selection copy.
+Unmounting a component removes the layout nodes of its whole subtree, measure contexts included; taffy's `remove` drops the node's context but does not free descendants. A component replaced by one of another type under the same key is unmounted the same way. `ComponentDrawer::root_canvas` exposes the frame drawn so far to `post_component_draw` hooks, such as an application's own fullscreen selection copy.
 
 Draw coordinates cover the layout's whole range: `ComponentDrawer::canvas_position` is a `Point<i32>`, `ComponentDrawer::size` and the clip rectangle use `u32`, and `ScrollViewHandle` reports content and viewport heights as `u32`. A tree rendered ahead of time, such as a long history, can be far taller than `i16::MAX` or `u16::MAX` rows, and every row is drawn in place and scrolled to. Mouse coordinates local to a component more than `u16::MAX` rows above the screen pin to the last row an event can carry.
 
@@ -68,6 +69,11 @@ This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) chang
 - View click and hover targets use the same visible-area calculation as local mouse hooks, retaining unclipped local coordinates and hit testing for visible overflow. Covered by `test_view_click_respects_ancestor_clip_without_moving_origin` in `packages/iocraft/src/components/view.rs`. Ancestor clip changes invalidate Memo retained blits and CachedSubtree snapshots so descendant event regions are refreshed. Zero-height sibling suppression traverses children under an empty clip to keep hidden descendants out of hit testing.
 
 ### Breaking changes for consumers
+
+- Taffy alignment constants use uppercase names, such as `AlignItems::CENTER`, `AlignItems::FLEX_START`, and `JustifyContent::SPACE_BETWEEN`.
+- `Position` is an iocraft enum with only `Relative` (the default) and `Absolute`, keeping layout coordinates relative to the parent. It converts into `taffy::Position`.
+- Directly constructed Taffy `Style` values use relative positioning when `position` is `Static`. `ComponentUpdater::set_layout_style` and `set_layout_style_if_changed` panic for unsupported `Fixed` or `Sticky` positioning.
+- Taffy 0.15 rounds positions in cumulative coordinates, so nested percentage layouts can shift cell boundaries to tile within their rounded parent.
 
 - `element!` initializes optional props using each field type's `Default`; a handwritten `impl Default` on the props struct is no longer used. Fields whose types do not implement `Default` must be marked `#[iocraft(required)]` and supplied by the caller.
 - `NewlineProps::count` is now `Option<i32>`. Omitting it still reserves one row, and `element!(Newline(count: 2))` remains valid.
