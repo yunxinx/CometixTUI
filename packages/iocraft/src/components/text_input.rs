@@ -345,7 +345,7 @@ impl TextBuffer {
                 if width >= col {
                     return row.offset + idx;
                 }
-                width += crate::canvas::string_display_width(grapheme);
+                width += crate::canvas::string_display_width_from_col(grapheme, width);
             }
             row.offset + row.len
         }
@@ -1584,6 +1584,12 @@ mod tests {
         let buffer = TextBuffer::new("a\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}bc\n12345", 10);
         assert_eq!(buffer.above_offset(25, None), 19);
         assert_eq!(buffer.below_offset(19, None), 25);
+
+        let buffer = TextBuffer::new("0123456789\na\tbc", 20);
+        assert_eq!(buffer.below_offset(9, None), 14);
+
+        let buffer = TextBuffer::new("a\tbc\n0123456789", 20);
+        assert_eq!(buffer.above_offset(14, None), 3);
     }
 
     #[test]
