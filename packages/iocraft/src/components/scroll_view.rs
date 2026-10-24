@@ -1,13 +1,13 @@
 use crate::{
+    AnyElement, Canvas, CanvasTextStyle, Color, Component, ComponentDrawer, ComponentUpdater,
+    FRAME_INTERVAL, FlexDirection, Hook, Hooks, JustifyContent, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind, Overflow, Position, Props, SelectionController, TerminalEvent,
     component,
     components::View,
     element,
     hooks::{
         Ref, SelectionContext, State, UseConst, UseInterval, UseRef, UseState, UseTerminalEvents,
     },
-    AnyElement, Canvas, CanvasTextStyle, Color, Component, ComponentDrawer, ComponentUpdater,
-    FlexDirection, Hook, Hooks, JustifyContent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    MouseEventKind, Overflow, Position, Props, SelectionController, TerminalEvent, FRAME_INTERVAL,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -809,11 +809,7 @@ pub fn virtual_scroll_snapshot_bin(
     let quantum = i32::from(config.scroll_quantum_rows.max(1));
     let target = scroll_top.saturating_add(pending_delta).max(0);
     let bin = target / quantum;
-    if is_sticky {
-        !bin
-    } else {
-        bin
-    }
+    if is_sticky { !bin } else { bin }
 }
 
 /// Plans the mounted range, spacers, and optional clamp bounds for a virtual list.
@@ -1107,19 +1103,17 @@ fn scroll_key_delta(event: &KeyEvent, viewport_height: u32, modal_pager_keys: bo
     if SelectionController::selection_focus_move_for_key(event).is_some() {
         return None;
     }
-    if modal_pager_keys {
-        if let Some(action) = modal_pager_action(event) {
-            return Some(match action {
-                ModalPagerAction::LineUp => -1,
-                ModalPagerAction::LineDown => 1,
-                ModalPagerAction::HalfPageUp => -((viewport_height as i32 / 2).max(1)),
-                ModalPagerAction::HalfPageDown => (viewport_height as i32 / 2).max(1),
-                ModalPagerAction::FullPageUp => -(viewport_height as i32).max(1),
-                ModalPagerAction::FullPageDown => (viewport_height as i32).max(1),
-                ModalPagerAction::Top => i32::MIN / 2,
-                ModalPagerAction::Bottom => i32::MAX / 2,
-            });
-        }
+    if modal_pager_keys && let Some(action) = modal_pager_action(event) {
+        return Some(match action {
+            ModalPagerAction::LineUp => -1,
+            ModalPagerAction::LineDown => 1,
+            ModalPagerAction::HalfPageUp => -((viewport_height as i32 / 2).max(1)),
+            ModalPagerAction::HalfPageDown => (viewport_height as i32 / 2).max(1),
+            ModalPagerAction::FullPageUp => -(viewport_height as i32).max(1),
+            ModalPagerAction::FullPageDown => (viewport_height as i32).max(1),
+            ModalPagerAction::Top => i32::MIN / 2,
+            ModalPagerAction::Bottom => i32::MAX / 2,
+        });
     }
 
     match event.code {
@@ -1427,36 +1421,36 @@ pub fn plan_scroll_box_render_offset(
         followed_bottom = true;
     }
 
-    if let Some(pending) = pending_delta {
-        if pending != 0 {
-            let result = if let Some(mode) = input.drain_mode {
-                let past_mounted_clamp =
-                    if let (Some(min), Some(max)) = (input.clamp_min, input.clamp_max) {
-                        let lower = min.min(max);
-                        let upper = min.max(max);
-                        (pending < 0 && scroll_top < lower) || (pending > 0 && scroll_top > upper)
-                    } else {
-                        false
-                    };
-                let effective_height = if past_mounted_clamp {
-                    // Mirrors CC Ink's past-clamp throttle:
-                    // `Math.min(4, innerHeight >> 3)`. `drain_scroll_delta`
-                    // itself still enforces a minimum hardware-scroll cap of 1.
-                    (viewport_height >> 3).min(4)
+    if let Some(pending) = pending_delta
+        && pending != 0
+    {
+        let result = if let Some(mode) = input.drain_mode {
+            let past_mounted_clamp =
+                if let (Some(min), Some(max)) = (input.clamp_min, input.clamp_max) {
+                    let lower = min.min(max);
+                    let upper = min.max(max);
+                    (pending < 0 && scroll_top < lower) || (pending > 0 && scroll_top > upper)
                 } else {
-                    viewport_height
+                    false
                 };
-                drain_scroll_delta(mode, pending, effective_height.min(u16::MAX as i32) as u16)
+            let effective_height = if past_mounted_clamp {
+                // Mirrors CC Ink's past-clamp throttle:
+                // `Math.min(4, innerHeight >> 3)`. `drain_scroll_delta`
+                // itself still enforces a minimum hardware-scroll cap of 1.
+                (viewport_height >> 3).min(4)
             } else {
-                ScrollDrainResult {
-                    applied: pending,
-                    remaining: 0,
-                }
+                viewport_height
             };
-            drained_delta = result.applied;
-            scroll_top = scroll_top.saturating_add(result.applied);
-            pending_delta = (result.remaining != 0).then_some(result.remaining);
-        }
+            drain_scroll_delta(mode, pending, effective_height.min(u16::MAX as i32) as u16)
+        } else {
+            ScrollDrainResult {
+                applied: pending,
+                remaining: 0,
+            }
+        };
+        drained_delta = result.applied;
+        scroll_top = scroll_top.saturating_add(result.applied);
+        pending_delta = (result.remaining != 0).then_some(result.remaining);
     }
 
     let range_clamped = scroll_top.clamp(0, max_scroll);
@@ -1898,15 +1892,14 @@ impl Hook for ScrollHintHook {
     fn pre_component_draw(&mut self, drawer: &mut ComponentDrawer) {
         let pos = drawer.canvas_position();
         let size = drawer.size();
-        if self.enabled {
-            if let (Some(prev_offset), Some(prev_top), Some(prev_height)) =
+        if self.enabled
+            && let (Some(prev_offset), Some(prev_top), Some(prev_height)) =
                 (self.prev_scroll_offset, self.prev_top, self.prev_height)
-            {
-                let delta = self.scroll_offset - prev_offset;
-                let same_region = prev_top == pos.y && prev_height == size.height;
-                if same_region && delta != 0 && delta.unsigned_abs() < size.height {
-                    drawer.set_scroll_hint(delta);
-                }
+        {
+            let delta = self.scroll_offset - prev_offset;
+            let same_region = prev_top == pos.y && prev_height == size.height;
+            if same_region && delta != 0 && delta.unsigned_abs() < size.height {
+                drawer.set_scroll_hint(delta);
             }
         }
         self.prev_scroll_offset = Some(self.scroll_offset);
@@ -2542,27 +2535,29 @@ impl Hook for ContentHeightHook {
         if let Some(mut out) = self.out {
             let h = drawer.size().height;
             let old_h = out.try_get().unwrap_or(0);
-            if self.pinned_to_bottom && self.selection.is_enabled() && old_h > 0 && h > old_h {
-                if let (Some(viewport_top), Some(viewport_height)) =
+            if self.pinned_to_bottom
+                && self.selection.is_enabled()
+                && old_h > 0
+                && h > old_h
+                && let (Some(viewport_top), Some(viewport_height)) =
                     (self.viewport_top, self.viewport_height)
-                {
-                    let viewport_height = viewport_height.get() as usize;
-                    if viewport_height > 0 {
-                        let canvas = self
-                            .selection_screen
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .clone();
-                        if let Some(canvas) = canvas {
-                            let top = viewport_top.get() as usize;
-                            let bottom = top + viewport_height - 1;
-                            self.selection.translate_for_follow_scroll(
-                                &canvas,
-                                (h - old_h) as usize,
-                                top,
-                                bottom,
-                            );
-                        }
+            {
+                let viewport_height = viewport_height.get() as usize;
+                if viewport_height > 0 {
+                    let canvas = self
+                        .selection_screen
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if let Some(canvas) = canvas {
+                        let top = viewport_top.get() as usize;
+                        let bottom = top + viewport_height - 1;
+                        self.selection.translate_for_follow_scroll(
+                            &canvas,
+                            (h - old_h) as usize,
+                            top,
+                            bottom,
+                        );
                     }
                 }
             }
@@ -2612,9 +2607,9 @@ fn ScrollViewContentMeasurer<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        allow_drag_autoscroll_tick, reset_drag_autoscroll_ticks_for_render,
-        scroll_drain_mode_for_xterm_js_host, scroll_key_delta, user_scrolled_up_after_scroll,
-        DragAutoscrollTickState, WheelAccelState,
+        DragAutoscrollTickState, WheelAccelState, allow_drag_autoscroll_tick,
+        reset_drag_autoscroll_ticks_for_render, scroll_drain_mode_for_xterm_js_host,
+        scroll_key_delta, user_scrolled_up_after_scroll,
     };
     use crate::prelude::*;
     use futures::stream::{self, StreamExt};

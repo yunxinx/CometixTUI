@@ -7,7 +7,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll, Waker},
 };
-use crossterm::{cursor, QueueableCommand};
+use crossterm::{QueueableCommand, cursor};
 use futures::{channel::oneshot, future::BoxFuture};
 use std::io;
 use std::{
@@ -639,7 +639,7 @@ impl UseOutputImpl {
 mod tests {
     use super::*;
     use crate::prelude::*;
-    use futures::{task::noop_waker, StreamExt};
+    use futures::{StreamExt, task::noop_waker};
     use macro_rules_attribute::apply;
     use smol_macros::test;
 
@@ -664,9 +664,11 @@ mod tests {
             let mut output = UseOutputImpl::default();
             let stdout = output.use_stdout();
             let waker = Waker::from(Arc::new(WriteOnWake(stdout.clone())));
-            assert!(Pin::new(&mut output)
-                .poll_change(&mut core::task::Context::from_waker(&waker))
-                .is_pending());
+            assert!(
+                Pin::new(&mut output)
+                    .poll_change(&mut core::task::Context::from_waker(&waker))
+                    .is_pending()
+            );
             stdout.println(NestedMessage(stdout.clone()));
             let messages: Vec<_> = output
                 .state
@@ -1057,12 +1059,14 @@ mod tests {
                 assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
             } else {
                 result.unwrap();
-                assert!(proof
-                    .bytes
-                    .lock()
-                    .unwrap()
-                    .windows(b"\x1b]52;c;QQ==\x07".len())
-                    .any(|w| w == b"\x1b]52;c;QQ==\x07"));
+                assert!(
+                    proof
+                        .bytes
+                        .lock()
+                        .unwrap()
+                        .windows(b"\x1b]52;c;QQ==\x07".len())
+                        .any(|w| w == b"\x1b]52;c;QQ==\x07")
+                );
             }
             done.set(true);
         });
@@ -1271,13 +1275,15 @@ mod tests {
             for task in tasks {
                 task.await;
             }
-            assert!(proof
-                .output
-                .bytes
-                .lock()
-                .unwrap()
-                .windows(b"52;c;QQ==".len())
-                .any(|w| w == b"52;c;QQ=="));
+            assert!(
+                proof
+                    .output
+                    .bytes
+                    .lock()
+                    .unwrap()
+                    .windows(b"52;c;QQ==".len())
+                    .any(|w| w == b"52;c;QQ==")
+            );
             done.set(true);
         });
         if done.get() {

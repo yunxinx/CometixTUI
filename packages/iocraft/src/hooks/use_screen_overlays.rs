@@ -56,7 +56,7 @@ impl UseScreenOverlays<'_> for Hooks<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{prelude::*, SelectionController, TextMatchPosition};
+    use crate::{SelectionController, TextMatchPosition, prelude::*};
     use futures::StreamExt;
 
     #[component]

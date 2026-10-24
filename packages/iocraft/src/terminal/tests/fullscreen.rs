@@ -518,8 +518,8 @@ fn test_plan_terminal_fullscreen_canvas_scroll_frame_patches_shifts_previous_lik
 }
 
 #[test]
-fn test_plan_terminal_fullscreen_packed_canvas_scroll_frame_patches_shifts_previous_like_cc_decstbm(
-) {
+fn test_plan_terminal_fullscreen_packed_canvas_scroll_frame_patches_shifts_previous_like_cc_decstbm()
+ {
     let mut pools = CanvasPackedCellPools::new();
     let mut line_cache = CanvasPackedLineCache::new();
     let style = CanvasResolvedStyle::default();

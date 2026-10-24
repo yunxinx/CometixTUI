@@ -1,5 +1,5 @@
 use super::{StdoutHandle, UseOutput};
-use crate::{ansi, ComponentUpdater, Hook, Hooks};
+use crate::{ComponentUpdater, Hook, Hooks, ansi};
 use std::{env, io::IsTerminal};
 
 mod private {
@@ -368,7 +368,7 @@ fn version_gte(a: (u32, u32, u32), b: (u32, u32, u32)) -> bool {
 mod tests {
     use super::*;
     use crate::prelude::*;
-    use futures::{channel::mpsc, StreamExt};
+    use futures::{StreamExt, channel::mpsc};
 
     fn always() -> bool {
         true

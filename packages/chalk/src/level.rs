@@ -14,8 +14,8 @@
 
 use std::io::IsTerminal;
 use std::sync::{
-    atomic::{AtomicU8, Ordering},
     OnceLock,
+    atomic::{AtomicU8, Ordering},
 };
 
 /// Terminal color support level, mirroring chalk/supports-color:
@@ -165,7 +165,7 @@ fn supports_color_base(
     // Terminal and pwsh 7 live. Revisit only if that audience changes.
     #[cfg(windows)]
     {
-        return 3;
+        3
     }
 
     #[cfg(not(windows))]
@@ -211,7 +211,7 @@ fn supports_color_base(
                         3
                     } else {
                         2
-                    }
+                    };
                 }
                 "Apple_Terminal" => return 2,
                 _ => {}

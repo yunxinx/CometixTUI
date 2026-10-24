@@ -421,10 +421,10 @@ where
 
     /// Registers a logical root node and returns its stable id.
     pub fn register_root(&mut self, key: K) -> RendererStableNodeId<K> {
-        if let Some(old_parent) = self.parents.remove(&key) {
-            if let Some(siblings) = self.children.get_mut(&old_parent) {
-                siblings.retain(|sibling| sibling != &key);
-            }
+        if let Some(old_parent) = self.parents.remove(&key)
+            && let Some(siblings) = self.children.get_mut(&old_parent)
+        {
+            siblings.retain(|sibling| sibling != &key);
         }
         let id = self.generations.current_id(key.clone());
         self.children.entry(key).or_default();
@@ -438,10 +438,10 @@ where
         key: K,
         parent: K,
     ) -> (RendererStableNodeId<K>, RendererStableNodeId<K>) {
-        if let Some(old_parent) = self.parents.insert(key.clone(), parent.clone()) {
-            if let Some(siblings) = self.children.get_mut(&old_parent) {
-                siblings.retain(|sibling| sibling != &key);
-            }
+        if let Some(old_parent) = self.parents.insert(key.clone(), parent.clone())
+            && let Some(siblings) = self.children.get_mut(&old_parent)
+        {
+            siblings.retain(|sibling| sibling != &key);
         }
         let siblings = self.children.entry(parent.clone()).or_default();
         if !siblings.contains(&key) {
@@ -506,10 +506,10 @@ where
         let logical_nodes = self.logical_subtree(root);
         let removed = self.retained.remove_subtree(&root_id, is_absolute);
 
-        if let Some(parent) = self.parents.get(root).cloned() {
-            if let Some(siblings) = self.children.get_mut(&parent) {
-                siblings.retain(|sibling| sibling != root);
-            }
+        if let Some(parent) = self.parents.get(root).cloned()
+            && let Some(siblings) = self.children.get_mut(&parent)
+        {
+            siblings.retain(|sibling| sibling != root);
         }
         for key in logical_nodes {
             self.parents.remove(&key);

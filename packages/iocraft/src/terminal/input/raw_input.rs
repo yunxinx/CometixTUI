@@ -335,22 +335,21 @@ impl<W: Write> TerminalRawInputSessionGuard<W> {
         let mut first_error = None;
 
         if self.terminal_modes_active {
-            if let Some(writer) = self.writer.as_mut() {
-                if let Err(error) =
+            if let Some(writer) = self.writer.as_mut()
+                && let Err(error) =
                     write_terminal_raw_input_mode_exit(writer, self.options.terminal_modes)
                         .and_then(|()| writer.flush())
-                {
-                    first_error = Some(error);
-                }
+            {
+                first_error = Some(error);
             }
             self.terminal_modes_active = false;
         }
 
         if self.os_raw_mode_enabled {
-            if let Err(error) = terminal::disable_raw_mode() {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
+            if let Err(error) = terminal::disable_raw_mode()
+                && first_error.is_none()
+            {
+                first_error = Some(error);
             }
             self.os_raw_mode_enabled = false;
         }
@@ -796,13 +795,13 @@ impl Stream for TerminalRawInputFallibleEventStream {
                 Poll::Pending => {}
             }
 
-            if let Some(delay) = this.flush_delay.as_mut() {
-                if delay.as_mut().poll(cx).is_ready() {
-                    this.flush_delay = None;
-                    if let Some(output) = this.frontend.flush_if_due(false) {
-                        this.push_output(output);
-                        continue;
-                    }
+            if let Some(delay) = this.flush_delay.as_mut()
+                && delay.as_mut().poll(cx).is_ready()
+            {
+                this.flush_delay = None;
+                if let Some(output) = this.frontend.flush_if_due(false) {
+                    this.push_output(output);
+                    continue;
                 }
             }
 
@@ -912,13 +911,13 @@ impl Stream for TerminalRawInputEventStream {
                 Poll::Pending => {}
             }
 
-            if let Some(delay) = this.flush_delay.as_mut() {
-                if delay.as_mut().poll(cx).is_ready() {
-                    this.flush_delay = None;
-                    if let Some(output) = this.frontend.flush_if_due(false) {
-                        this.push_output(output);
-                        continue;
-                    }
+            if let Some(delay) = this.flush_delay.as_mut()
+                && delay.as_mut().poll(cx).is_ready()
+            {
+                this.flush_delay = None;
+                if let Some(output) = this.frontend.flush_if_due(false) {
+                    this.push_output(output);
+                    continue;
                 }
             }
 

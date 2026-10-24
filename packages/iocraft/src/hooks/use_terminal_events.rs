@@ -1,7 +1,7 @@
 use crate::{
-    terminal::component_local_offset, ComponentUpdater, FullscreenMouseEvent, Hook, Hooks, KeyCode,
-    KeyEventKind, KeyModifiers, PropagatedTerminalEvent, TerminalEvent, TerminalEventInterest,
-    TerminalEvents,
+    ComponentUpdater, FullscreenMouseEvent, Hook, Hooks, KeyCode, KeyEventKind, KeyModifiers,
+    PropagatedTerminalEvent, TerminalEvent, TerminalEventInterest, TerminalEvents,
+    terminal::component_local_offset,
 };
 use core::{
     pin::Pin,
@@ -467,12 +467,16 @@ mod tests {
         if total.get() >= 3 {
             system.exit();
         }
-        element!(Text(content: format!(
-            "resizes={} unwanted={} total={}",
-            resizes.get(),
-            unwanted.get(),
-            total.get()
-        )))
+        element!(
+            Text(
+                content: format!(
+                    "resizes={} unwanted={} total={}",
+                    resizes.get(),
+                    unwanted.get(),
+                    total.get()
+                ),
+            )
+        )
     }
 
     #[apply(test!)]
@@ -685,8 +689,8 @@ mod tests {
         ])))
         .for_each(|_| async {})
         .await;
-        let recorded_hits = hits.lock().unwrap().clone();
-        recorded_hits
+
+        hits.lock().unwrap().clone()
     }
 
     #[apply(test!)]

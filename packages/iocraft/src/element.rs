@@ -1,11 +1,11 @@
 use crate::{
+    Canvas, FrameProfileCallback, MockTerminalConfig, RenderFrameProfile, Terminal,
+    TerminalDiffPlanning, TerminalInputBackend, TerminalRawInputSessionOptions, TextMatchPosition,
     any_key::AnyKey,
     component::{Component, ComponentHelper, ComponentHelperExt},
     mock_terminal_render_loop, mock_terminal_render_loop_with_profile,
     props::AnyProps,
-    render, terminal_render_loop, Canvas, FrameProfileCallback, MockTerminalConfig,
-    RenderFrameProfile, Terminal, TerminalDiffPlanning, TerminalInputBackend,
-    TerminalRawInputSessionOptions, TextMatchPosition,
+    render, terminal_render_loop,
 };
 use crossterm::terminal;
 use futures::Stream;
@@ -13,7 +13,7 @@ use std::{
     fmt::Debug,
     future::Future,
     hash::Hash,
-    io::{self, stderr, stdout, IsTerminal, LineWriter, Write},
+    io::{self, IsTerminal, LineWriter, Write, stderr, stdout},
     pin::Pin,
     sync::Arc,
 };
@@ -708,10 +708,11 @@ impl<'a, E: ElementExt + Send + 'a> Future for RenderLoopFuture<'a, E> {
                         Ok(t) => t,
                         Err(e) => return std::task::Poll::Ready(Err(e)),
                     };
-                    if effective_mouse_capture && !fullscreen {
-                        if let Err(e) = terminal.enable_mouse_capture() {
-                            return std::task::Poll::Ready(Err(e));
-                        }
+                    if effective_mouse_capture
+                        && !fullscreen
+                        && let Err(e) = terminal.enable_mouse_capture()
+                    {
+                        return std::task::Poll::Ready(Err(e));
                     }
                     if ignore_ctrl_c {
                         terminal.ignore_ctrl_c();

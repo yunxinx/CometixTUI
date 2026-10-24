@@ -1,9 +1,8 @@
 use crate::{
-    component,
+    AnyElement, Color, Context, Hooks, Props, component,
     components::{ContextProvider, Fragment, Text, View},
     element,
-    hooks::{create_notification_context, UseNotificationExpiry, UseNotifications},
-    AnyElement, Color, Context, Hooks, Props,
+    hooks::{UseNotificationExpiry, UseNotifications, create_notification_context},
 };
 
 /// Props for [`NotificationProvider`].

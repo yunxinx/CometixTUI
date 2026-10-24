@@ -638,13 +638,12 @@ struct UseSelectionCopyNotificationsImpl {
 impl Hook for UseSelectionCopyNotificationsImpl {
     fn post_component_draw(&mut self, drawer: &mut ComponentDrawer) {
         let canvas = drawer.root_canvas_mut().clone();
-        if self.active {
-            if let Some(stdout) = &self.stdout {
-                if let Some(text) = stdout.copy_on_select_context(&self.selection, &canvas) {
-                    self.notifications
-                        .add_notification(copied_selection_notification(&text, self.path));
-                }
-            }
+        if self.active
+            && let Some(stdout) = &self.stdout
+            && let Some(text) = stdout.copy_on_select_context(&self.selection, &canvas)
+        {
+            self.notifications
+                .add_notification(copied_selection_notification(&text, self.path));
         }
         *self
             .canvas
@@ -882,7 +881,7 @@ impl UseSelection<'_> for Hooks<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{components::ContextProvider, prelude::*, Context};
+    use crate::{Context, components::ContextProvider, prelude::*};
     use futures::StreamExt;
 
     fn assert_bcd_background(canvas: &Canvas, background: Option<Color>) {
@@ -941,11 +940,15 @@ mod tests {
             .background_color;
         let highlighted = background.is_some();
         let theme_bg = background == Some(selection.selection_bg_color());
-        element!(Text(content: format!(
-            "enabled={} has={} text={text:?} highlighted={highlighted} theme_bg={theme_bg}",
-            selection.is_enabled(),
-            hooks.use_has_selection()
-        )))
+        element!(
+            Text(
+                content: format!(
+                    "enabled={} has={} text={text:?} highlighted={highlighted} theme_bg={theme_bg}",
+                    selection.is_enabled(),
+                    hooks.use_has_selection()
+                ),
+            )
+        )
     }
 
     #[component]
@@ -1271,10 +1274,7 @@ mod tests {
         if !selection.copy_on_select_would_mutate() {
             system.exit();
         }
-        element!(Text(content: format!(
-            "pending={}",
-            selection.copy_on_select_would_mutate()
-        )))
+        element!(Text(content: format!("pending={}", selection.copy_on_select_would_mutate())))
     }
 
     #[test]

@@ -422,11 +422,12 @@ impl CanvasAnsiRowCache {
             .map(|overlays| overlays.iter().take(row.len()).copied().collect::<Vec<_>>())
             .unwrap_or_else(|| vec![None; row.len()]);
 
-        if let Some(entry) = self.rows.get(&key) {
-            if entry.row == row && entry.overlays == overlays {
-                w.write_all(&entry.ansi)?;
-                return Ok(());
-            }
+        if let Some(entry) = self.rows.get(&key)
+            && entry.row == row
+            && entry.overlays == overlays
+        {
+            w.write_all(&entry.ansi)?;
+            return Ok(());
         }
 
         let mut ansi = Vec::new();

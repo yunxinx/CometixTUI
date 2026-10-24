@@ -61,10 +61,10 @@ struct UseFutureImpl {
 
 impl Hook for UseFutureImpl {
     fn poll_change(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if let Some(f) = self.f.as_mut() {
-            if let Poll::Ready(()) = f.as_mut().poll(cx) {
-                self.f = None;
-            }
+        if let Some(f) = self.f.as_mut()
+            && let Poll::Ready(()) = f.as_mut().poll(cx)
+        {
+            self.f = None;
         }
         Poll::Pending
     }

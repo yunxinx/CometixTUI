@@ -1,8 +1,9 @@
 use crate::{
+    AnyElement, Color, Props, Weight,
     components::{
-        raw_ansi::parse_ansi, MixedText, MixedTextContent, TextAlign, TextDecoration, TextWrap,
+        MixedText, MixedTextContent, TextAlign, TextDecoration, TextWrap, raw_ansi::parse_ansi,
     },
-    element, AnyElement, Color, Props, Weight,
+    element,
 };
 
 /// Props for [`Ansi`].

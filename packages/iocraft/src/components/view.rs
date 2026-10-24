@@ -1,16 +1,16 @@
 use super::raw_ansi::parse_ansi_line;
 use crate::{
-    hooks::UseTerminalEvents, terminal::component_local_offset, AnyElement, CanvasSubviewMut,
-    CanvasTextStyle, Color, Component, ComponentDrawer, ComponentUpdater, Context, Edges,
-    FocusChange, FocusContext, FocusId, FocusOptions, FullscreenMouseEvent, HandlerMut, Hooks,
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind, Props,
-    TerminalEvent, Weight,
+    AnyElement, CanvasSubviewMut, CanvasTextStyle, Color, Component, ComponentDrawer,
+    ComponentUpdater, Context, Edges, FocusChange, FocusContext, FocusId, FocusOptions,
+    FullscreenMouseEvent, HandlerMut, Hooks, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind, Props, TerminalEvent, Weight, hooks::UseTerminalEvents,
+    terminal::component_local_offset,
 };
 use iocraft_macros::with_layout_style_props;
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -672,27 +672,25 @@ fn dispatch_hover(records: &[ViewHoverRecord], hovered: &mut Vec<ViewId>, column
 
     let previous = hovered.clone();
     for old_id in previous.iter().copied() {
-        if !next.contains(&old_id) {
-            if let Some(record) = records.iter().find(|record| record.id == old_id) {
-                if let Some(handler_ref) = &record.on_leave {
-                    let mut handler = handler_ref
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    handler(());
-                }
-            }
+        if !next.contains(&old_id)
+            && let Some(record) = records.iter().find(|record| record.id == old_id)
+            && let Some(handler_ref) = &record.on_leave
+        {
+            let mut handler = handler_ref
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            handler(());
         }
     }
     for new_id in next.iter().copied() {
-        if !previous.contains(&new_id) {
-            if let Some(record) = records.iter().find(|record| record.id == new_id) {
-                if let Some(handler_ref) = &record.on_enter {
-                    let mut handler = handler_ref
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    handler(());
-                }
-            }
+        if !previous.contains(&new_id)
+            && let Some(record) = records.iter().find(|record| record.id == new_id)
+            && let Some(handler_ref) = &record.on_enter
+        {
+            let mut handler = handler_ref
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            handler(());
         }
     }
     *hovered = next;
@@ -1434,88 +1432,86 @@ impl Component for View {
             || blur_for_event.is_some()
             || !inherited_blur_captures.is_empty()
             || !inherited_blur_handlers.is_empty();
-        if self.was_focused != focused && (wants_focus_chain || wants_blur_chain) {
-            if let Some((id, ctx)) = self.focus_id.zip(self.focus_ctx) {
-                let change = ctx.last_focus_change();
-                let (kind, captures, target_capture, target_handler, bubbles) = if focused {
-                    (
-                        ViewFocusEventKind::Focus,
-                        &inherited_focus_captures,
-                        &focus_capture_for_event,
-                        &focus_for_event,
-                        &inherited_focus_handlers,
-                    )
-                } else {
-                    (
-                        ViewFocusEventKind::Blur,
-                        &inherited_blur_captures,
-                        &blur_capture_for_event,
-                        &blur_for_event,
-                        &inherited_blur_handlers,
-                    )
-                };
-                let focus_event = ViewFocusEvent::from_change(kind, id, self.view_id, change);
-                let stopped = focus_event.stopped.clone();
-                let immediate_stopped = focus_event.immediate_stopped.clone();
-                for capture in captures {
+        if self.was_focused != focused
+            && (wants_focus_chain || wants_blur_chain)
+            && let Some((id, ctx)) = self.focus_id.zip(self.focus_ctx)
+        {
+            let change = ctx.last_focus_change();
+            let (kind, captures, target_capture, target_handler, bubbles) = if focused {
+                (
+                    ViewFocusEventKind::Focus,
+                    &inherited_focus_captures,
+                    &focus_capture_for_event,
+                    &focus_for_event,
+                    &inherited_focus_handlers,
+                )
+            } else {
+                (
+                    ViewFocusEventKind::Blur,
+                    &inherited_blur_captures,
+                    &blur_capture_for_event,
+                    &blur_for_event,
+                    &inherited_blur_handlers,
+                )
+            };
+            let focus_event = ViewFocusEvent::from_change(kind, id, self.view_id, change);
+            let stopped = focus_event.stopped.clone();
+            let immediate_stopped = focus_event.immediate_stopped.clone();
+            for capture in captures {
+                if stopped.load(Ordering::SeqCst) || immediate_stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                let mut handler = capture
+                    .handler
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                handler(focus_event.clone().for_dispatch(
+                    ViewEventPhase::Capturing,
+                    capture.focus_id,
+                    Some(capture.view_id),
+                ));
+            }
+            let target_reached =
+                !stopped.load(Ordering::SeqCst) && !immediate_stopped.load(Ordering::SeqCst);
+            if target_reached && let Some(capture) = target_capture {
+                let mut handler = capture
+                    .handler
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                handler(focus_event.clone().for_dispatch(
+                    ViewEventPhase::AtTarget,
+                    capture.focus_id,
+                    Some(capture.view_id),
+                ));
+            }
+            if target_reached
+                && !immediate_stopped.load(Ordering::SeqCst)
+                && let Some(handler_ref) = target_handler
+            {
+                let mut handler = handler_ref
+                    .handler
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                handler(focus_event.clone().for_dispatch(
+                    ViewEventPhase::AtTarget,
+                    handler_ref.focus_id,
+                    Some(handler_ref.view_id),
+                ));
+            }
+            if !stopped.load(Ordering::SeqCst) && !immediate_stopped.load(Ordering::SeqCst) {
+                for bubble in bubbles.iter().rev() {
                     if stopped.load(Ordering::SeqCst) || immediate_stopped.load(Ordering::SeqCst) {
                         break;
                     }
-                    let mut handler = capture
+                    let mut handler = bubble
                         .handler
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     handler(focus_event.clone().for_dispatch(
-                        ViewEventPhase::Capturing,
-                        capture.focus_id,
-                        Some(capture.view_id),
+                        ViewEventPhase::Bubbling,
+                        bubble.focus_id,
+                        Some(bubble.view_id),
                     ));
-                }
-                let target_reached =
-                    !stopped.load(Ordering::SeqCst) && !immediate_stopped.load(Ordering::SeqCst);
-                if target_reached {
-                    if let Some(capture) = target_capture {
-                        let mut handler = capture
-                            .handler
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        handler(focus_event.clone().for_dispatch(
-                            ViewEventPhase::AtTarget,
-                            capture.focus_id,
-                            Some(capture.view_id),
-                        ));
-                    }
-                }
-                if target_reached && !immediate_stopped.load(Ordering::SeqCst) {
-                    if let Some(handler_ref) = target_handler {
-                        let mut handler = handler_ref
-                            .handler
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        handler(focus_event.clone().for_dispatch(
-                            ViewEventPhase::AtTarget,
-                            handler_ref.focus_id,
-                            Some(handler_ref.view_id),
-                        ));
-                    }
-                }
-                if !stopped.load(Ordering::SeqCst) && !immediate_stopped.load(Ordering::SeqCst) {
-                    for bubble in bubbles.iter().rev() {
-                        if stopped.load(Ordering::SeqCst)
-                            || immediate_stopped.load(Ordering::SeqCst)
-                        {
-                            break;
-                        }
-                        let mut handler = bubble
-                            .handler
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        handler(focus_event.clone().for_dispatch(
-                            ViewEventPhase::Bubbling,
-                            bubble.focus_id,
-                            Some(bubble.view_id),
-                        ));
-                    }
                 }
             }
         }
@@ -1555,93 +1551,89 @@ impl Component for View {
             if !ctx.is_focused(id) {
                 return;
             }
-            if let TerminalEvent::Key(key) = event.event() {
-                if key.kind != KeyEventKind::Release {
-                    let key_event = ViewKeyboardEvent::new(key);
-                    if event.is_default_prevented() {
-                        key_event.prevent_default();
+            if let TerminalEvent::Key(key) = event.event()
+                && key.kind != KeyEventKind::Release
+            {
+                let key_event = ViewKeyboardEvent::new(key);
+                if event.is_default_prevented() {
+                    key_event.prevent_default();
+                }
+                let stopped = key_event.stopped.clone();
+                let immediate_stopped = key_event.immediate_stopped.clone();
+                let default_prevented = key_event.default_prevented.clone();
+                let target = ctx.active();
+                for capture in &inherited_key_captures {
+                    if stopped.load(Ordering::SeqCst) || immediate_stopped.load(Ordering::SeqCst) {
+                        break;
                     }
-                    let stopped = key_event.stopped.clone();
-                    let immediate_stopped = key_event.immediate_stopped.clone();
-                    let default_prevented = key_event.default_prevented.clone();
-                    let target = ctx.active();
-                    for capture in &inherited_key_captures {
+                    let mut handler = capture
+                        .handler
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    handler(key_event.clone().for_dispatch(
+                        ViewEventPhase::Capturing,
+                        target,
+                        capture.focus_id,
+                        key_target_view,
+                        Some(capture.view_id),
+                    ));
+                }
+                let target_reached =
+                    !stopped.load(Ordering::SeqCst) && !immediate_stopped.load(Ordering::SeqCst);
+                if target_reached && let Some(capture) = &key_capture_for_event {
+                    let mut handler = capture
+                        .handler
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    handler(key_event.clone().for_dispatch(
+                        ViewEventPhase::AtTarget,
+                        target,
+                        capture.focus_id,
+                        key_target_view,
+                        Some(capture.view_id),
+                    ));
+                }
+                if target_reached
+                    && !immediate_stopped.load(Ordering::SeqCst)
+                    && let Some(handler_ref) = &key_handler_for_event
+                {
+                    let mut handler = handler_ref
+                        .handler
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    handler(key_event.clone().for_dispatch(
+                        ViewEventPhase::AtTarget,
+                        target,
+                        handler_ref.focus_id,
+                        key_target_view,
+                        Some(handler_ref.view_id),
+                    ));
+                }
+                if !stopped.load(Ordering::SeqCst) && !immediate_stopped.load(Ordering::SeqCst) {
+                    for bubble in inherited_key_handlers.iter().rev() {
                         if stopped.load(Ordering::SeqCst)
                             || immediate_stopped.load(Ordering::SeqCst)
                         {
                             break;
                         }
-                        let mut handler = capture
+                        let mut handler = bubble
                             .handler
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         handler(key_event.clone().for_dispatch(
-                            ViewEventPhase::Capturing,
+                            ViewEventPhase::Bubbling,
                             target,
-                            capture.focus_id,
+                            bubble.focus_id,
                             key_target_view,
-                            Some(capture.view_id),
+                            Some(bubble.view_id),
                         ));
                     }
-                    let target_reached = !stopped.load(Ordering::SeqCst)
-                        && !immediate_stopped.load(Ordering::SeqCst);
-                    if target_reached {
-                        if let Some(capture) = &key_capture_for_event {
-                            let mut handler = capture
-                                .handler
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            handler(key_event.clone().for_dispatch(
-                                ViewEventPhase::AtTarget,
-                                target,
-                                capture.focus_id,
-                                key_target_view,
-                                Some(capture.view_id),
-                            ));
-                        }
-                    }
-                    if target_reached && !immediate_stopped.load(Ordering::SeqCst) {
-                        if let Some(handler_ref) = &key_handler_for_event {
-                            let mut handler = handler_ref
-                                .handler
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            handler(key_event.clone().for_dispatch(
-                                ViewEventPhase::AtTarget,
-                                target,
-                                handler_ref.focus_id,
-                                key_target_view,
-                                Some(handler_ref.view_id),
-                            ));
-                        }
-                    }
-                    if !stopped.load(Ordering::SeqCst) && !immediate_stopped.load(Ordering::SeqCst)
-                    {
-                        for bubble in inherited_key_handlers.iter().rev() {
-                            if stopped.load(Ordering::SeqCst)
-                                || immediate_stopped.load(Ordering::SeqCst)
-                            {
-                                break;
-                            }
-                            let mut handler = bubble
-                                .handler
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            handler(key_event.clone().for_dispatch(
-                                ViewEventPhase::Bubbling,
-                                target,
-                                bubble.focus_id,
-                                key_target_view,
-                                Some(bubble.view_id),
-                            ));
-                        }
-                    }
-                    if default_prevented.load(Ordering::SeqCst) {
-                        event.prevent_default();
-                    }
-                    if stopped.load(Ordering::SeqCst) {
-                        event.stop_component_propagation();
-                    }
+                }
+                if default_prevented.load(Ordering::SeqCst) {
+                    event.prevent_default();
+                }
+                if stopped.load(Ordering::SeqCst) {
+                    event.stop_component_propagation();
                 }
             }
         });
@@ -1705,35 +1697,34 @@ impl Component for View {
                 }
                 let target_reached =
                     !stopped.load(Ordering::SeqCst) && !immediate_stopped.load(Ordering::SeqCst);
-                if target_reached {
-                    if let Some(capture) = &paste_capture_for_event {
-                        let mut handler = capture
-                            .handler
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        handler(paste_event.clone().for_dispatch(
-                            ViewEventPhase::AtTarget,
-                            target,
-                            capture.focus_id,
-                            paste_target_view,
-                            Some(capture.view_id),
-                        ));
-                    }
+                if target_reached && let Some(capture) = &paste_capture_for_event {
+                    let mut handler = capture
+                        .handler
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    handler(paste_event.clone().for_dispatch(
+                        ViewEventPhase::AtTarget,
+                        target,
+                        capture.focus_id,
+                        paste_target_view,
+                        Some(capture.view_id),
+                    ));
                 }
-                if target_reached && !immediate_stopped.load(Ordering::SeqCst) {
-                    if let Some(handler_ref) = &paste_handler_for_event {
-                        let mut handler = handler_ref
-                            .handler
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        handler(paste_event.clone().for_dispatch(
-                            ViewEventPhase::AtTarget,
-                            target,
-                            handler_ref.focus_id,
-                            paste_target_view,
-                            Some(handler_ref.view_id),
-                        ));
-                    }
+                if target_reached
+                    && !immediate_stopped.load(Ordering::SeqCst)
+                    && let Some(handler_ref) = &paste_handler_for_event
+                {
+                    let mut handler = handler_ref
+                        .handler
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    handler(paste_event.clone().for_dispatch(
+                        ViewEventPhase::AtTarget,
+                        target,
+                        handler_ref.focus_id,
+                        paste_target_view,
+                        Some(handler_ref.view_id),
+                    ));
                 }
                 if !stopped.load(Ordering::SeqCst) && !immediate_stopped.load(Ordering::SeqCst) {
                     for bubble in inherited_paste_handlers.iter().rev() {
@@ -1838,83 +1829,84 @@ impl Component for View {
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
-                        if let Some(click) = pending.as_mut() {
-                            if click.column != *column || click.row != *row {
-                                click.dragged = true;
-                            }
+                        if let Some(click) = pending.as_mut()
+                            && (click.column != *column || click.row != *row)
+                        {
+                            click.dragged = true;
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         let click = pending.take();
-                        if let Some(click) = click {
-                            if inside && !click.dragged {
-                                // Match CC Ink's dispatchClick: click-to-focus is part of
-                                // the completed release-click, not the initial mouse down.
-                                // A drag that started on a focusable view must not steal focus.
-                                let mut focus_cursor = target_record.map(|record| record.id);
-                                while let Some(current) = focus_cursor {
-                                    let Some(record) =
-                                        records.iter().find(|record| record.id == current)
-                                    else {
-                                        break;
-                                    };
-                                    if let Some((id, ctx)) = record.focus {
-                                        ctx.focus(id);
-                                        break;
-                                    }
-                                    focus_cursor = record.parent;
+                        if let Some(click) = click
+                            && inside
+                            && !click.dragged
+                        {
+                            // Match CC Ink's dispatchClick: click-to-focus is part of
+                            // the completed release-click, not the initial mouse down.
+                            // A drag that started on a focusable view must not steal focus.
+                            let mut focus_cursor = target_record.map(|record| record.id);
+                            while let Some(current) = focus_cursor {
+                                let Some(record) =
+                                    records.iter().find(|record| record.id == current)
+                                else {
+                                    break;
+                                };
+                                if let Some((id, ctx)) = record.focus {
+                                    ctx.focus(id);
+                                    break;
                                 }
+                                focus_cursor = record.parent;
+                            }
 
-                                let click_event = ViewClickEvent::new(
-                                    *column,
-                                    *row,
-                                    component_local_offset(*column, rect.left),
-                                    component_local_offset(*row, rect.top),
-                                    *cell_is_blank,
-                                );
-                                let stopped = click_event.stopped.clone();
-                                let target = Some(view_id);
-                                let mut handled = false;
-                                let mut current = Some(view_id);
-                                while let Some(current_id) = current {
-                                    let Some(record) =
-                                        records.iter().find(|record| record.id == current_id)
-                                    else {
-                                        break;
-                                    };
-                                    if let Some(handler_ref) = &record.handler {
-                                        let handler_region = *record
-                                            .region
+                            let click_event = ViewClickEvent::new(
+                                *column,
+                                *row,
+                                component_local_offset(*column, rect.left),
+                                component_local_offset(*row, rect.top),
+                                *cell_is_blank,
+                            );
+                            let stopped = click_event.stopped.clone();
+                            let target = Some(view_id);
+                            let mut handled = false;
+                            let mut current = Some(view_id);
+                            while let Some(current_id) = current {
+                                let Some(record) =
+                                    records.iter().find(|record| record.id == current_id)
+                                else {
+                                    break;
+                                };
+                                if let Some(handler_ref) = &record.handler {
+                                    let handler_region = *record
+                                        .region
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    if let Some(handler_region) = handler_region {
+                                        let handler_rect = handler_region.rect;
+                                        handled = true;
+                                        let phase = if record.id == view_id {
+                                            ViewEventPhase::AtTarget
+                                        } else {
+                                            ViewEventPhase::Bubbling
+                                        };
+                                        let mut handler = handler_ref
                                             .lock()
                                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                        if let Some(handler_region) = handler_region {
-                                            let handler_rect = handler_region.rect;
-                                            handled = true;
-                                            let phase = if record.id == view_id {
-                                                ViewEventPhase::AtTarget
-                                            } else {
-                                                ViewEventPhase::Bubbling
-                                            };
-                                            let mut handler = handler_ref
-                                                .lock()
-                                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                            handler(click_event.clone().for_dispatch(
-                                                phase,
-                                                target,
-                                                Some(record.id),
-                                                component_local_offset(*column, handler_rect.left),
-                                                component_local_offset(*row, handler_rect.top),
-                                            ));
-                                        }
+                                        handler(click_event.clone().for_dispatch(
+                                            phase,
+                                            target,
+                                            Some(record.id),
+                                            component_local_offset(*column, handler_rect.left),
+                                            component_local_offset(*row, handler_rect.top),
+                                        ));
                                     }
-                                    if stopped.load(Ordering::SeqCst) {
-                                        break;
-                                    }
-                                    current = record.parent;
                                 }
-                                if handled || stopped.load(Ordering::SeqCst) {
-                                    event.stop_component_propagation();
+                                if stopped.load(Ordering::SeqCst) {
+                                    break;
                                 }
+                                current = record.parent;
+                            }
+                            if handled || stopped.load(Ordering::SeqCst) {
+                                event.stop_component_propagation();
                             }
                         }
                     }

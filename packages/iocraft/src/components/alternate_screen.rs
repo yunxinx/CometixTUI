@@ -1,6 +1,6 @@
 use crate::{
-    component, components::View, element, hooks::UseContext, AnyElement, Hooks, Props,
-    SystemContext,
+    AnyElement, Hooks, Props, SystemContext, component, components::View, element,
+    hooks::UseContext,
 };
 
 /// Props for [`AlternateScreen`].
@@ -41,7 +41,7 @@ pub fn AlternateScreen<'a>(
 #[cfg(test)]
 mod tests {
     use crate::prelude::*;
-    use futures::{stream, StreamExt};
+    use futures::{StreamExt, stream};
 
     #[component]
     fn AlternateScreenProbe(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {

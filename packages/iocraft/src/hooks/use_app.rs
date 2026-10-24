@@ -1,4 +1,4 @@
-use crate::{context::TerminalHandoffRequest, Hooks, SystemContext};
+use crate::{Hooks, SystemContext, context::TerminalHandoffRequest};
 use std::io;
 
 use super::{State, UseContext, UseState};
@@ -158,8 +158,10 @@ mod tests {
                 .mock_terminal_render_loop(MockTerminalConfig::default())
                 .collect(),
         );
-        assert!(canvases
-            .iter()
-            .any(|canvas| canvas.to_string().contains("code=7")));
+        assert!(
+            canvases
+                .iter()
+                .any(|canvas| canvas.to_string().contains("code=7"))
+        );
     }
 }

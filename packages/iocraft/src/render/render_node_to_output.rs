@@ -174,14 +174,13 @@ pub fn apply_retained_node_render_plan_to_canvas(
         application.cleared_old_region = Some(region);
     }
 
-    if plan.action == RetainedNodeRenderAction::Blit {
-        if let Some(region) = plan
+    if plan.action == RetainedNodeRenderAction::Blit
+        && let Some(region) = plan
             .blit_region
             .and_then(|region| region.clipped_to_canvas(next.width(), next.height()))
-        {
-            next.blit_region_from(previous, region.x, region.y, region.width, region.height);
-            application.blitted_region = Some(region);
-        }
+    {
+        next.blit_region_from(previous, region.x, region.y, region.width, region.height);
+        application.blitted_region = Some(region);
     }
 
     for region in &plan.pending_clear_regions {

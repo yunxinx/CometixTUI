@@ -181,11 +181,11 @@ fn ScrolledTallScrollBoxApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> 
     hooks.use_terminal_events({
         let mut handle = handle;
         move |event| {
-            if let TerminalEvent::Key(key) = event {
-                if key.kind == KeyEventKind::Press {
-                    handle.write().scroll_to(70_000);
-                    did_scroll.set(true);
-                }
+            if let TerminalEvent::Key(key) = event
+                && key.kind == KeyEventKind::Press
+            {
+                handle.write().scroll_to(70_000);
+                did_scroll.set(true);
             }
         }
     });
@@ -863,9 +863,11 @@ async fn test_prev_damage_wakes_next_identical_render_once() {
     assert_eq!(canvases[0].damage_region(), None);
     assert!(canvases[1].damage_region().is_some());
     assert_eq!(canvases[2].damage_region(), None);
-    assert!(canvases
-        .iter()
-        .all(|canvas| canvas.to_string() == "static\n"));
+    assert!(
+        canvases
+            .iter()
+            .all(|canvas| canvas.to_string() == "static\n")
+    );
 }
 
 #[derive(Default)]

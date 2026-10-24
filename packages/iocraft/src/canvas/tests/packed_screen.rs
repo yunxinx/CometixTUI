@@ -1073,9 +1073,11 @@ fn test_canvas_packed_screen_visible_cell_helper_matches_cc_visible_cell_at_inde
         None,
         CanvasPackedCellWidth::Normal,
     ));
-    assert!(packed
-        .visible_cell(&pools, 1, 0, Some(visible_id))
-        .is_some());
+    assert!(
+        packed
+            .visible_cell(&pools, 1, 0, Some(visible_id))
+            .is_some()
+    );
 
     assert!(packed.set_cell_text(
         &mut pools,

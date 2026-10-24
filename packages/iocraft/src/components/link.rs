@@ -1,7 +1,7 @@
 use crate::{
-    component,
+    AnyElement, Props, component,
     components::{StyledSegment, Text},
-    element, AnyElement, Props,
+    element,
 };
 
 /// Props for [`Link`].

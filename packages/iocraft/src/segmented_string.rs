@@ -1,4 +1,4 @@
-use crate::unicode_linebreak::{linebreaks_iter, BreakOpportunity};
+use crate::unicode_linebreak::{BreakOpportunity, linebreaks_iter};
 use core::{
     fmt::{self, Display},
     mem,

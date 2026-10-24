@@ -6,12 +6,12 @@ use crate::{
     multimap::AppendOnlyMultimap,
     props::AnyProps,
     terminal::{
-        plan_terminal_canvas_diff, plan_terminal_scroll_hint_patch, terminal_scroll_hint_to_ansi,
         MockTerminalConfig, MockTerminalOutputStream, PendingTerminalFlush, PendingTerminalQuery,
         Terminal, TerminalCanvasDiffContext, TerminalCanvasDiffTarget, TerminalCanvasRepaintReason,
         TerminalDiffPlanning, TerminalEvents, TerminalQuery, TerminalScrollHintBounds,
         TerminalScrollHintPatchOptions, TerminalScrollHintPatchPlan,
-        TerminalScrollHintPatchSkipReason, TerminalScrollHintRejection,
+        TerminalScrollHintPatchSkipReason, TerminalScrollHintRejection, plan_terminal_canvas_diff,
+        plan_terminal_scroll_hint_patch, terminal_scroll_hint_to_ansi,
     },
 };
 use core::{
@@ -21,7 +21,7 @@ use core::{
     task::{self, Poll},
 };
 use futures::{
-    future::{select, Either, FutureExt, LocalBoxFuture},
+    future::{Either, FutureExt, LocalBoxFuture, select},
     stream::{Stream, StreamExt},
 };
 use std::{
@@ -2467,15 +2467,15 @@ impl<'a> Tree<'a> {
                 });
             }
             let last_frame = std::time::Instant::now();
-            if let Some(requested) = self.system_context.mouse_capture() {
-                if mouse_capture_enabled != Some(requested) {
-                    if requested {
-                        term.enable_mouse_capture()?;
-                    } else {
-                        term.disable_mouse_capture()?;
-                    }
-                    mouse_capture_enabled = Some(requested);
+            if let Some(requested) = self.system_context.mouse_capture()
+                && mouse_capture_enabled != Some(requested)
+            {
+                if requested {
+                    term.enable_mouse_capture()?;
+                } else {
+                    term.disable_mouse_capture()?;
                 }
+                mouse_capture_enabled = Some(requested);
             }
             if let Some(flags) = self.system_context.keyboard_enhancement_flags() {
                 term.set_keyboard_enhancement_flags(flags)?;

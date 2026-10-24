@@ -120,13 +120,7 @@ impl Clipboard {
         let tmux = self.tmux_load_buffer(text, &env);
         let passthrough =
             ansi::osc52_clipboard_sequence_for_multiplexer(text, MultiplexerPassthrough::Tmux);
-        Box::pin(async move {
-            if tmux.await {
-                passthrough
-            } else {
-                raw
-            }
-        })
+        Box::pin(async move { if tmux.await { passthrough } else { raw } })
     }
 
     // Maps to CC `tmuxLoadBuffer`: iTerm2 must not receive tmux's -w emission.
@@ -293,9 +287,11 @@ mod tests {
         assert_eq!(backend.programs(), ["pbcopy", "tmux"]);
         let calls = backend.calls.lock().unwrap();
         assert_eq!(calls[1].1, ["load-buffer", "-w", "-"]);
-        assert!(calls
-            .iter()
-            .all(|c| c.2 == "中文\n🌈" && c.3 == Duration::from_secs(2)));
+        assert!(
+            calls
+                .iter()
+                .all(|c| c.2 == "中文\n🌈" && c.3 == Duration::from_secs(2))
+        );
         drop(calls);
         release.send(0).unwrap();
         assert_eq!(

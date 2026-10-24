@@ -5,8 +5,8 @@ use crate::{
     multimap::RemoveOnlyMultimap,
     props::{AnyProps, Props},
     render::{
-        wake::{push_wake_enabled, settle_trace_enabled, ComponentWakeState},
         ComponentDrawer, ComponentUpdater, LayoutEngine, UpdateContext,
+        wake::{ComponentWakeState, push_wake_enabled, settle_trace_enabled},
     },
 };
 use core::{
@@ -305,16 +305,15 @@ impl InstantiatedComponent {
                 } else {
                     None
                 };
-                if self.subtree_retained && single_child {
-                    if let Some(rect) = subtree_rect {
-                        if self.cached_blit_bounds == Some(rect)
-                            && self.cached_blit_clip_rect == drawer.clip_rect()
-                            && !self.cached_blit_drew_overlays
-                            && drawer.try_retained_blit(rect)
-                        {
-                            return;
-                        }
-                    }
+                if self.subtree_retained
+                    && single_child
+                    && let Some(rect) = subtree_rect
+                    && self.cached_blit_bounds == Some(rect)
+                    && self.cached_blit_clip_rect == drawer.clip_rect()
+                    && !self.cached_blit_drew_overlays
+                    && drawer.try_retained_blit(rect)
+                {
+                    return;
                 }
                 drawer.for_child_node_layout(child_node_id, |drawer| {
                     self.hooks.pre_component_draw(drawer);

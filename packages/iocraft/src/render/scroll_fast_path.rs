@@ -745,12 +745,11 @@ pub fn plan_scroll_fast_path_child_repairs<K>(
         }
 
         let screen_y = i64::from(content_y) + child_top;
-        if !child.dirty {
-            if let Some(cached_y) = child.cached_y {
-                if i64::from(cached_y) - i64::from(delta) == screen_y {
-                    continue;
-                }
-            }
+        if !child.dirty
+            && let Some(cached_y) = child.cached_y
+            && i64::from(cached_y) - i64::from(delta) == screen_y
+        {
+            continue;
         }
 
         let repair_top = viewport_top.max(screen_y);

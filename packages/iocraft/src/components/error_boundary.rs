@@ -1,10 +1,11 @@
 use crate::{
+    AnyElement, Component, ComponentUpdater, Hooks, Props,
     components::{ErrorLocation, ErrorOverview},
-    element, AnyElement, Component, ComponentUpdater, Hooks, Props,
+    element,
 };
 use std::{
     any::Any,
-    panic::{catch_unwind, AssertUnwindSafe},
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex},
 };
 

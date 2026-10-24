@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use iocraft::{components::View, AnyElement, Hooks};
-use iocraft_macros::{component, element, Props};
+use iocraft::{AnyElement, Hooks, components::View};
+use iocraft_macros::{Props, component, element};
 
 #[component]
 fn MyComponent() -> impl Into<AnyElement<'static>> {

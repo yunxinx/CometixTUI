@@ -35,8 +35,8 @@
 //! `now - lastUpdate` from its own subscribe time, so its phase is its
 //! start; iocraft's `use_interval` models that with its own `Delay`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// The base tick while the terminal is focused. CC `ink/constants.ts`

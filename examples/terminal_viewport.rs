@@ -19,11 +19,7 @@ struct CounterProps {
 fn Counter(mut hooks: Hooks, props: &CounterProps) -> impl Into<AnyElement<'static>> {
     let mut renders = hooks.use_state(|| 0u32);
     renders += 1;
-    element!(Text(content: format!(
-        "{} counter renders={}",
-        props.label,
-        renders.get()
-    )))
+    element!(Text(content: format!("{} counter renders={}", props.label, renders.get())))
 }
 
 #[component]
@@ -35,10 +31,7 @@ fn TopProbe(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
 #[component]
 fn BottomProbe(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let entry = hooks.use_terminal_viewport_with_rows(3);
-    element!(Text(content: format!(
-        "bottom probe visible={}",
-        entry.is_visible
-    )))
+    element!(Text(content: format!("bottom probe visible={}", entry.is_visible)))
 }
 
 #[component]

@@ -1,6 +1,6 @@
 use crate::{
-    context::ExitOnCtrlCContext, Hooks, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    MouseEventKind, PropagatedTerminalEvent, TerminalEvent,
+    Hooks, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind, PropagatedTerminalEvent,
+    TerminalEvent, context::ExitOnCtrlCContext,
 };
 
 use super::{UseContext, UseTerminalEvents};
@@ -303,7 +303,7 @@ impl UseInput for Hooks<'_, '_> {
 mod tests {
     use super::*;
     use crate::prelude::*;
-    use futures::{stream, StreamExt};
+    use futures::{StreamExt, stream};
 
     #[component]
     fn InputProbe(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {

@@ -1,4 +1,4 @@
-use crate::{component, components::View, element, AnyElement, Props};
+use crate::{AnyElement, Props, component, components::View, element};
 
 /// Props for [`NoSelect`].
 #[non_exhaustive]

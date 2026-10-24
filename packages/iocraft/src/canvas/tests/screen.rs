@@ -1568,18 +1568,22 @@ fn test_style_caches_invalidate_on_level_change() {
     let mut rows = CanvasAnsiRowCache::new();
     {
         let _guard = ColorLevelGuard::pin(3);
-        assert!(transitions
-            .transition(CanvasResolvedStyle::default(), bold_orange)
-            .contains("38;2;215;119;87"));
+        assert!(
+            transitions
+                .transition(CanvasResolvedStyle::default(), bold_orange)
+                .contains("38;2;215;119;87")
+        );
         let mut out = Vec::new();
         rows.write_row(&styled_canvas(), 0, &mut out).unwrap();
         assert!(String::from_utf8(out).unwrap().contains("38;2;215;119;87"));
     }
     {
         let _guard = ColorLevelGuard::pin(2);
-        assert!(transitions
-            .transition(CanvasResolvedStyle::default(), bold_orange)
-            .contains("38;5;174"));
+        assert!(
+            transitions
+                .transition(CanvasResolvedStyle::default(), bold_orange)
+                .contains("38;5;174")
+        );
         let mut out = Vec::new();
         rows.write_row(&styled_canvas(), 0, &mut out).unwrap();
         assert!(String::from_utf8(out).unwrap().contains("38;5;174"));

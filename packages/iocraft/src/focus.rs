@@ -173,10 +173,8 @@ impl FocusState {
     fn set_active_with_stack(&mut self, active: Option<FocusId>, push_previous: bool) {
         if self.active != active {
             let previous = self.active;
-            if push_previous {
-                if let Some(previous) = previous {
-                    self.push_focus_stack(previous);
-                }
+            if push_previous && let Some(previous) = previous {
+                self.push_focus_stack(previous);
             }
             self.active = active;
             self.last_focus_change = Some(FocusChange {
@@ -217,11 +215,11 @@ impl FocusState {
 
     fn set_entry_active(&mut self, id: FocusId, is_active: bool) {
         let mut changed = false;
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
-            if entry.is_active != is_active {
-                entry.is_active = is_active;
-                changed = true;
-            }
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id)
+            && entry.is_active != is_active
+        {
+            entry.is_active = is_active;
+            changed = true;
         }
         if changed && !is_active && self.active == Some(id) {
             // Deactivation is an iocraft extension (CC Ink's focus manager only

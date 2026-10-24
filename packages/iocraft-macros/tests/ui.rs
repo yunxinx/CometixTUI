@@ -47,7 +47,7 @@ fn props_diagnostics() {
     fs::write(
         project.path().join("Cargo.toml"),
         format!(
-            "[package]\nname = \"iocraft-props-ui\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\niocraft = {{ path = {} }}\n",
+            "[package]\nname = \"iocraft-props-ui\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n\n[dependencies]\niocraft = {{ path = {} }}\n",
             serde_json::to_string(&iocraft).unwrap()
         ),
     ).unwrap();
@@ -96,7 +96,7 @@ fn props_diagnostics() {
     fs::write(
         project.path().join("Cargo.toml"),
         format!(
-            "[package]\nname = \"iocraft-props-ui\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\nuiterm = {{ package = \"iocraft\", path = {} }}\n",
+            "[package]\nname = \"iocraft-props-ui\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n\n[dependencies]\nuiterm = {{ package = \"iocraft\", path = {} }}\n",
             serde_json::to_string(&iocraft).unwrap()
         ),
     ).unwrap();

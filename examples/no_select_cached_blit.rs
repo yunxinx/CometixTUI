@@ -6,7 +6,7 @@
 //! selection/search overlays; iocraft mirrors that so the selection overlay
 //! skips the cached cells.
 
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use iocraft::prelude::*;
 use std::io;
 

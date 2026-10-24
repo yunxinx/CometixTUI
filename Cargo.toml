@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 
 members = [
     "packages/chalk",
@@ -8,10 +8,15 @@ members = [
     "packages/iocraft-router",
 ]
 
+[workspace.package]
+edition = "2024"
+rust-version = "1.99"
+
 [package]
 name = "iocraft-examples"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 
 [dev-dependencies]

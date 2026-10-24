@@ -1872,31 +1872,31 @@ impl Canvas {
     /// cell. Callers do not need to know whether a cell is wide.
     pub fn set_overlay(&mut self, x: usize, y: usize, overlay: StyleOverlay) {
         self.mark_rows_written(y, y.saturating_add(1));
-        if let Some(row) = self.overlays.get_mut(y).map(std::sync::Arc::make_mut) {
-            if let Some(slot) = row.get_mut(x) {
-                Self::compose_overlay_slot(slot, overlay);
-            }
+        if let Some(row) = self.overlays.get_mut(y).map(std::sync::Arc::make_mut)
+            && let Some(slot) = row.get_mut(x)
+        {
+            Self::compose_overlay_slot(slot, overlay);
         }
         // Auto-expand across the wide character's cells.
-        if let Some(cell_row) = self.cells.get(y) {
-            if let Some(cell) = cell_row.get(x) {
-                match cell.cell_width {
-                    CellWidth::Wide => {
-                        if let Some(row) = self.overlays.get_mut(y).map(std::sync::Arc::make_mut) {
-                            if let Some(slot) = row.get_mut(x + 1) {
-                                Self::compose_overlay_slot(slot, overlay);
-                            }
-                        }
+        if let Some(cell_row) = self.cells.get(y)
+            && let Some(cell) = cell_row.get(x)
+        {
+            match cell.cell_width {
+                CellWidth::Wide => {
+                    if let Some(row) = self.overlays.get_mut(y).map(std::sync::Arc::make_mut)
+                        && let Some(slot) = row.get_mut(x + 1)
+                    {
+                        Self::compose_overlay_slot(slot, overlay);
                     }
-                    CellWidth::WidthTail if x > 0 => {
-                        if let Some(row) = self.overlays.get_mut(y).map(std::sync::Arc::make_mut) {
-                            if let Some(slot) = row.get_mut(x - 1) {
-                                Self::compose_overlay_slot(slot, overlay);
-                            }
-                        }
-                    }
-                    _ => {}
                 }
+                CellWidth::WidthTail if x > 0 => {
+                    if let Some(row) = self.overlays.get_mut(y).map(std::sync::Arc::make_mut)
+                        && let Some(slot) = row.get_mut(x - 1)
+                    {
+                        Self::compose_overlay_slot(slot, overlay);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1925,10 +1925,10 @@ impl Canvas {
     /// Clears the overlay on a single cell.
     pub fn clear_overlay(&mut self, x: usize, y: usize) {
         self.mark_rows_written(y, y.saturating_add(1));
-        if let Some(row) = self.overlays.get_mut(y).map(std::sync::Arc::make_mut) {
-            if let Some(slot) = row.get_mut(x) {
-                *slot = None;
-            }
+        if let Some(row) = self.overlays.get_mut(y).map(std::sync::Arc::make_mut)
+            && let Some(slot) = row.get_mut(x)
+        {
+            *slot = None;
         }
     }
 

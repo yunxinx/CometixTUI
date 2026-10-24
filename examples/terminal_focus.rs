@@ -6,7 +6,7 @@
 //! render-loop focus state instead of reverting to `Unknown`.
 //! This example uses mock terminal event streams so it is deterministic.
 
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use iocraft::prelude::*;
 use std::io;
 
@@ -17,10 +17,7 @@ fn FocusProbe(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     if state != TerminalFocusState::Unknown {
         system.exit();
     }
-    element!(Text(content: format!(
-        "terminal focused={} state={state:?}",
-        state.is_focused()
-    )))
+    element!(Text(content: format!("terminal focused={} state={state:?}", state.is_focused())))
 }
 
 fn render_with(event: TerminalEvent) -> Vec<String> {

@@ -1,5 +1,5 @@
 use crate::{
-    hooks::UseTerminalEvents, Hooks, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, TerminalEvent,
+    Hooks, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, TerminalEvent, hooks::UseTerminalEvents,
 };
 
 mod private {
@@ -126,10 +126,10 @@ fn parse_key_code(
         "left" => KeyCode::Left,
         "right" => KeyCode::Right,
         _ => {
-            if let Some(n) = lower.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
-                if (1..=24).contains(&n) {
-                    return Ok(KeyCode::F(n));
-                }
+            if let Some(n) = lower.strip_prefix('f').and_then(|n| n.parse::<u8>().ok())
+                && (1..=24).contains(&n)
+            {
+                return Ok(KeyCode::F(n));
             }
             let mut chars = original.chars();
             match (chars.next(), chars.next()) {
@@ -137,7 +137,7 @@ fn parse_key_code(
                 _ => {
                     return Err(KeyBindingParseError(format!(
                         "unrecognized key {original:?} in {full:?}"
-                    )))
+                    )));
                 }
             }
         }
@@ -198,11 +198,11 @@ impl UseKeybinding for Hooks<'_, '_> {
             .parse()
             .unwrap_or_else(|e: KeyBindingParseError| panic!("{e}"));
         self.use_propagated_terminal_events(move |propagated| {
-            if let TerminalEvent::Key(event) = propagated.event() {
-                if binding.matches(event) {
-                    f();
-                    propagated.stop_propagation();
-                }
+            if let TerminalEvent::Key(event) = propagated.event()
+                && binding.matches(event)
+            {
+                f();
+                propagated.stop_propagation();
             }
         });
     }
@@ -334,9 +334,15 @@ mod tests {
     #[component]
     fn Item(mut hooks: Hooks, props: &ItemProps) -> impl Into<AnyElement<'static>> {
         let focus = hooks.use_focus(FocusOptions::default());
-        element!(Text(content: format!(
-            "{}{}", props.label, if focus.is_focused() { "*" } else { " " }
-        )))
+        element!(
+            Text(
+                content: format!(
+                    "{}{}",
+                    props.label,
+                    if focus.is_focused() { "*" } else { " " }
+                ),
+            )
+        )
     }
 
     #[component]

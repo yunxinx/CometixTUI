@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use iocraft::{element, AnyElement, Component, Element, Percent, Props};
+use iocraft::{AnyElement, Component, Element, Percent, Props, element};
 
 #[derive(Default)]
 struct MyComponent;

@@ -5,7 +5,7 @@
 //! byte tokenization, paste grouping, terminal-response parsing, mouse parsing,
 //! and incomplete-sequence flush timing.
 
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use iocraft::prelude::*;
 
 fn main() {

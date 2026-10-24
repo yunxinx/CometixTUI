@@ -21,7 +21,7 @@ mod selection;
 mod style_pool;
 
 pub use measure_text::{
-    expand_tabs, expand_tabs_with_interval, line_width, measure_text, widest_line, TextMeasurement,
+    TextMeasurement, expand_tabs, expand_tabs_with_interval, line_width, measure_text, widest_line,
 };
 pub(crate) use measure_text::{
     grapheme_width, handles_vs16_incorrectly, single_ascii_byte, skip_escape_sequence_graphemes,

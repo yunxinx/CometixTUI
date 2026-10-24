@@ -802,18 +802,18 @@ impl TerminalImpl for StdTerminal<'_> {
             return Ok(());
         }
 
-        if let Some(size) = self.size {
-            if self.prev_canvas_height >= size.1 {
-                // A viewport-tall inline canvas cannot be cleared reliably with
-                // relative line erases: some rows may already be in native
-                // scrollback. Clear the visible screen and repaint from a fresh
-                // baseline, but do NOT purge scrollback. Local JSX overlays such
-                // as /resume must preserve the user's mouse-wheel terminal history.
-                self.dest
-                    .queue(terminal::Clear(terminal::ClearType::All))?
-                    .queue(cursor::MoveTo(0, 0))?;
-                return Ok(());
-            }
+        if let Some(size) = self.size
+            && self.prev_canvas_height >= size.1
+        {
+            // A viewport-tall inline canvas cannot be cleared reliably with
+            // relative line erases: some rows may already be in native
+            // scrollback. Clear the visible screen and repaint from a fresh
+            // baseline, but do NOT purge scrollback. Local JSX overlays such
+            // as /resume must preserve the user's mouse-wheel terminal history.
+            self.dest
+                .queue(terminal::Clear(terminal::ClearType::All))?
+                .queue(cursor::MoveTo(0, 0))?;
+            return Ok(());
         }
 
         clear_canvas_inline(&mut *self.dest, self.prev_canvas_height)

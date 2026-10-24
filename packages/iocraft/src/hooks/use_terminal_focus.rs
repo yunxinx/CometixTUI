@@ -80,7 +80,7 @@ impl Hook for UseTerminalFocusImpl {
 mod tests {
     use super::*;
     use crate::prelude::*;
-    use futures::{stream, StreamExt};
+    use futures::{StreamExt, stream};
 
     #[component]
     fn TerminalFocusProbe(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {

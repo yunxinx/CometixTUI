@@ -1,10 +1,9 @@
 use crate::{
-    component,
+    AnyElement, Color, FlexDirection, HandlerMut, Hooks, KeyCode, KeyEvent, KeyEventKind,
+    MouseEventKind, Props, TerminalEvent, component,
     components::{Text, View},
     element,
     hooks::{UseState, UseTerminalEvents},
-    AnyElement, Color, FlexDirection, HandlerMut, Hooks, KeyCode, KeyEvent, KeyEventKind,
-    MouseEventKind, Props, TerminalEvent,
 };
 
 /// The props which can be passed to the [`Checkbox`] component.

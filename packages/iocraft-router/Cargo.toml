@@ -1,7 +1,8 @@
 [package]
 name = "iocraft-router"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "Declarative router for iocraft TUI framework with reactive state, history stack, and builder API."
 

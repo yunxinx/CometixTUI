@@ -1,9 +1,9 @@
 use crate::{
+    CanvasTextStyle, Color, Component, ComponentDrawer, ComponentUpdater, Hooks, Props, Weight,
     canvas::UnderlineStyle,
     components::text::{Text, TextAlign, TextDecoration, TextDrawer, TextWrap},
     segmented_string::SegmentedString,
     strip_ansi::strip_ansi,
-    CanvasTextStyle, Color, Component, ComponentDrawer, ComponentUpdater, Hooks, Props, Weight,
 };
 
 /// A section of text in a [`MixedText`] component.

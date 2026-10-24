@@ -40,20 +40,20 @@ where
 
     /// Registers a root node with no parent.
     pub fn register_root(&mut self, node: K) {
-        if let Some(old_parent) = self.parents.remove(&node) {
-            if let Some(siblings) = self.children.get_mut(&old_parent) {
-                siblings.retain(|sibling| sibling != &node);
-            }
+        if let Some(old_parent) = self.parents.remove(&node)
+            && let Some(siblings) = self.children.get_mut(&old_parent)
+        {
+            siblings.retain(|sibling| sibling != &node);
         }
         self.children.entry(node).or_default();
     }
 
     /// Attaches `node` under `parent`, updating any old parent edge.
     pub fn attach(&mut self, node: K, parent: K) {
-        if let Some(old_parent) = self.parents.insert(node.clone(), parent.clone()) {
-            if let Some(siblings) = self.children.get_mut(&old_parent) {
-                siblings.retain(|sibling| sibling != &node);
-            }
+        if let Some(old_parent) = self.parents.insert(node.clone(), parent.clone())
+            && let Some(siblings) = self.children.get_mut(&old_parent)
+        {
+            siblings.retain(|sibling| sibling != &node);
         }
         let siblings = self.children.entry(parent).or_default();
         if !siblings.contains(&node) {

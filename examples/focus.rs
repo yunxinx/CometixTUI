@@ -72,10 +72,9 @@ fn Submit(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             kind: KeyEventKind::Press,
             ..
         }) = event
+            && matches!(code, KeyCode::Enter | KeyCode::Char(' '))
         {
-            if matches!(code, KeyCode::Enter | KeyCode::Char(' ')) {
-                should_submit.set(true);
-            }
+            should_submit.set(true);
         }
     });
 

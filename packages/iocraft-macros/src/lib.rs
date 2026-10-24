@@ -4,18 +4,17 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::Span;
-use quote::{format_ident, quote, quote_spanned, ToTokens};
+use quote::{ToTokens, format_ident, quote, quote_spanned};
 use std::sync::atomic::{AtomicU64, Ordering};
 use syn::{
-    braced, parenthesized,
+    DeriveInput, Error, Expr, FieldValue, Fields, FnArg, GenericParam, Generics, Ident, ItemFn,
+    ItemStruct, Lifetime, Lit, Member, Pat, Result, Token, Type, TypePath, WhereClause,
+    WherePredicate, braced, parenthesized,
     parse::{Parse, ParseStream, Parser},
     parse_macro_input, parse_quote,
     punctuated::Punctuated,
     spanned::Spanned,
     token::{Brace, Comma, Paren},
-    DeriveInput, Error, Expr, FieldValue, Fields, FnArg, GenericParam, Generics, Ident, ItemFn,
-    ItemStruct, Lifetime, Lit, Member, Pat, Result, Token, Type, TypePath, WhereClause,
-    WherePredicate,
 };
 
 fn iocraft_path() -> Result<proc_macro2::TokenStream> {
@@ -826,7 +825,7 @@ impl Parse for ParsedComponent {
                                     return Err(Error::new(
                                         arg.ty.span(),
                                         "invalid `props` type (must be a reference)",
-                                    ))
+                                    ));
                                 }
                             }
                         }
@@ -841,14 +840,14 @@ impl Parse for ParsedComponent {
                                 return Err(Error::new(
                                     arg.ty.span(),
                                     "invalid `hooks` type (must be a reference or a value)",
-                                ))
+                                ));
                             }
                         },
                         _ => {
                             return Err(Error::new(
                                 arg.span(),
                                 "unexpected argument (must be named `props` or `hooks`)",
-                            ))
+                            ));
                         }
                     }
                 }
@@ -1424,7 +1423,7 @@ pub fn with_layout_style_props(_attr: TokenStream, item: TokenStream) -> TokenSt
 
     let mut ast = parse_macro_input!(item as DeriveInput);
     match &mut ast.data {
-        syn::Data::Struct(ref mut struct_data) => {
+        syn::Data::Struct(struct_data) => {
             if let syn::Fields::Named(fields) = &mut struct_data.fields {
                 fields.named.extend(layout_style_fields.iter().cloned());
             }

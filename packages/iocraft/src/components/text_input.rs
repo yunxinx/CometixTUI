@@ -1,12 +1,11 @@
 use crate::{
-    component,
+    AnyElement, CanvasTextStyle, Color, Component, ComponentDrawer, ComponentUpdater, HandlerMut,
+    Hook, Hooks, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, LayoutStyle, Overflow, Position,
+    Props, Size, StyleOverlay, TerminalEvent, Weight, component,
     components::{TextDecoration, TextDrawer, TextWrap, View},
     element,
     hooks::{Ref, State, UseMemo, UseState, UseTerminalEvents},
     segmented_string::SegmentedString,
-    AnyElement, CanvasTextStyle, Color, Component, ComponentDrawer, ComponentUpdater, HandlerMut,
-    Hook, Hooks, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, LayoutStyle, Overflow, Position,
-    Props, Size, StyleOverlay, TerminalEvent, Weight,
 };
 use core::{
     pin::Pin,

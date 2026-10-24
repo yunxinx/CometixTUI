@@ -309,11 +309,11 @@ pub fn plan_terminal_fullscreen_canvas_frame_patches(
     let mut content = Vec::new();
     let mut had_scroll_patch = false;
 
-    if let Some(scroll_patch_ansi) = options.scroll_patch_ansi {
-        if !scroll_patch_ansi.is_empty() {
-            content.push(TerminalPatch::Stdout(scroll_patch_ansi));
-            had_scroll_patch = true;
-        }
+    if let Some(scroll_patch_ansi) = options.scroll_patch_ansi
+        && !scroll_patch_ansi.is_empty()
+    {
+        content.push(TerminalPatch::Stdout(scroll_patch_ansi));
+        had_scroll_patch = true;
     }
 
     content.extend(terminal_fullscreen_canvas_diff_patches(
@@ -361,11 +361,11 @@ pub fn plan_terminal_fullscreen_packed_canvas_frame_patches(
     let mut content = Vec::new();
     let mut had_scroll_patch = false;
 
-    if let Some(scroll_patch_ansi) = options.scroll_patch_ansi {
-        if !scroll_patch_ansi.is_empty() {
-            content.push(TerminalPatch::Stdout(scroll_patch_ansi));
-            had_scroll_patch = true;
-        }
+    if let Some(scroll_patch_ansi) = options.scroll_patch_ansi
+        && !scroll_patch_ansi.is_empty()
+    {
+        content.push(TerminalPatch::Stdout(scroll_patch_ansi));
+        had_scroll_patch = true;
     }
 
     content.extend(terminal_fullscreen_packed_canvas_diff_patches(

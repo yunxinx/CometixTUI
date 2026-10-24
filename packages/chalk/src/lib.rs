@@ -23,11 +23,11 @@
 mod level;
 mod styles;
 
-pub use level::{set_stderr_level, set_stdout_level, stderr_level, stdout_level, ColorLevel};
-pub use styles::{ansi256_to_ansi, hex_to_rgb, rgb_to_ansi, rgb_to_ansi256, NamedColor};
+pub use level::{ColorLevel, set_stderr_level, set_stdout_level, stderr_level, stdout_level};
+pub use styles::{NamedColor, ansi256_to_ansi, hex_to_rgb, rgb_to_ansi, rgb_to_ansi256};
 
 use styles::{
-    wrap_ansi16, wrap_ansi16m, wrap_ansi256, CodePair, ANSI_BACKGROUND_OFFSET, BG_CLOSE, FG_CLOSE,
+    ANSI_BACKGROUND_OFFSET, BG_CLOSE, CodePair, FG_CLOSE, wrap_ansi16, wrap_ansi16m, wrap_ansi256,
 };
 
 /// One styling layer: an open/close escape-sequence pair.

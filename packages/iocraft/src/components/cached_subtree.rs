@@ -1,5 +1,5 @@
 use crate::{
-    component, components::View, element, AnyElement, Canvas, ComponentDrawer, Hook, Hooks, Props,
+    AnyElement, Canvas, ComponentDrawer, Hook, Hooks, Props, component, components::View, element,
 };
 
 /// Props for [`CachedSubtree`].
@@ -151,7 +151,7 @@ pub fn CachedSubtree<'a>(
 #[cfg(test)]
 mod tests {
     use crate::prelude::*;
-    use futures::{stream, StreamExt};
+    use futures::{StreamExt, stream};
 
     #[component]
     fn CachedSubtreeProbe(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {

@@ -1,5 +1,5 @@
 use iocraft::Display;
-use iocraft_macros::{with_layout_style_props, Props};
+use iocraft_macros::{Props, with_layout_style_props};
 
 #[with_layout_style_props]
 #[derive(Default, Props)]

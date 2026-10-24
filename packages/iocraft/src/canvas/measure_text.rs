@@ -238,12 +238,13 @@ pub(crate) fn grapheme_width(grapheme: &str) -> usize {
     // Incomplete keycap sequences (digit/#/* + VS16 without U+20E3) stay one
     // column in CC Ink's stringWidth.ts. Complete keycaps fall through to the
     // VS16 emoji-width rule below.
-    if grapheme.len() >= 4 && grapheme.contains('\u{fe0f}') && !grapheme.contains('\u{20e3}') {
-        if let Some(first) = grapheme.chars().next() {
-            if first.is_ascii_digit() || first == '#' || first == '*' {
-                return 1;
-            }
-        }
+    if grapheme.len() >= 4
+        && grapheme.contains('\u{fe0f}')
+        && !grapheme.contains('\u{20e3}')
+        && let Some(first) = grapheme.chars().next()
+        && (first.is_ascii_digit() || first == '#' || first == '*')
+    {
+        return 1;
     }
 
     // Single visible codepoint plus VS16 (emoji presentation selector): terminals

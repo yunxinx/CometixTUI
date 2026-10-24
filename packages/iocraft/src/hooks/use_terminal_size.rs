@@ -1,6 +1,6 @@
 use crate::{
-    hooks::{State, UseState, UseTerminalEvents},
     ComponentUpdater, Hook, Hooks, TerminalEvent,
+    hooks::{State, UseState, UseTerminalEvents},
 };
 use crossterm::terminal;
 

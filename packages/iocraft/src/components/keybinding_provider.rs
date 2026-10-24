@@ -1,9 +1,8 @@
 use crate::{
-    component,
+    AnyElement, Context, Hooks, Props, component,
     components::ContextProvider,
     element,
-    hooks::{create_keybinding_context, parse_keybinding_blocks, KeybindingBlock},
-    AnyElement, Context, Hooks, Props,
+    hooks::{KeybindingBlock, create_keybinding_context, parse_keybinding_blocks},
 };
 
 /// Props for [`KeybindingProvider`].
@@ -41,7 +40,7 @@ pub fn KeybindingProvider<'a>(
 #[cfg(test)]
 mod tests {
     use crate::prelude::*;
-    use futures::{stream, StreamExt};
+    use futures::{StreamExt, stream};
 
     fn key(ch: char) -> TerminalEvent {
         TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char(ch)))

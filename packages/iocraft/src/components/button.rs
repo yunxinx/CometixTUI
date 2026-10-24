@@ -1,9 +1,9 @@
 use crate::{
+    AnyElement, HandlerMut, Hooks, KeyCode, KeyEvent, KeyEventKind, Props, TerminalEvent,
     component,
     components::{View, ViewClickEvent, ViewKeyboardEvent},
     element,
     hooks::{Ref, UseInterval, UseState, UseTerminalEvents},
-    AnyElement, HandlerMut, Hooks, KeyCode, KeyEvent, KeyEventKind, Props, TerminalEvent,
 };
 use std::{
     sync::{Arc, Mutex},

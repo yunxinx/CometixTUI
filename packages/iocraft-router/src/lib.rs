@@ -4,7 +4,7 @@ pub mod route;
 
 pub use core::{RouterConfig, RouterError, RouterResult};
 pub use integration::{
-    use_route, use_router, PageRenderer, ReactiveRouterHandle, RouterApp, RouterContext, UIRouter,
-    UIRouterBuilder,
+    PageRenderer, ReactiveRouterHandle, RouterApp, RouterContext, UIRouter, UIRouterBuilder,
+    use_route, use_router,
 };
 pub use route::{Route, RouteId};

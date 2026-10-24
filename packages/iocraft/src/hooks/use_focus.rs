@@ -1,5 +1,5 @@
 use crate::{
-    hooks::UseContext, FocusContext, FocusHandle, FocusId, FocusManager, FocusOptions, Hook, Hooks,
+    FocusContext, FocusHandle, FocusId, FocusManager, FocusOptions, Hook, Hooks, hooks::UseContext,
 };
 
 mod private {

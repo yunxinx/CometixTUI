@@ -821,10 +821,9 @@ pub fn optimize_terminal_patches(diff: Vec<TerminalPatch>) -> Vec<TerminalPatch>
 
             if let (TerminalPatch::Hyperlink { uri: last_uri }, TerminalPatch::Hyperlink { uri }) =
                 (&*last, &patch)
+                && last_uri == uri
             {
-                if last_uri == uri {
-                    continue;
-                }
+                continue;
             }
 
             if matches!(

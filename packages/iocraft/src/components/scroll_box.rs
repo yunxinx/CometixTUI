@@ -1,9 +1,8 @@
 use crate::{
-    component,
+    AnyElement, Color, Hooks, Props, component,
     components::{ScrollDrainMode, ScrollView},
     element,
     hooks::{Ref, SelectionContext},
-    AnyElement, Color, Hooks, Props,
 };
 
 pub use crate::components::ScrollViewHandle as ScrollBoxHandle;
@@ -149,7 +148,7 @@ pub fn FastScrollBox<'a>(
 #[cfg(test)]
 mod tests {
     use crate::prelude::*;
-    use futures::{stream, StreamExt};
+    use futures::{StreamExt, stream};
 
     #[component]
     fn ScrollBoxProbe(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {

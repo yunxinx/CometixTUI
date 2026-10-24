@@ -2357,10 +2357,11 @@ impl CanvasPackedScreen {
                     *marked = false;
                 }
             }
-            if start_x == 0 && max_x == self.width {
-                if let Some(soft_wrap) = self.soft_wrap.get_mut(row) {
-                    *soft_wrap = 0;
-                }
+            if start_x == 0
+                && max_x == self.width
+                && let Some(soft_wrap) = self.soft_wrap.get_mut(row)
+            {
+                *soft_wrap = 0;
             }
         }
 
@@ -2493,16 +2494,16 @@ impl CanvasPackedScreen {
         let mut span_start = start_y;
         for row in start_y..=max_y {
             if row == max_y || row_is_excluded(row) {
-                if row > span_start {
-                    if let Some(region) = self.blit_region_from(
+                if row > span_start
+                    && let Some(region) = self.blit_region_from(
                         src,
                         start_x,
                         span_start,
                         max_x - start_x,
                         row - span_start,
-                    ) {
-                        regions.push(region);
-                    }
+                    )
+                {
+                    regions.push(region);
                 }
                 span_start = row.saturating_add(1);
             }
@@ -2568,10 +2569,10 @@ impl CanvasPackedScreen {
             self.cells[dst_start + offset] = self.cells[src_start + offset];
             self.no_select[dst_start + offset] = self.no_select[src_start + offset];
         }
-        if let Some(src_soft_wrap) = self.soft_wrap.get(src_row).copied() {
-            if let Some(dst_soft_wrap) = self.soft_wrap.get_mut(dst_row) {
-                *dst_soft_wrap = src_soft_wrap;
-            }
+        if let Some(src_soft_wrap) = self.soft_wrap.get(src_row).copied()
+            && let Some(dst_soft_wrap) = self.soft_wrap.get_mut(dst_row)
+        {
+            *dst_soft_wrap = src_soft_wrap;
         }
     }
 
@@ -3183,11 +3184,12 @@ impl CanvasPackedOutput {
         }
 
         let mut prev_content_end = 0usize;
-        if let Some(soft_wrap) = soft_wrap {
-            if from > 0 && soft_wrap.get(from).copied() == Some(true) {
-                prev_content_end =
-                    measure_packed_output_line_end(&mut self.line_cache, x, &lines[from - 1]);
-            }
+        if let Some(soft_wrap) = soft_wrap
+            && from > 0
+            && soft_wrap.get(from).copied() == Some(true)
+        {
+            prev_content_end =
+                measure_packed_output_line_end(&mut self.line_cache, x, &lines[from - 1]);
         }
 
         for (offset_y, line) in lines[from..to].iter().enumerate() {

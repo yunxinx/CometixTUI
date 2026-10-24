@@ -6,7 +6,7 @@
 //! into scrollback. Wheel scrolling clears selection, matching CC Ink's
 //! `ScrollKeybindingHandler`.
 
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use iocraft::prelude::*;
 
 #[component]

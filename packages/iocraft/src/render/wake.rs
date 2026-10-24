@@ -18,8 +18,8 @@
 
 use futures::task::AtomicWaker;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::task::Wake;
 
@@ -326,8 +326,8 @@ mod settle_tests {
     #[apply(test!)]
     async fn test_update_phase_writes_settle_in_same_frame() {
         use std::sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         };
         super::set_push_wake_for_tests(Some(true));
         // Count render-loop ITERATIONS via the profile callback: convergence

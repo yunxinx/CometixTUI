@@ -1,11 +1,11 @@
 use crate::{
+    CanvasTextStyle, Color, Component, ComponentDrawer, ComponentUpdater, Hooks, Props, TextStyles,
+    Weight,
     canvas::UnderlineStyle,
     components::{MixedText, MixedTextContent},
     render::MeasureFunc,
     segmented_string::SegmentedString,
     strip_ansi::strip_ansi,
-    CanvasTextStyle, Color, Component, ComponentDrawer, ComponentUpdater, Hooks, Props, TextStyles,
-    Weight,
 };
 use taffy::{AvailableSpace, Size};
 

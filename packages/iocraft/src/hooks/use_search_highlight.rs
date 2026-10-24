@@ -359,17 +359,21 @@ impl UseSearchHighlight<'_> for Hooks<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{components::ContextProvider, prelude::*, Context};
+    use crate::{Context, components::ContextProvider, prelude::*};
     use futures::StreamExt;
 
     #[component]
     fn SearchHighlightConsumer(hooks: Hooks) -> impl Into<AnyElement<'static>> {
         let highlight = hooks.use_search_highlight();
-        element!(Text(content: format!(
-            "enabled={} query={:?}",
-            highlight.is_enabled(),
-            highlight.query()
-        )))
+        element!(
+            Text(
+                content: format!(
+                    "enabled={} query={:?}",
+                    highlight.is_enabled(),
+                    highlight.query()
+                ),
+            )
+        )
     }
 
     #[component]
@@ -510,16 +514,20 @@ mod tests {
             expected.to_vec(),
             "current match must move from second to first, then all highlights clear"
         );
-        assert!(canvases
-            .first()
-            .unwrap()
-            .to_string()
-            .contains("enabled=true query=\"lazy\""));
-        assert!(canvases
-            .last()
-            .unwrap()
-            .to_string()
-            .contains("enabled=true query=\"\""));
+        assert!(
+            canvases
+                .first()
+                .unwrap()
+                .to_string()
+                .contains("enabled=true query=\"lazy\"")
+        );
+        assert!(
+            canvases
+                .last()
+                .unwrap()
+                .to_string()
+                .contains("enabled=true query=\"\"")
+        );
     }
 
     #[component]

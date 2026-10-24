@@ -8,9 +8,9 @@ use crate::{
     element::Output,
 };
 use crossterm::{
-    cursor,
+    ExecutableCommand, QueueableCommand, cursor,
     event::{self, Event, EventStream},
-    terminal, ExecutableCommand, QueueableCommand,
+    terminal,
 };
 use futures::{
     channel::{mpsc, oneshot},
@@ -20,7 +20,7 @@ use futures_timer::Delay;
 use std::{
     collections::VecDeque,
     future::Future,
-    io::{self, stdin, IsTerminal, Write},
+    io::{self, IsTerminal, Write, stdin},
     mem,
     pin::Pin,
     sync::{Arc, Mutex, Weak},
@@ -48,8 +48,8 @@ mod scroll_hint;
 
 #[cfg(test)]
 use backend::{
-    clear_canvas_inline, register_terminal_for_panic_restore,
-    unregister_terminal_for_panic_restore, PANIC_RESTORE_STATE,
+    PANIC_RESTORE_STATE, clear_canvas_inline, register_terminal_for_panic_restore,
+    unregister_terminal_for_panic_restore,
 };
 use backend::{StdTerminal, TerminalImpl};
 pub use capability::*;
@@ -753,7 +753,7 @@ impl<'a> Terminal<'a> {
     }
 
     pub async fn wait(&mut self) -> io::Result<()> {
-        use futures::future::{poll_fn, select, Either};
+        use futures::future::{Either, poll_fn, select};
 
         let event_cell_snapshot = self.event_cell_snapshot.clone();
         match &mut self.event_stream {

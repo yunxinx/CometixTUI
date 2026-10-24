@@ -2,8 +2,8 @@ use super::*;
 use crate::prelude::*;
 use crossterm::QueueableCommand;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 
 #[derive(Clone, Default)]

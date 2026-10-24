@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn test_woken_consumer_can_read_changed_state() {
         use std::{
-            sync::{mpsc, Arc},
+            sync::{Arc, mpsc},
             task::Wake,
             time::Duration,
         };

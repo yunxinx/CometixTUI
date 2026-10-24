@@ -92,8 +92,9 @@ mod tests {
     use macro_rules_attribute::apply;
     use smol_macros::test;
     use std::sync::{
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc, Mutex, OnceLock,
+        mpsc,
     };
     use std::time::Duration;
 

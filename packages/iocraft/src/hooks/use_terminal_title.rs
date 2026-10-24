@@ -1,4 +1,4 @@
-use crate::{strip_ansi::strip_ansi, ComponentUpdater, Hook, Hooks};
+use crate::{ComponentUpdater, Hook, Hooks, strip_ansi::strip_ansi};
 
 mod private {
     pub trait Sealed {}
@@ -90,7 +90,7 @@ impl Hook for UseTerminalTitleImpl {
 mod tests {
     use super::*;
     use crate::prelude::*;
-    use futures::{channel::mpsc, StreamExt};
+    use futures::{StreamExt, channel::mpsc};
 
     #[derive(Default, Props)]
     struct TitleScriptProps {

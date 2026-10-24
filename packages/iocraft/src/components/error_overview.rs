@@ -1,4 +1,4 @@
-use crate::{component, element, AnyElement, Color, FlexDirection, Props, Weight};
+use crate::{AnyElement, Color, FlexDirection, Props, Weight, component, element};
 
 use super::{Fragment, Text, View};
 
@@ -37,10 +37,10 @@ struct ErrorExcerptLine {
 
 fn cleanup_path(path: &str) -> String {
     let path = path.strip_prefix("file://").unwrap_or(path);
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Ok(relative) = std::path::Path::new(path).strip_prefix(cwd) {
-            return relative.display().to_string();
-        }
+    if let Ok(cwd) = std::env::current_dir()
+        && let Ok(relative) = std::path::Path::new(path).strip_prefix(cwd)
+    {
+        return relative.display().to_string();
     }
     path.to_string()
 }

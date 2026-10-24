@@ -1,11 +1,10 @@
 use crate::{
-    component,
+    AnyElement, Context, FocusContext, Hooks, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, Props,
+    TerminalEvent, component,
     components::{ContextProvider, ViewFocusParentContext},
     element,
     focus::create_focus_context,
     hooks::{UseContext, UseTerminalDefaultEvents},
-    AnyElement, Context, FocusContext, Hooks, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, Props,
-    TerminalEvent,
 };
 
 /// The props which can be passed to the [`FocusScope`] component.
@@ -164,7 +163,15 @@ mod tests {
     #[component]
     fn Item(mut hooks: Hooks, props: &ItemProps) -> impl Into<AnyElement<'static>> {
         let focus = hooks.use_focus(FocusOptions::default());
-        element!(Text(content: format!("{}{}", props.label, if focus.is_focused() { "*" } else { " " })))
+        element!(
+            Text(
+                content: format!(
+                    "{}{}",
+                    props.label,
+                    if focus.is_focused() { "*" } else { " " }
+                ),
+            )
+        )
     }
 
     #[component]
@@ -311,9 +318,15 @@ mod tests {
             auto_focus: false,
             is_active: enabled,
         });
-        element!(Text(content: format!(
-            "{}{}", props.label, if focus.is_focused() { "*" } else { " " }
-        )))
+        element!(
+            Text(
+                content: format!(
+                    "{}{}",
+                    props.label,
+                    if focus.is_focused() { "*" } else { " " }
+                ),
+            )
+        )
     }
 
     #[component]

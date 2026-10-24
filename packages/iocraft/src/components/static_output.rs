@@ -1,7 +1,6 @@
 use crate::{
-    component,
+    AnyElement, Hooks, Props, component,
     hooks::{UseOutput, UseState},
-    AnyElement, Hooks, Props,
 };
 
 /// The props which can be passed to the [`StaticOutput`] component.

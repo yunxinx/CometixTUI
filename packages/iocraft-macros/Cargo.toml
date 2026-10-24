@@ -1,7 +1,8 @@
 [package]
 name = "iocraft-macros"
 version = "0.2.4"
-edition = "2021"
+edition.workspace = true
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "Macro implementations for the iocraft crate."
 repository = "https://github.com/ccbrown/iocraft"

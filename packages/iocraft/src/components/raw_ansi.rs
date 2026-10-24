@@ -1,6 +1,6 @@
 use crate::{
-    canvas::{string_display_width_from_col, UnderlineStyle},
     CanvasTextStyle, Color, Component, ComponentDrawer, ComponentUpdater, Hooks, Props, Weight,
+    canvas::{UnderlineStyle, string_display_width_from_col},
 };
 use std::collections::HashMap;
 use taffy::{geometry::Size, style::Dimension};
@@ -639,10 +639,10 @@ fn parse_ansi_impl(input: &str, stop_at_newline: bool) -> Vec<AnsiRun> {
             i += ch.len_utf8();
             if let Some(next) = input[i..].chars().next() {
                 i += next.len_utf8();
-                if matches!(next, '(' | ')' | '*' | '+') {
-                    if let Some(designator) = input[i..].chars().next() {
-                        i += designator.len_utf8();
-                    }
+                if matches!(next, '(' | ')' | '*' | '+')
+                    && let Some(designator) = input[i..].chars().next()
+                {
+                    i += designator.len_utf8();
                 }
             }
             continue;

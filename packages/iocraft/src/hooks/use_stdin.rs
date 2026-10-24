@@ -1,4 +1,4 @@
-use crate::{context::ExitOnCtrlCContext, ComponentUpdater, Hook, Hooks};
+use crate::{ComponentUpdater, Hook, Hooks, context::ExitOnCtrlCContext};
 
 use super::{State, UseContext, UseState};
 
@@ -107,10 +107,10 @@ struct UseStdinImpl {
 
 impl Hook for UseStdinImpl {
     fn post_component_update(&mut self, updater: &mut ComponentUpdater) {
-        if let Some(requested) = self.requested_raw_mode.get() {
-            if let Some(terminal) = updater.terminal_mut() {
-                let _ = terminal.set_raw_mode_enabled(requested);
-            }
+        if let Some(requested) = self.requested_raw_mode.get()
+            && let Some(terminal) = updater.terminal_mut()
+        {
+            let _ = terminal.set_raw_mode_enabled(requested);
         }
 
         let supported = updater.is_terminal_raw_mode_supported();
@@ -139,12 +139,16 @@ mod tests {
             system.exit();
         }
 
-        element!(Text(content: format!(
-            "supported={} enabled={} exit_on_ctrl_c={}",
-            stdin.is_raw_mode_supported(),
-            stdin.is_raw_mode_enabled(),
-            stdin.exit_on_ctrl_c()
-        )))
+        element!(
+            Text(
+                content: format!(
+                    "supported={} enabled={} exit_on_ctrl_c={}",
+                    stdin.is_raw_mode_supported(),
+                    stdin.is_raw_mode_enabled(),
+                    stdin.exit_on_ctrl_c()
+                ),
+            )
+        )
     }
 
     #[test]
@@ -192,10 +196,7 @@ mod tests {
             system.exit();
         }
 
-        element!(Text(content: format!(
-            "requested={:?}",
-            stdin.requested_raw_mode()
-        )))
+        element!(Text(content: format!("requested={:?}", stdin.requested_raw_mode())))
     }
 
     #[test]

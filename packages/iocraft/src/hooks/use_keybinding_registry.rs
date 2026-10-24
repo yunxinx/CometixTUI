@@ -522,10 +522,10 @@ impl ActiveContextRegistrationHook {
 
 impl Drop for ActiveContextRegistrationHook {
     fn drop(&mut self) {
-        if self.active {
-            if let Some(context) = self.context.take() {
-                self.keybindings.unregister_active_context(&context);
-            }
+        if self.active
+            && let Some(context) = self.context.take()
+        {
+            self.keybindings.unregister_active_context(&context);
         }
     }
 }

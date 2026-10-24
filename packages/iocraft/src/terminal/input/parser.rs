@@ -447,16 +447,15 @@ fn parsed_input_event_key_code(event: &TerminalParsedInputEvent) -> Option<KeyCo
     if event.keypress.name.as_deref() == Some("insert") {
         return Some(KeyCode::Insert);
     }
-    if key.fn_key {
-        if let Some(number) = event
+    if key.fn_key
+        && let Some(number) = event
             .keypress
             .name
             .as_deref()
             .and_then(|name| name.strip_prefix('f'))
             .and_then(|number| number.parse::<u8>().ok())
-        {
-            return Some(KeyCode::F(number));
-        }
+    {
+        return Some(KeyCode::F(number));
     }
     if let Some(ch) = single_char(&event.input) {
         return Some(KeyCode::Char(ch));
