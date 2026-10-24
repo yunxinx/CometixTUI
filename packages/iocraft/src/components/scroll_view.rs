@@ -1102,8 +1102,8 @@ enum ModalPagerAction {
 }
 
 fn scroll_key_delta(event: &KeyEvent, viewport_height: u32, modal_pager_keys: bool) -> Option<i32> {
-    // Shift with an arrow, Home or End extends a selection, which moves only
-    // its focus: CC Ink's scroll bindings match no modified arrow either.
+    // Shift with an arrow, Home or End moves only a selection's focus, as CC
+    // Ink's `selectionFocusMoveForKey` does, whether or not a selection exists.
     if SelectionController::selection_focus_move_for_key(event).is_some() {
         return None;
     }

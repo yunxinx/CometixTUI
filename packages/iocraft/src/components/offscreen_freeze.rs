@@ -75,10 +75,15 @@ struct OffscreenFreezeDrawCache {
     // The children were refreshed while frozen: draw them instead of the
     // snapshot this frame, then take the result as the snapshot.
     refreshed: bool,
+    // `ComponentDrawer::overlay_count` before the subtree drew. A restore copies an absolutely
+    // positioned node's pixels without recording it, so a later blit could not tell what it
+    // covered: a subtree that drew one is not kept.
+    overlays_before_draw: usize,
 }
 
 impl Hook for OffscreenFreezeDrawCache {
     fn pre_component_draw(&mut self, drawer: &mut ComponentDrawer) {
+        self.overlays_before_draw = drawer.overlay_count();
         self.frozen =
             !self.bypassed && !is_drawer_visible_in_terminal_viewport(drawer, self.terminal_rows);
         if !self.frozen {
@@ -123,7 +128,7 @@ impl Hook for OffscreenFreezeDrawCache {
 
     fn post_component_draw(&mut self, drawer: &mut ComponentDrawer) {
         let refreshed = std::mem::take(&mut self.refreshed);
-        if self.bypassed {
+        if self.bypassed || drawer.overlay_count() > self.overlays_before_draw {
             self.snapshot = None;
             return;
         }

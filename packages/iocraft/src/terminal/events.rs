@@ -328,6 +328,13 @@ pub struct FullscreenMouseEvent {
     pub kind: MouseEventKind,
 }
 
+/// A screen column or row relative to a component's `origin`. A component taller than any
+/// terminal can start more than `u16::MAX` rows above the screen; its farther rows pin to the
+/// last one an event can carry.
+pub(crate) fn component_local_offset(screen: u16, origin: i32) -> u16 {
+    u16::try_from(i64::from(screen) - i64::from(origin)).unwrap_or(u16::MAX)
+}
+
 impl FullscreenMouseEvent {
     /// Creates a new `FullscreenMouseEvent`.
     pub fn new(kind: MouseEventKind, column: u16, row: u16) -> Self {

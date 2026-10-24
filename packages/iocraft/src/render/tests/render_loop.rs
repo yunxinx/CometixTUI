@@ -146,6 +146,14 @@ fn test_a_layout_taller_than_u16_rows_draws_every_row_in_place() {
     }
 }
 
+/// The row numbers of three tall blocks, one per line.
+fn tall_rows() -> String {
+    (0..3 * TALL_BLOCK_ROWS)
+        .map(|row| row.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[component]
 fn TallScrollBoxApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut system = hooks.use_context_mut::<SystemContext>();
@@ -155,17 +163,56 @@ fn TallScrollBoxApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     } else {
         frames.set(frames.get() + 1);
     }
-    let lines = (0..3 * TALL_BLOCK_ROWS)
-        .map(|row| row.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
     element! {
         View(width: 8, height: 2) {
             ScrollBox(sticky_scroll: true) {
-                Text(content: lines)
+                Text(content: tall_rows())
             }
         }
     }
+}
+
+/// Scrolls to row 70,000 of the tall rows on a key press.
+#[component]
+fn ScrolledTallScrollBoxApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let mut system = hooks.use_context_mut::<SystemContext>();
+    let handle = hooks.use_ref_default::<ScrollBoxHandle>();
+    let mut did_scroll = hooks.use_state(|| false);
+    hooks.use_terminal_events({
+        let mut handle = handle;
+        move |event| {
+            if let TerminalEvent::Key(key) = event {
+                if key.kind == KeyEventKind::Press {
+                    handle.write().scroll_to(70_000);
+                    did_scroll.set(true);
+                }
+            }
+        }
+    });
+    if did_scroll.get() && handle.read().get_scroll_top() == 70_000 {
+        system.exit();
+    }
+    element! {
+        View(width: 8, height: 2) {
+            ScrollBox(handle) {
+                Text(content: tall_rows())
+            }
+        }
+    }
+}
+
+#[apply(test!)]
+async fn test_a_scroll_box_scrolled_past_u16_rows_shows_the_rows_it_was_scrolled_to() {
+    let canvases: Vec<_> = element!(ScrolledTallScrollBoxApp)
+        .mock_terminal_render_loop(MockTerminalConfig::with_events(futures::stream::iter(
+            vec![TerminalEvent::Key(KeyEvent::new(
+                KeyEventKind::Press,
+                KeyCode::Char('x'),
+            ))],
+        )))
+        .collect()
+        .await;
+    assert_eq!(canvases.last().unwrap().to_string(), "70000\n70001\n");
 }
 
 #[apply(test!)]

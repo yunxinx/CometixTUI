@@ -1,6 +1,7 @@
 use crate::{
-    ComponentUpdater, FullscreenMouseEvent, Hook, Hooks, KeyCode, KeyEventKind, KeyModifiers,
-    PropagatedTerminalEvent, TerminalEvent, TerminalEventInterest, TerminalEvents,
+    terminal::component_local_offset, ComponentUpdater, FullscreenMouseEvent, Hook, Hooks, KeyCode,
+    KeyEventKind, KeyModifiers, PropagatedTerminalEvent, TerminalEvent, TerminalEventInterest,
+    TerminalEvents,
 };
 use core::{
     pin::Pin,
@@ -345,12 +346,8 @@ impl Hook for UseTerminalEventsImpl {
                         {
                             continue;
                         }
-                        // Component-local rows past the event's range only occur far down a
-                        // component taller than any terminal; they pin to the last one.
-                        let row = u16::try_from(i64::from(event.row) - i64::from(location.y))
-                            .unwrap_or(u16::MAX);
-                        let column = u16::try_from(i64::from(event.column) - i64::from(location.x))
-                            .unwrap_or(u16::MAX);
+                        let row = component_local_offset(event.row, location.y);
+                        let column = component_local_offset(event.column, location.x);
                         if let Some(f) = &mut self.f {
                             f(&PropagatedTerminalEvent::new(
                                 TerminalEvent::FullscreenMouse(FullscreenMouseEvent {

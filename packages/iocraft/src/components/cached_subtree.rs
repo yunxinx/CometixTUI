@@ -36,10 +36,15 @@ struct CachedSubtreeHook {
     enabled: bool,
     damage_on_restore: bool,
     snapshot: Option<CachedSubtreeSnapshot>,
+    // `ComponentDrawer::overlay_count` before the subtree drew. A restore copies an absolutely
+    // positioned node's pixels without recording it, so a later blit could not tell what it
+    // covered: a subtree that drew one is not cached.
+    overlays_before_draw: usize,
 }
 
 impl Hook for CachedSubtreeHook {
     fn pre_component_draw(&mut self, drawer: &mut ComponentDrawer) {
+        self.overlays_before_draw = drawer.overlay_count();
         if !self.enabled {
             return;
         }
@@ -84,7 +89,7 @@ impl Hook for CachedSubtreeHook {
     }
 
     fn post_component_draw(&mut self, drawer: &mut ComponentDrawer) {
-        if !self.enabled {
+        if !self.enabled || drawer.overlay_count() > self.overlays_before_draw {
             self.snapshot = None;
             return;
         }
@@ -176,6 +181,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A menu over a retained memo inside a cached subtree: drawn, then
+    /// restored from the cache, then gone while the memo stays unchanged.
+    #[component]
+    fn CachedOverlaidMemoApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let mut system = hooks.use_context_mut::<SystemContext>();
+        let mut step = hooks.use_state(|| 0u8);
+        let mut should_exit = hooks.use_state(|| false);
+        hooks.use_terminal_events(move |event| match event {
+            TerminalEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                step.set(step.get() + 1);
+            }
+            TerminalEvent::Resize(..) => should_exit.set(true),
+            _ => {}
+        });
+        if should_exit.get() {
+            system.exit();
+        }
+        let menu = step.get() < 2;
+        element! {
+            View(flex_direction: FlexDirection::Column, width: 8) {
+                CachedSubtree(cache_key: format!("menu {menu}"), damage_on_restore: false) {
+                    View(flex_direction: FlexDirection::Column, width: 100pct) {
+                        Memo(memo_key: "history".to_string(), compare: memo_key_eq as MemoComparator) {
+                            Text(content: "one\ntwo")
+                        }
+                        #(menu.then(|| element! {
+                            View(position: Position::Absolute, top: 0, left: 0, width: 100pct, height: 1, opaque: true) {
+                                Text(content: "menu")
+                            }
+                        }))
+                    }
+                }
+                Text(content: format!("step {}", step.get()))
+            }
+        }
+    }
+
+    /// A cache restore records no overlay, so a subtree that drew one is not
+    /// cached: otherwise the memo under the menu would blit it back once the
+    /// menu has gone.
+    #[test]
+    fn test_cached_subtree_does_not_restore_an_overlay_over_an_inner_memo() {
+        crate::render::set_retained_blit_for_tests(Some(true));
+        let key = TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char('x')));
+        let frames: Vec<String> = smol::block_on(
+            element!(CachedOverlaidMemoApp)
+                .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter(vec![
+                    key.clone(),
+                    key,
+                    TerminalEvent::Resize(80, 24),
+                ])))
+                .map(|canvas| canvas.to_string())
+                .collect(),
+        );
+        crate::render::set_retained_blit_for_tests(None);
+        let mut distinct = frames.clone();
+        distinct.dedup();
+        assert_eq!(
+            distinct,
+            [
+                "menu\ntwo\nstep 0\n",
+                "menu\ntwo\nstep 1\n",
+                "one\ntwo\nstep 2\n",
+            ]
+        );
     }
 
     #[test]

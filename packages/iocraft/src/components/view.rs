@@ -1,9 +1,10 @@
 use super::raw_ansi::parse_ansi_line;
 use crate::{
-    hooks::UseTerminalEvents, AnyElement, CanvasSubviewMut, CanvasTextStyle, Color, Component,
-    ComponentDrawer, ComponentUpdater, Context, Edges, FocusChange, FocusContext, FocusId,
-    FocusOptions, FullscreenMouseEvent, HandlerMut, Hooks, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEventKind, Props, TerminalEvent, Weight,
+    hooks::UseTerminalEvents, terminal::component_local_offset, AnyElement, CanvasSubviewMut,
+    CanvasTextStyle, Color, Component, ComponentDrawer, ComponentUpdater, Context, Edges,
+    FocusChange, FocusContext, FocusId, FocusOptions, FullscreenMouseEvent, HandlerMut, Hooks,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind, Props,
+    TerminalEvent, Weight,
 };
 use iocraft_macros::with_layout_style_props;
 use std::{
@@ -1867,8 +1868,8 @@ impl Component for View {
                                 let click_event = ViewClickEvent::new(
                                     *column,
                                     *row,
-                                    (*column as i32 - rect.left) as u16,
-                                    (*row as i32 - rect.top) as u16,
+                                    component_local_offset(*column, rect.left),
+                                    component_local_offset(*row, rect.top),
                                     *cell_is_blank,
                                 );
                                 let stopped = click_event.stopped.clone();
@@ -1901,8 +1902,8 @@ impl Component for View {
                                                 phase,
                                                 target,
                                                 Some(record.id),
-                                                (*column as i32 - handler_rect.left) as u16,
-                                                (*row as i32 - handler_rect.top) as u16,
+                                                component_local_offset(*column, handler_rect.left),
+                                                component_local_offset(*row, handler_rect.top),
                                             ));
                                         }
                                     }
