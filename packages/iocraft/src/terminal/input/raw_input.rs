@@ -821,11 +821,7 @@ impl Stream for TerminalRawInputFallibleEventStream {
 /// write terminal queries, or replace the default crossterm backend; applications
 /// must explicitly construct it around their own raw byte source.
 pub struct TerminalRawInputEventStream {
-    source: BoxStream<'static, Vec<u8>>,
-    frontend: TerminalRawInputFrontend,
-    pending_events: VecDeque<TerminalEvent>,
-    flush_delay: Option<Pin<Box<Delay>>>,
-    source_done: bool,
+    inner: TerminalRawInputFallibleEventStream,
 }
 
 impl TerminalRawInputEventStream {
@@ -843,41 +839,28 @@ impl TerminalRawInputEventStream {
         S: Stream<Item = Vec<u8>> + Send + 'static,
     {
         Self {
-            source: source.boxed(),
-            frontend,
-            pending_events: VecDeque::new(),
-            flush_delay: None,
-            source_done: false,
+            inner: TerminalRawInputFallibleEventStream::with_frontend(source.map(Ok), frontend),
         }
     }
 
     /// Returns the wrapped frontend.
     pub fn frontend(&self) -> &TerminalRawInputFrontend {
-        &self.frontend
+        self.inner.frontend()
     }
 
     /// Returns the wrapped frontend mutably.
     pub fn frontend_mut(&mut self) -> &mut TerminalRawInputFrontend {
-        &mut self.frontend
+        self.inner.frontend_mut()
     }
 
     /// Returns the currently buffered incomplete sequence, if any.
     pub fn buffered(&self) -> &str {
-        self.frontend.buffered()
+        TerminalRawInputFallibleEventStream::buffered(&self.inner)
     }
 
     /// Returns whether an incomplete sequence is buffered.
     pub fn has_incomplete_sequence(&self) -> bool {
-        self.frontend.has_incomplete_sequence()
-    }
-
-    fn push_output(&mut self, output: TerminalRawInputFrontendOutput) {
-        self.pending_events.extend(output.events);
-        self.arm_flush_delay(output.pending_flush_timeout);
-    }
-
-    fn arm_flush_delay(&mut self, timeout: Option<Duration>) {
-        self.flush_delay = timeout.map(|duration| Box::pin(Delay::new(duration)));
+        self.inner.has_incomplete_sequence()
     }
 }
 
@@ -885,45 +868,12 @@ impl Stream for TerminalRawInputEventStream {
     type Item = TerminalEvent;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        loop {
-            if let Some(event) = this.pending_events.pop_front() {
-                return Poll::Ready(Some(event));
-            }
-
-            if this.source_done {
-                if this.frontend.has_incomplete_sequence() {
-                    let output = this.frontend.flush();
-                    this.push_output(output);
-                    continue;
-                }
-                return Poll::Ready(None);
-            }
-
-            match this.source.as_mut().poll_next(cx) {
-                Poll::Ready(Some(bytes)) => {
-                    let output = this.frontend.feed_bytes(&bytes);
-                    this.push_output(output);
-                    continue;
-                }
-                Poll::Ready(None) => {
-                    this.source_done = true;
-                    continue;
-                }
-                Poll::Pending => {}
-            }
-
-            if let Some(delay) = this.flush_delay.as_mut()
-                && delay.as_mut().poll(cx).is_ready()
-            {
-                this.flush_delay = None;
-                if let Some(output) = this.frontend.flush_if_due(false) {
-                    this.push_output(output);
-                    continue;
-                }
-            }
-
-            return Poll::Pending;
-        }
+        Pin::new(&mut self.get_mut().inner)
+            .poll_next(cx)
+            .map(|event| {
+                event.map(|event| {
+                    event.expect("an infallible byte source cannot produce I/O errors")
+                })
+            })
     }
 }

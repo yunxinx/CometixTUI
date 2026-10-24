@@ -3,6 +3,7 @@
 This fork extends [Haleclipse/CometixTUI](https://github.com/Haleclipse/CometixTUI) at `ec7c06155482815a4b4a99be5ad4c62675a632a1` with controlled-input support:
 
 - Keyboard and paste events are dispatched individually. Component state is processed before the next input event, so typing `hi`, Enter, and `x` can submit `hi` and retain `x` as a fresh draft. Input bypasses frame throttling and resize settling, including when a resize arrived earlier in the same throttle window; non-input updates still coalesce.
+- `TextInput` moves and deletes by extended grapheme cluster, clamps byte offsets to grapheme boundaries, and uses canvas grapheme widths for vertical movement and cursor overlays. Covered by `test_input_moves_and_deletes_whole_graphemes`, `test_text_buffer_vertical_movement_uses_grapheme_columns`, and `test_cursor_offsets_are_clamped_to_grapheme_boundaries` in `packages/iocraft/src/components/text_input.rs`.
 - `TextInputProps::max_height` caps the visible rows of an auto-growing multiline input. The viewport follows the cursor and resets its scroll offset when content shrinks.
 - An unwrapped `TextInput` limits horizontal scrolling by its widest buffer row, so shrinking a multiline value until every line fits returns the viewport to column zero. Covered by `test_text_input_unwrapped_multiline_value_scrolls_back_when_longest_line_shrinks`.
 - `TextInputProps::on_change_cursor_offset` reports every cursor move made by input, after `on_change` when the input also edited the value, so a parent that mirrors both sees them in the same event and frame. An edit sets the cursor together with its value instead of leaving the next render to infer it from the value it receives. A cursor offset set on a `TextInputHandle` while no input is mounted applies when one mounts with it.
@@ -94,7 +95,7 @@ This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) chang
 - Text wrapping preserves leading blank lines (`iocraft#271`).
 - Text reuses its measure function for style-only changes; content, wrap mode, and structured-mode changes reinstall it, while `MeasureMemo` caches layout probes (`iocraft#287`). Empty `Text` retains this fork's 0×0 layout rather than reserving a line.
 - Single-line paste normalizes LF, CR, and CRLF to spaces, while multiline input preserves line breaks (`iocraft#243`).
-- Requested TextInput cursor offsets are clamped to the value length and rounded down to UTF-8 character boundaries (`iocraft#252`); the handle documentation now states this behavior.
+- Requested TextInput cursor offsets are clamped to the value length and rounded down to extended grapheme cluster boundaries (building on `iocraft#252`); the handle documentation states these byte-offset semantics.
 - TextInput auto-grow derives layout from current props and text rows, so disabling and re-enabling it restores the height (`iocraft#266`).
 - Button uses View's primary-button release-click handling, so right and middle buttons do not activate it (`iocraft#295`); its documentation now specifies the primary button.
 

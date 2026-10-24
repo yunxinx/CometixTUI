@@ -12,7 +12,7 @@ use core::{
     task::{Poll, Waker},
 };
 use std::sync::Arc;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
 
 trait UseCursorOverlay {
     fn use_cursor_overlay(&mut self) -> &mut CursorOverlayState;
@@ -102,7 +102,7 @@ impl TextInputHandle {
     /// Sets the cursor position to the specified offset.
     ///
     /// The offset is in bytes, not characters. Offsets past the end are clamped to the value's
-    /// length. An offset inside a UTF-8 character is rounded down to that character's start.
+    /// length. An offset inside a grapheme cluster is rounded down to that cluster's start.
     /// Set while the input is unmounted, the offset applies when an input mounts with this
     /// handle.
     pub fn set_cursor_offset(&mut self, offset: usize) {
@@ -315,8 +315,8 @@ impl TextBuffer {
             0
         } else {
             self.text[..offset]
-                .char_indices()
-                .last()
+                .grapheme_indices(true)
+                .next_back()
                 .map_or(0, |(i, _)| i)
         }
     }
@@ -326,7 +326,7 @@ impl TextBuffer {
             self.text.len()
         } else {
             self.text[offset..]
-                .char_indices()
+                .grapheme_indices(true)
                 .nth(1)
                 .map_or(self.text.len(), |(i, _)| offset + i)
         }
@@ -339,11 +339,13 @@ impl TextBuffer {
             row.offset + row.len
         } else {
             let mut width = 0;
-            for (idx, c) in self.text[row.offset..].char_indices() {
+            for (idx, grapheme) in
+                self.text[row.offset..row.offset + row.len].grapheme_indices(true)
+            {
                 if width >= col {
                     return row.offset + idx;
                 }
-                width += c.width().unwrap_or(0);
+                width += crate::canvas::string_display_width(grapheme);
             }
             row.offset + row.len
         }
@@ -566,13 +568,13 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
         requested_cursor_offset.set(None);
     }
     if let Some(requested) = requested.or(pending_cursor_offset) {
-        let requested = clamp_to_char_boundary(&props.value, requested);
+        let requested = clamp_to_grapheme_boundary(&props.value, requested);
         if cursor_offset != requested {
             cursor_offset.set(requested);
         }
     }
 
-    let safe_cursor_offset = clamp_to_char_boundary(&props.value, cursor_offset.get());
+    let safe_cursor_offset = clamp_to_grapheme_boundary(&props.value, cursor_offset.get());
     if safe_cursor_offset != cursor_offset.get() {
         cursor_offset.set(safe_cursor_offset);
     }
@@ -622,9 +624,9 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
     cursor_overlay.physical_cursor = props.physical_cursor;
     cursor_overlay.char_width = if has_focus && safe_cursor_offset < props.value.len() {
         props.value[safe_cursor_offset..]
-            .chars()
+            .graphemes(true)
             .next()
-            .map(|c| c.width().unwrap_or(0).max(1) as u16)
+            .map(|grapheme| crate::canvas::grapheme_width(grapheme).max(1) as u16)
             .unwrap_or(1)
     } else {
         1
@@ -641,7 +643,7 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
             }
             let propagated = event;
             let event = propagated.event().clone();
-            let cursor = clamp_to_char_boundary(&value, cursor_offset.get());
+            let cursor = clamp_to_grapheme_boundary(&value, cursor_offset.get());
             // The cursor after an edit of `value`.
             let mut edited = None;
             let mut handled = false;
@@ -717,16 +719,17 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
                             handled = true;
                         }
                         KeyCode::Backspace => {
-                            if let Some(previous) = value[..cursor].chars().next_back() {
-                                let start = cursor - previous.len_utf8();
-                                value.remove(start);
+                            if cursor > 0 {
+                                let start = buffer.left_of_offset(cursor);
+                                value.replace_range(start..cursor, "");
                                 edited = Some(start);
                             }
                             handled = true;
                         }
                         KeyCode::Delete => {
                             if cursor < value.len() {
-                                value.remove(cursor);
+                                let end = buffer.right_of_offset(cursor);
+                                value.replace_range(cursor..end, "");
                                 edited = Some(cursor);
                             }
                             handled = true;
@@ -785,14 +788,16 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
                 }
                 _ => {}
             }
-            if let Some(edited) = edited {
-                // The edit's cursor is exact, so it is set here with the value it belongs to
-                // rather than guessed from the value the next render receives.
+            // An edit can join adjacent graphemes, so publish its cursor at a boundary in
+            // the resulting value, together with the value it belongs to.
+            let moved = clamp_to_grapheme_boundary(&value, edited.unwrap_or(cursor_offset.get()));
+            if cursor_offset != moved {
+                cursor_offset.set(moved);
+            }
+            if edited.is_some() {
                 prev_value.set(value.clone());
-                cursor_offset.set(edited);
                 on_change(value.clone());
             }
-            let moved = cursor_offset.get();
             if moved != cursor {
                 on_change_cursor_offset(moved);
             }
@@ -829,16 +834,19 @@ fn is_altgr_char(code: KeyCode, modifiers: KeyModifiers) -> bool {
         && matches!(code, KeyCode::Char(c) if !c.is_control() && !c.is_ascii_alphanumeric())
 }
 
-fn clamp_to_char_boundary(value: &str, offset: usize) -> usize {
-    let mut offset = offset.min(value.len());
-    while offset > 0 && !value.is_char_boundary(offset) {
-        offset -= 1;
+fn clamp_to_grapheme_boundary(value: &str, offset: usize) -> usize {
+    if offset >= value.len() {
+        return value.len();
     }
-    offset
+    value
+        .grapheme_indices(true)
+        .take_while(|(index, _)| *index <= offset)
+        .last()
+        .map_or(0, |(index, _)| index)
 }
 
 fn new_cursor_offset(prev_value: &str, cursor_offset: usize, value: &str) -> usize {
-    let cursor_offset = clamp_to_char_boundary(prev_value, cursor_offset);
+    let cursor_offset = clamp_to_grapheme_boundary(prev_value, cursor_offset);
     let prev_head = &prev_value[..cursor_offset];
     let prev_tail = &prev_value[cursor_offset..];
     let has_same_head = value
@@ -859,7 +867,7 @@ fn new_cursor_offset(prev_value: &str, cursor_offset: usize, value: &str) -> usi
         // unknown, put the cursor at the end
         value.len()
     };
-    clamp_to_char_boundary(value, offset)
+    clamp_to_grapheme_boundary(value, offset)
 }
 
 #[cfg(test)]
@@ -1096,6 +1104,84 @@ mod tests {
         // The offset set while it was unmounted places its cursor.
         let cursor = canvases.last().unwrap().cursor_declaration().unwrap();
         assert_eq!((cursor.x, cursor.y), (11, 1));
+    }
+
+    #[apply(test!)]
+    async fn test_input_moves_and_deletes_whole_graphemes() {
+        let value = "a\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}b\u{1f1e8}\u{1f1f3}c";
+        let key = |code| TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, code));
+        let events = [key(KeyCode::Tab), TerminalEvent::Paste(value.to_string())]
+            .into_iter()
+            .chain(
+                [
+                    KeyCode::Left,
+                    KeyCode::Left,
+                    KeyCode::Left,
+                    KeyCode::Left,
+                    KeyCode::Right,
+                    KeyCode::Right,
+                    KeyCode::Right,
+                    KeyCode::Backspace,
+                    KeyCode::Left,
+                    KeyCode::Backspace,
+                    KeyCode::Home,
+                    KeyCode::Delete,
+                    KeyCode::Delete,
+                    KeyCode::Delete,
+                ]
+                .into_iter()
+                .map(key),
+            )
+            .chain([TerminalEvent::Paste(value.to_string())])
+            .chain(
+                [
+                    KeyCode::Home,
+                    KeyCode::Right,
+                    KeyCode::Delete,
+                    KeyCode::Right,
+                    KeyCode::Delete,
+                ]
+                .into_iter()
+                .map(key),
+            )
+            .chain([TerminalEvent::Resize(80, 24)]);
+        let canvases: Vec<_> = element!(MirroredInput)
+            .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter(events)))
+            .collect()
+            .await;
+        let frames: Vec<_> = canvases.iter().map(Canvas::to_string).collect();
+        let mut mirrored: Vec<_> = frames
+            .iter()
+            .map(|frame| frame.lines().next().unwrap_or_default())
+            .collect();
+        mirrored.dedup();
+        assert_eq!(
+            mirrored,
+            [
+                "|0".to_string(),
+                format!("{value}|29"),
+                format!("{value}|28"),
+                format!("{value}|20"),
+                format!("{value}|19"),
+                format!("{value}|1"),
+                format!("{value}|19"),
+                format!("{value}|20"),
+                format!("{value}|28"),
+                "a\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}bc|20".to_string(),
+                "a\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}bc|19".to_string(),
+                "abc|1".to_string(),
+                "abc|0".to_string(),
+                "bc|0".to_string(),
+                "c|0".to_string(),
+                "|0".to_string(),
+                format!("{value}|29"),
+                format!("{value}|0"),
+                format!("{value}|1"),
+                "ab\u{1f1e8}\u{1f1f3}c|1".to_string(),
+                "ab\u{1f1e8}\u{1f1f3}c|2".to_string(),
+                "abc|2".to_string(),
+            ]
+        );
     }
 
     #[apply(test!)]
@@ -1435,19 +1521,25 @@ mod tests {
 
     #[apply(test!)]
     async fn test_cursor_overlay_covers_both_cells_of_wide_character() {
-        let canvases: Vec<_> = element! {
-            CursorProbe(initial_value: "一二".to_string(), width: 6, height: 1)
-        }
-        .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter(vec![
-            TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Left)),
-            TerminalEvent::Resize(80, 24),
-        ])))
-        .collect()
-        .await;
+        for (value, column) in [
+            ("一二", 2),
+            ("a1\u{fe0f}\u{20e3}", 1),
+            ("a\u{1f1e8}\u{1f1f3}", 1),
+        ] {
+            let canvases: Vec<_> = element! {
+                CursorProbe(initial_value: value.to_string(), width: 6, height: 1)
+            }
+            .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter(vec![
+                TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Left)),
+                TerminalEvent::Resize(80, 24),
+            ])))
+            .collect()
+            .await;
 
-        let last = canvases.last().unwrap();
-        assert!(last.resolved_text_style(2, 0).unwrap().invert);
-        assert!(last.resolved_text_style(3, 0).unwrap().invert);
+            let last = canvases.last().unwrap();
+            assert!(last.resolved_text_style(column, 0).unwrap().invert);
+            assert!(last.resolved_text_style(column + 1, 0).unwrap().invert);
+        }
     }
 
     #[apply(test!)]
@@ -1479,6 +1571,19 @@ mod tests {
         assert_eq!(buffer.above_offset(5, None), 1);
         assert_eq!(buffer.below_offset(5, None), 5);
         assert_eq!(buffer.above_offset(5, Some(6)), 3);
+    }
+
+    #[test]
+    fn test_text_buffer_vertical_movement_uses_grapheme_columns() {
+        let buffer = TextBuffer::new("12345\na\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}bc", 10);
+        assert_eq!(buffer.below_offset(3, None), 25);
+        assert_eq!(buffer.above_offset(25, None), 3);
+        assert_eq!(buffer.below_offset(2, None), 25);
+        assert_eq!(buffer.below_offset(3, Some(4)), 26);
+
+        let buffer = TextBuffer::new("a\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}bc\n12345", 10);
+        assert_eq!(buffer.above_offset(25, None), 19);
+        assert_eq!(buffer.below_offset(19, None), 25);
     }
 
     #[test]
@@ -1538,13 +1643,22 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_offsets_are_clamped_to_char_boundaries() {
-        assert_eq!(clamp_to_char_boundary("éx", 0), 0);
-        assert_eq!(clamp_to_char_boundary("éx", 1), 0);
-        assert_eq!(clamp_to_char_boundary("éx", 2), 2);
-        assert_eq!(clamp_to_char_boundary("éx", 99), 3);
+    fn test_cursor_offsets_are_clamped_to_grapheme_boundaries() {
+        assert_eq!(clamp_to_grapheme_boundary("éx", 0), 0);
+        assert_eq!(clamp_to_grapheme_boundary("éx", 1), 0);
+        assert_eq!(clamp_to_grapheme_boundary("éx", 2), 2);
+        assert_eq!(clamp_to_grapheme_boundary("éx", 99), 3);
 
         assert_eq!(new_cursor_offset("éx", 1, "é!x"), 4);
+
+        for offset in 0..3 {
+            assert_eq!(clamp_to_grapheme_boundary("e\u{0301}x", offset), 0);
+        }
+        assert_eq!(clamp_to_grapheme_boundary("e\u{0301}x", 3), 3);
+        assert_eq!(clamp_to_grapheme_boundary("e\u{0301}x", 99), 4);
+        assert_eq!(new_cursor_offset("e\u{0301}x", 1, "e\u{0301}!x"), 5);
+        assert_eq!(new_cursor_offset("ex", 1, "e\u{0301}x"), 3);
+        assert_eq!(new_cursor_offset("e\n\u{0301}x", 2, "e\u{0301}x"), 0);
     }
 
     #[cfg(windows)]
