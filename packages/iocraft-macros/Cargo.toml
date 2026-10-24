@@ -1,6 +1,6 @@
 [package]
 name = "iocraft-macros"
-version = "0.2.4"
+version = "0.2.5"
 edition.workspace = true
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"

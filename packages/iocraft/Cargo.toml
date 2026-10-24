@@ -1,6 +1,6 @@
 [package]
 name = "iocraft"
-version = "0.9.1"
+version = "0.10.0"
 edition.workspace = true
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
@@ -17,10 +17,10 @@ serde = ["crossterm/serde"]
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 futures = "0.3.30"
 taffy = { version = "0.15.0", default-features = false, features = ["std", "flexbox", "grid", "parse", "taffy_tree"] }
-iocraft-macros = { version = "0.2.4", path = "../iocraft-macros" }
+iocraft-macros = { version = "0.2.5", path = "../iocraft-macros" }
 # CC Ink renders every color through chalk; the canvas SGR encoders take
 # chalk's level detection and downgrade math from the same port.
-chalk = { version = "0.1.0", path = "../chalk" }
+chalk = { version = "0.2.0", path = "../chalk" }
 bitflags = "2.6.0"
 unicode-width = "0.2.2"
 unicode-segmentation = "1"

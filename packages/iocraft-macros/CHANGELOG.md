@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/yunxinx/CometixTUI/compare/iocraft-macros-v0.2.4...iocraft-macros-v0.2.5) - 2026-10-24
+
+### Added
+
+- *(sync)* 同步 upstream 至 2158a53 并支持必填属性校验
+- *(layout)* add CC Ink style shorthands and focus parity
+- *(layout)* CSS Grid DSL with named template areas
+
+### Other
+
+- *(deps)* 升级 taffy 0.15 与相关依赖，适配布局定位并修复多行输入横向滚动
+- 升级至 Rust 2024 edition 与 1.99 工具链
+- *(sync)* 更新 upstream 同步记录与 Props 必填说明
+- *(deps)* upgrade taffy to 0.11
+
 ## [0.2.4](https://github.com/ccbrown/iocraft/compare/iocraft-macros-v0.2.3...iocraft-macros-v0.2.4) - 2026-04-18
 
 ### Fixed

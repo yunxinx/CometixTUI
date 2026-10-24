@@ -7,6 +7,146 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/yunxinx/CometixTUI/compare/iocraft-v0.9.1...iocraft-v0.10.0) - 2026-10-24
+
+### Added
+
+- *(sync)* 同步 upstream 至 2158a53 并支持必填属性校验
+- *(inline)* settle resizes and replay scrollback after inline purges
+- *(offscreen-freeze)* refresh_key re-renders a frozen subtree in place
+- *(debug)* the layout dump names the component that owns each node
+- *(components)* the animation clock quantizes intervals to its base tick, set from terminal focus at the render root
+- *(components)* clock_context, the tree's animation clock, provided at the render root
+- *(debug)* IOCRAFT_DEBUG=wake prints the component and hook slot behind each frame
+- push-wake on by default; wake-mode-sensitive tests made cadence independent
+- retained-blit on by default; push-wake stays opt-in pending triage
+- frame-phase observability parity with CC 2.1.241, minus its observer effect
+- settle render-phase state writes in the same frame (dirty-path W1.6)
+- push-mode wake routing for the component tree (dirty-path Phase W1)
+- *(render)* per-row write tracking to damage-skip terminal diff scans
+- *(render)* per-frame leaf-measure counter for frame profiling
+- *(render)* retained-blit fast path for memo-retained subtrees (opt-in)
+- *(hooks)* add Hook::post_component_effects and drain use_output there
+- *(iocraft)* add clipboard transport with retained output completion
+- *(iocraft)* encode canvas colors through chalk (ink colorize parity)
+- *(checkbox)* support children as space-separated label
+- *(text)* add structured Ink segment flow
+- port applicable upstream v0.8.5 fixes
+- *(app)* terminal ownership handoff via suspend_terminal
+- *(ansi)* add forced invert prop for parent Text parity
+- *(render)* make memo transparent and retain exposed layout nodes
+- *(render)* add opt-in fullscreen scroll patch mode
+- *(terminal)* add opt-in raw input backend mode
+- *(components)* add offscreen freeze skip-poll opt-in
+- *(components)* add opt-in memo wrapper
+- *(render)* add opt-in retained optimization mode
+- *(terminal)* bound safe diff planning scans
+- *(render)* wire opt-in terminal diff planning
+- *(terminal)* add opt-in canvas diff planning
+- *(canvas)* add bounded diff iteration
+- *(profile)* expose render diff scan timings
+- *(render)* add clean blits and layout style equality guards
+- *(ui)* add CC-style events, notifications and app hooks
+- *(fullscreen)* add alternate-screen scroll and selection primitives
+- *(render)* add profiling and retained render primitives
+- *(terminal)* add inline diff safety, fullscreen patch planners and raw input
+- *(canvas)* add CC Ink text, ANSI and retained screen primitives
+- *(layout)* add CC Ink style shorthands and focus parity
+- *(terminal)* dispatch Ctrl+C to component tree before default exit
+- *(text_input)* dual cursor mode — physical (ratatui) vs overlay (ink)
+- *(render)* OSC 8 hyperlinks, OSC 0 title, CSI K bleed fix
+- *(components)* StaticOutput + ErrorBoundary + 5 examples
+- *(components)* add StaticOutput and ErrorBoundary
+- *(canvas)* grapheme-cluster width measurement + CellWidth tracking
+- *(terminal)* expose kitty keyboard protocol flags
+- *(hooks)* declarative keyboard bindings via use_keybinding
+- *(layout)* CSS Grid DSL with named template areas
+- *(layout)* upgrade taffy 0.5.2 → 0.10.0, enable grid feature
+- *(render)* frame throttling with configurable max fps
+- *(events)* propagation-aware terminal events with consumption semantics
+- *(components)* add Checkbox component
+- *(canvas)* physical cursor declarations for IME support
+- *(terminal)* restore terminal state before panic output
+- *(terminal)* self-healing redraw after suspend/resume (SIGCONT)
+- *(terminal)* bracketed paste support
+- *(canvas)* post-render style overlay + TextInput cursor inversion
+- *(focus)* add use_focus / use_focus_manager hooks and FocusScope component
+- *(focus)* core state machine with UI-order tracking
+
+### Fixed
+
+- *(render)* 缓存子树不再带回覆盖层，超高组件的鼠标坐标饱和换算
+- *(render)* 绘制坐标覆盖整个布局范围，嵌套 Memo 不再带回覆盖层
+- *(render)* 输入框按实际宽度首帧布局，光标随编辑同帧上报，覆盖层不再被 blit 带回
+- *(render)* 卸载时回收整棵子树布局节点，备用屏往返不再重写或错位主屏
+- *(terminal)* 动态备用屏幕往返后主屏原地续写 inline 画面
+- *(terminal)* 显示光标时保留用户终端的光标形状
+- *(docs)* 修复 intra-doc 链接未解析导致 cargo doc 报错的问题
+- *(sync)* 移植 upstream 鼠标事件祖先裁剪与 Windows AltGr 字符支持
+- *(sync)* 移植 upstream unicode 空白对齐与宽字符裁剪修复
+- *(sync)* 移植 upstream 异步处理、状态锁释放与终端更新修复
+- *(inline)* 修复终端高度缩小导致的光标基准丢失并在输入时提交 resize
+- *(input)* preserve event order and scroll capped text inputs
+- *(offscreen-freeze)* a refresh reaches the draw that first freezes the subtree
+- *(render)* no retained-blit for a memo that re-rendered earlier in the frame
+- *(terminal)* input received while blurred counts as focus-in, as CC Ink's failsafe does
+- drain wakes that land during a poll pass before rendering
+- hooks reconfigured during render ask for a poll (push-wake drain hang)
+- narrow render-phase settle to state writes only (dirty-path W1.7)
+- hooks re-arm their waker on the Ready path (dirty-path W1.5)
+- account for the blank bottom gap left by shrinking inline frames
+- *(hooks)* stop use_interval ticks from forcing renders
+- *(terminal)* clear progress and tab status on exit like CC Ink
+- *(terminal)* flush side-band control writes immediately
+- *(hooks)* write title and tab status in the pass that changes them
+- *(hooks)* [**breaking**] write the terminal title only when it changes
+- *(text)* preserve inherited dim with ANSI bold
+- *(terminal)* reset unsafe inline rewrites like Ink
+- *(canvas)* distinguish missing rows from empty rows in row_eq
+- *(canvas)* model bold and dim as independent attributes like CC Ink
+- port upstream v0.8.4 fixes into fork structure
+- *(deps)* upgrade taffy to 0.12.1 for layout-cache soundness fix
+- *(canvas)* prevent erasing last cell in full-width ANSI rows and adjust reset behavior
+- *(render)* use terminal height for main-screen layout
+- *(context)* avoid fallback past borrowed matching context
+- *(canvas)* single row-end erase path, character written before clear
+- *(canvas)* remove dead assignments that triggered unused warnings
+
+### Other
+
+- *(deps)* 升级 taffy 0.15 与相关依赖，适配布局定位并修复多行输入横向滚动
+- 升级至 Rust 2024 edition 与 1.99 工具链
+- *(render)* 布局位移改在绘制时逐节点判定，不再每帧遍历全部布局节点
+- *(sync)* 更新 upstream 同步记录与 Props 必填说明
+- *(sync)* 添加 upstream 同步文档并优化滚动测试
+- *(render)* memoize measure functions per node; MixedText installs its measure once
+- cargo fmt; clear the four clippy warnings
+- consolidate diagnostic env vars into IOCRAFT_DISABLE and IOCRAFT_DEBUG
+- IOCRAFT_SETTLE_TRACE names the render-phase state writers
+- share blank overlay and no-select rows copy-on-write like cells
+- build the mouse blank-cell snapshot only while the mouse is captured
+- push-mode scan descends dirty paths only (dirty-path W2)
+- dispatch terminal events by subscriber interest
+- *(render)* keep Taffy's dirty bit truthful; gate the layout-shift walk on it
+- *(canvas)* Arc copy-on-write rows — blits, blanks and equality go O(1)
+- *(iocraft)* sync version and changelog with upstream v0.9.1
+- *(deps)* upgrade taffy to 0.14
+- *(text)* pass owned contents to the structured flow entry
+- fix unreachable pattern from #218 port and clean clippy warnings
+- Merge remote-tracking branch 'upstream/main'
+- *(scroll-view)* explicit f32 suffix on flex_grow literals
+- Merge remote-tracking branch 'upstream/main'
+- rewrite README with comprehensive fork capability documentation
+- rename to CometixTUI, rewrite README with fork capability diff
+- *(terminal)* skip duplicate repaint preflight scan
+- *(iocraft)* split ink-aligned render modules
+- document CC Ink parity surfaces
+- *(api)* export CC parity components and hooks
+- *(deps)* upgrade taffy to 0.11
+- *(canvas)* extract ANSI escape helpers into ansi.rs module
+- fix pre-existing clippy warnings
+- *(examples)* add focus example demonstrating the declarative API
+
 ### Added
 
 - *(terminal)* support opt-in bracketed paste events in raw mode.
