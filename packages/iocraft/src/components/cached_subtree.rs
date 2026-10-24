@@ -24,9 +24,9 @@ pub struct CachedSubtreeProps<'a> {
 
 struct CachedSubtreeSnapshot {
     key: String,
-    width: u16,
-    height: u16,
-    clip_rect: taffy::Rect<u16>,
+    width: u32,
+    height: u32,
+    clip_rect: taffy::Rect<u32>,
     canvas: Canvas,
 }
 

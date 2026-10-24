@@ -300,7 +300,7 @@ type EventCallback = Box<dyn FnMut(&PropagatedTerminalEvent) + Send + 'static>;
 
 struct UseTerminalEventsImpl {
     events: Option<TerminalEvents>,
-    component_location: (Point<i16>, Rect<u16>),
+    component_location: (Point<i32>, Rect<u32>),
     in_component: bool,
     propagation_aware: bool,
     observe_stopped: bool,
@@ -336,15 +336,21 @@ impl Hook for UseTerminalEventsImpl {
                 let (location, visible_rect) = self.component_location;
                 match event {
                     TerminalEvent::FullscreenMouse(event) => {
-                        if event.column < visible_rect.left
-                            || event.column >= visible_rect.right
-                            || event.row < visible_rect.top
-                            || event.row >= visible_rect.bottom
+                        let (event_column, event_row) =
+                            (u32::from(event.column), u32::from(event.row));
+                        if event_column < visible_rect.left
+                            || event_column >= visible_rect.right
+                            || event_row < visible_rect.top
+                            || event_row >= visible_rect.bottom
                         {
                             continue;
                         }
-                        let row = (i32::from(event.row) - i32::from(location.y)) as u16;
-                        let column = (i32::from(event.column) - i32::from(location.x)) as u16;
+                        // Component-local rows past the event's range only occur far down a
+                        // component taller than any terminal; they pin to the last one.
+                        let row = u16::try_from(i64::from(event.row) - i64::from(location.y))
+                            .unwrap_or(u16::MAX);
+                        let column = u16::try_from(i64::from(event.column) - i64::from(location.x))
+                            .unwrap_or(u16::MAX);
                         if let Some(f) = &mut self.f {
                             f(&PropagatedTerminalEvent::new(
                                 TerminalEvent::FullscreenMouse(FullscreenMouseEvent {

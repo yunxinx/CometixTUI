@@ -411,6 +411,72 @@ mod tests {
         );
     }
 
+    /// A menu over a retained inner memo, both inside an outer memo: drawn,
+    /// then restored by the outer memo's blit, then gone while the inner memo
+    /// stays unchanged.
+    #[component]
+    fn NestedOverlaidMemoApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let mut system = hooks.use_context_mut::<SystemContext>();
+        let mut step = hooks.use_state(|| 0u8);
+        let mut should_exit = hooks.use_state(|| false);
+        hooks.use_terminal_events(move |event| match event {
+            TerminalEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                step.set(step.get() + 1);
+            }
+            TerminalEvent::Resize(..) => should_exit.set(true),
+            _ => {}
+        });
+        if should_exit.get() {
+            system.exit();
+        }
+        let menu = step.get() < 2;
+        element! {
+            View(flex_direction: FlexDirection::Column, width: 8) {
+                Memo(memo_key: format!("menu {menu}"), compare: memo_key_eq as MemoComparator) {
+                    View(flex_direction: FlexDirection::Column) {
+                        Memo(memo_key: "history".to_string(), compare: memo_key_eq as MemoComparator) {
+                            Text(content: "one\ntwo")
+                        }
+                        #(menu.then(|| element! {
+                            View(position: Position::Absolute, top: 0, left: 0, width: 100pct, height: 1, opaque: true) {
+                                Text(content: "menu")
+                            }
+                        }))
+                    }
+                }
+                Text(content: format!("step {}", step.get()))
+            }
+        }
+    }
+
+    /// A blit restores an overlay's pixels without recording the overlay, so a
+    /// subtree that drew one is drawn again rather than blitted: otherwise the
+    /// frame after the blit would not know the overlay covered the inner memo.
+    #[test]
+    fn test_retained_blit_does_not_restore_an_overlay_drawn_inside_an_outer_memo() {
+        crate::render::set_retained_blit_for_tests(Some(true));
+        let key = TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char('x')));
+        let frames: Vec<String> = smol::block_on(
+            element!(NestedOverlaidMemoApp)
+                .mock_terminal_render_loop(MockTerminalConfig::with_events(futures::stream::iter(
+                    vec![key.clone(), key, TerminalEvent::Resize(80, 24)],
+                )))
+                .map(|canvas| canvas.to_string())
+                .collect(),
+        );
+        crate::render::set_retained_blit_for_tests(None);
+        let mut distinct = frames.clone();
+        distinct.dedup();
+        assert_eq!(
+            distinct,
+            [
+                "menu\ntwo\nstep 0\n",
+                "menu\ntwo\nstep 1\n",
+                "one\ntwo\nstep 2\n",
+            ]
+        );
+    }
+
     #[component]
     fn NoComparatorMemoApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         let mut system = hooks.use_context_mut::<SystemContext>();

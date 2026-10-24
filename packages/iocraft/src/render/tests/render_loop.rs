@@ -120,6 +120,67 @@ fn test_component_drawer_content_and_visible_size_match_ink_helpers() {
     assert_eq!(canvas.to_string().lines().next(), Some("c4v8r8"));
 }
 
+/// Rows in each block of [`test_a_layout_taller_than_u16_rows_draws_every_row_in_place`]: three
+/// of them reach past both `i16::MAX` and `u16::MAX`.
+const TALL_BLOCK_ROWS: usize = 25_000;
+
+#[test]
+fn test_a_layout_taller_than_u16_rows_draws_every_row_in_place() {
+    let block = |block: usize| {
+        (0..TALL_BLOCK_ROWS)
+            .map(|row| format!("{}", block * TALL_BLOCK_ROWS + row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let canvas = element! {
+        View(flex_direction: FlexDirection::Column) {
+            Text(content: block(0))
+            Text(content: block(1))
+            Text(content: block(2))
+        }
+    }
+    .render(Some(8));
+    assert_eq!(canvas.height(), 3 * TALL_BLOCK_ROWS);
+    for row in [0, 32_767, 32_768, 65_535, 65_536, 3 * TALL_BLOCK_ROWS - 1] {
+        assert_eq!(canvas.get_text(0, row, 8, 1).trim_end(), row.to_string());
+    }
+}
+
+#[component]
+fn TallScrollBoxApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let mut system = hooks.use_context_mut::<SystemContext>();
+    let mut frames = hooks.use_state(|| 0u8);
+    if frames.get() == 2 {
+        system.exit();
+    } else {
+        frames.set(frames.get() + 1);
+    }
+    let lines = (0..3 * TALL_BLOCK_ROWS)
+        .map(|row| row.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    element! {
+        View(width: 8, height: 2) {
+            ScrollBox(sticky_scroll: true) {
+                Text(content: lines)
+            }
+        }
+    }
+}
+
+#[apply(test!)]
+async fn test_a_sticky_scroll_box_shows_the_end_of_content_taller_than_u16_rows() {
+    let canvases: Vec<_> = element!(TallScrollBoxApp)
+        .mock_terminal_render_loop(MockTerminalConfig::default())
+        .collect()
+        .await;
+    let last = 3 * TALL_BLOCK_ROWS - 1;
+    assert_eq!(
+        canvases.last().unwrap().to_string(),
+        format!("{}\n{last}\n", last - 1)
+    );
+}
+
 #[derive(Default)]
 struct RenderWakeCounter {
     renders: u32,
@@ -1535,5 +1596,57 @@ async fn test_unmounted_subtrees_leave_no_layout_nodes() {
         2,
         "every hidden frame has the same nodes, as does every shown one: {node_counts:?}"
     );
+    assert_eq!(node_counts.first(), node_counts.last(), "{node_counts:?}");
+}
+
+// Puts a view with a text, a text, then a view with a text again under one explicit key.
+#[component]
+fn KeyedTypeSwapApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let mut system = hooks.use_context_mut::<SystemContext>();
+    let step = hooks.use_state(|| 0u8);
+    let mut step_for_future = step;
+    hooks.use_future(async move {
+        for _ in 0..2 {
+            smol::Timer::after(Duration::from_millis(20)).await;
+            step_for_future.set(step_for_future.get() + 1);
+        }
+    });
+    if step.get() == 2 {
+        system.exit();
+    }
+    let child: AnyElement<'static> = if step.get() == 1 {
+        let mut text = element!(Text(content: "text"));
+        text.key = ElementKey::new("same");
+        text.into()
+    } else {
+        let mut view = element! {
+            View {
+                Text(content: "view")
+            }
+        };
+        view.key = ElementKey::new("same");
+        view.into()
+    };
+    element! {
+        View {
+            #(child)
+        }
+    }
+}
+
+#[apply(test!)]
+async fn test_a_keyed_child_replaced_by_another_type_leaves_no_layout_nodes() {
+    let node_counts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let node_counts_cb = std::sync::Arc::clone(&node_counts);
+    let _frames = element!(KeyedTypeSwapApp)
+        .mock_terminal_render_loop_with_profile(MockTerminalConfig::default(), move |event| {
+            node_counts_cb
+                .lock()
+                .unwrap()
+                .push(event.phases.layout_nodes)
+        })
+        .collect::<Vec<_>>()
+        .await;
+    let node_counts = node_counts.lock().unwrap().clone();
     assert_eq!(node_counts.first(), node_counts.last(), "{node_counts:?}");
 }

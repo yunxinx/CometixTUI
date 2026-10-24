@@ -166,10 +166,11 @@ pub(crate) struct InstantiatedComponent {
     cached_blit_bounds: Option<(usize, usize, usize, usize)>,
     // A changed ancestor clip requires drawing again so descendant event
     // regions and local mouse coordinates reflect the visible output.
-    cached_blit_clip_rect: Rect<u16>,
-    // The overlays (`ComponentDrawer::overlay_count`) this subtree drew last
-    // frame: any other overlay over its rectangle rules the blit out.
-    cached_blit_overlays: std::ops::Range<usize>,
+    cached_blit_clip_rect: Rect<u32>,
+    // This subtree drew an absolutely positioned node last frame. A blit
+    // restores such a node's pixels without recording it as an overlay, so the
+    // next frame could not tell what it covered: the subtree is drawn instead.
+    cached_blit_drew_overlays: bool,
     // Push-mode wake routing (Phase W): the dirty bit any wake from this
     // component's hooks/futures lands on, plus the shared route to the render
     // loop. `proxy_waker` is the cached `Waker` built from it.
@@ -200,7 +201,7 @@ impl InstantiatedComponent {
             children_updated_since_draw: false,
             cached_blit_bounds: None,
             cached_blit_clip_rect: Rect::default(),
-            cached_blit_overlays: 0..0,
+            cached_blit_drew_overlays: false,
             wake_state,
             proxy_waker,
         }
@@ -308,9 +309,9 @@ impl InstantiatedComponent {
                     if let Some(rect) = subtree_rect {
                         if self.cached_blit_bounds == Some(rect)
                             && self.cached_blit_clip_rect == drawer.clip_rect()
-                            && drawer.try_retained_blit(rect, self.cached_blit_overlays.clone())
+                            && !self.cached_blit_drew_overlays
+                            && drawer.try_retained_blit(rect)
                         {
-                            self.cached_blit_overlays = overlays_start..overlays_start;
                             return;
                         }
                     }
@@ -347,7 +348,7 @@ impl InstantiatedComponent {
         // before ancestor/root overlay hooks run.
         drawer.replay_deferred_no_select();
 
-        self.cached_blit_overlays = overlays_start..drawer.overlay_count();
+        self.cached_blit_drew_overlays = drawer.overlay_count() > overlays_start;
 
         if self.has_transparent_layout {
             if let Some(child) = self.children.components.iter().next().as_ref() {

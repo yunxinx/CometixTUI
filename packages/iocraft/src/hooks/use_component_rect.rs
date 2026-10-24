@@ -61,10 +61,10 @@ impl Hook for UseComponentRectImpl {
         let size = drawer.size();
         let position = drawer.canvas_position();
         let rect = Rect {
-            left: position.x as i32,
-            right: position.x as i32 + size.width as i32,
-            top: position.y as i32,
-            bottom: position.y as i32 + size.height as i32,
+            left: position.x,
+            right: position.x + size.width as i32,
+            top: position.y,
+            bottom: position.y + size.height as i32,
         };
 
         if self.rect != Some(rect) {

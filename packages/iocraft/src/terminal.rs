@@ -121,7 +121,7 @@ pub enum FullscreenSelectionKeyOutcome {
 }
 
 impl SelectionController {
-    fn selection_focus_move_for_key(event: &KeyEvent) -> Option<SelectionFocusMove> {
+    pub(crate) fn selection_focus_move_for_key(event: &KeyEvent) -> Option<SelectionFocusMove> {
         if !event.modifiers.contains(KeyModifiers::SHIFT)
             || event
                 .modifiers

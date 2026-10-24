@@ -226,12 +226,17 @@ impl Hook for UseSizeImpl {
     }
 
     fn pre_component_draw(&mut self, drawer: &mut ComponentDrawer) {
+        // An input is laid out within a terminal, whose size fits a `u16`.
         let size = drawer.size();
-        self.size = (size.width, size.height);
+        let size = (
+            u16::try_from(size.width).unwrap_or(u16::MAX),
+            u16::try_from(size.height).unwrap_or(u16::MAX),
+        );
+        self.size = size;
         let Some((width, height)) = self.rendered else {
             return;
         };
-        if width != size.width || height.is_some_and(|height| height != size.height) {
+        if width != size.0 || height.is_some_and(|height| height != size.1) {
             self.resized = true;
             if let Some(waker) = &self.waker {
                 waker.wake_by_ref();

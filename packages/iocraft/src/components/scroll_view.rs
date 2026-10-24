@@ -7,7 +7,7 @@ use crate::{
     },
     AnyElement, Canvas, CanvasTextStyle, Color, Component, ComponentDrawer, ComponentUpdater,
     FlexDirection, Hook, Hooks, JustifyContent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    MouseEventKind, Overflow, Position, Props, TerminalEvent, FRAME_INTERVAL,
+    MouseEventKind, Overflow, Position, Props, SelectionController, TerminalEvent, FRAME_INTERVAL,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -133,9 +133,9 @@ impl Drop for ScrollViewSubscription {
 
 struct ScrollViewHandleInner {
     scroll_offset: State<i32>,
-    content_height: State<u16>,
-    viewport_height: State<u16>,
-    viewport_top: State<u16>,
+    content_height: State<u32>,
+    viewport_height: State<u32>,
+    viewport_top: State<u32>,
     user_scrolled_up: State<bool>,
     clamp_bounds: State<ScrollClampBounds>,
     pending_scroll_delta: State<i32>,
@@ -276,14 +276,14 @@ impl ScrollViewHandle {
     }
 
     /// Returns the total height of the scrollable content in lines.
-    pub fn content_height(&self) -> u16 {
+    pub fn content_height(&self) -> u32 {
         self.inner
             .as_ref()
             .map_or(0, |inner| inner.content_height.get())
     }
 
     /// CC Ink-style alias for [`Self::content_height`].
-    pub fn get_scroll_height(&self) -> u16 {
+    pub fn get_scroll_height(&self) -> u32 {
         self.content_height()
     }
 
@@ -291,31 +291,31 @@ impl ScrollViewHandle {
     ///
     /// iocraft measures content height during the draw phase, so the cached
     /// value is already the latest completed layout measurement.
-    pub fn get_fresh_scroll_height(&self) -> u16 {
+    pub fn get_fresh_scroll_height(&self) -> u32 {
         self.content_height()
     }
 
     /// Returns the height of the visible viewport in lines.
-    pub fn viewport_height(&self) -> u16 {
+    pub fn viewport_height(&self) -> u32 {
         self.inner
             .as_ref()
             .map_or(0, |inner| inner.viewport_height.get())
     }
 
     /// CC Ink-style alias for [`Self::viewport_height`].
-    pub fn get_viewport_height(&self) -> u16 {
+    pub fn get_viewport_height(&self) -> u32 {
         self.viewport_height()
     }
 
     /// Returns the absolute screen-buffer row of the viewport top.
-    pub fn viewport_top(&self) -> u16 {
+    pub fn viewport_top(&self) -> u32 {
         self.inner
             .as_ref()
             .map_or(0, |inner| inner.viewport_top.get())
     }
 
     /// CC Ink-style alias for [`Self::viewport_top`].
-    pub fn get_viewport_top(&self) -> u16 {
+    pub fn get_viewport_top(&self) -> u32 {
         self.viewport_top()
     }
 
@@ -399,11 +399,11 @@ impl ScrollViewHandle {
     }
 }
 
-fn max_offset(content_height: u16, viewport_height: u16) -> i32 {
-    (content_height as i32 - viewport_height as i32).max(0)
+fn max_offset(content_height: u32, viewport_height: u32) -> i32 {
+    i32::try_from(content_height.saturating_sub(viewport_height)).unwrap_or(i32::MAX)
 }
 
-fn clamp_offset_to_scroll_range(offset: i32, content_height: u16, viewport_height: u16) -> i32 {
+fn clamp_offset_to_scroll_range(offset: i32, content_height: u32, viewport_height: u32) -> i32 {
     offset.clamp(0, max_offset(content_height, viewport_height))
 }
 
@@ -427,8 +427,8 @@ fn user_scrolled_up_after_scroll(
 
 fn clamp_offset_with_bounds(
     offset: i32,
-    content_height: u16,
-    viewport_height: u16,
+    content_height: u32,
+    viewport_height: u32,
     bounds: ScrollClampBounds,
 ) -> i32 {
     let max_valid = max_offset(content_height, viewport_height);
@@ -1101,7 +1101,12 @@ enum ModalPagerAction {
     Bottom,
 }
 
-fn scroll_key_delta(event: &KeyEvent, viewport_height: u16, modal_pager_keys: bool) -> Option<i32> {
+fn scroll_key_delta(event: &KeyEvent, viewport_height: u32, modal_pager_keys: bool) -> Option<i32> {
+    // Shift with an arrow, Home or End extends a selection, which moves only
+    // its focus: CC Ink's scroll bindings match no modified arrow either.
+    if SelectionController::selection_focus_move_for_key(event).is_some() {
+        return None;
+    }
     if modal_pager_keys {
         if let Some(action) = modal_pager_action(event) {
             return Some(match action {
@@ -1728,8 +1733,8 @@ impl WheelAccelState {
 
 #[derive(Default, Props)]
 struct ScrollViewScrollbarProps {
-    viewport_height: u16,
-    content_height: u16,
+    viewport_height: u32,
+    content_height: u32,
     scroll_offset: i32,
     thumb_color: Option<Color>,
     track_color: Option<Color>,
@@ -1737,8 +1742,8 @@ struct ScrollViewScrollbarProps {
 
 #[derive(Default)]
 struct ScrollViewScrollbar {
-    viewport_height: u16,
-    content_height: u16,
+    viewport_height: u32,
+    content_height: u32,
     scroll_offset: i32,
     thumb_color: Option<Color>,
     track_color: Option<Color>,
@@ -1861,10 +1866,10 @@ pub struct ScrollViewProps<'a> {
 }
 
 // Hook that measures the component height in pre_component_draw and writes
-// the result to a State<u16>.
+// the result to a State<u32>.
 struct MeasureHeightHook {
-    out: State<u16>,
-    out_top: State<u16>,
+    out: State<u32>,
+    out_top: State<u32>,
 }
 
 impl Hook for MeasureHeightHook {
@@ -1873,7 +1878,7 @@ impl Hook for MeasureHeightHook {
         if self.out.try_get() != Some(h) {
             self.out.set(h);
         }
-        let top = drawer.canvas_position().y.max(0) as u16;
+        let top = drawer.canvas_position().y.max(0) as u32;
         if self.out_top.try_get() != Some(top) {
             self.out_top.set(top);
         }
@@ -1885,8 +1890,8 @@ struct ScrollHintHook {
     scroll_offset: i32,
     enabled: bool,
     prev_scroll_offset: Option<i32>,
-    prev_top: Option<i16>,
-    prev_height: Option<u16>,
+    prev_top: Option<i32>,
+    prev_height: Option<u32>,
 }
 
 impl Hook for ScrollHintHook {
@@ -1899,7 +1904,7 @@ impl Hook for ScrollHintHook {
             {
                 let delta = self.scroll_offset - prev_offset;
                 let same_region = prev_top == pos.y && prev_height == size.height;
-                if same_region && delta != 0 && delta.unsigned_abs() < size.height as u32 {
+                if same_region && delta != 0 && delta.unsigned_abs() < size.height {
                     drawer.set_scroll_hint(delta);
                 }
             }
@@ -1997,12 +2002,12 @@ pub fn ScrollView<'a>(
     let mut scroll_offset = hooks.use_state(|| 0i32);
     let mut user_scrolled_up = hooks.use_state(|| false);
     let mut pending_scroll_delta = hooks.use_state(|| 0i32);
-    let mut content_height: State<u16> = hooks.use_state(|| 0u16);
-    let viewport_height: State<u16> = hooks.use_state(|| 0u16);
-    let viewport_top: State<u16> = hooks.use_state(|| 0u16);
+    let mut content_height: State<u32> = hooks.use_state(|| 0u32);
+    let viewport_height: State<u32> = hooks.use_state(|| 0u32);
+    let viewport_top: State<u32> = hooks.use_state(|| 0u32);
     let clamp_bounds: State<ScrollClampBounds> = hooks.use_state(ScrollClampBounds::default);
     let subscribers = hooks.use_const_default::<SharedScrollViewSubscribers>();
-    let content_height_ref: Ref<u16> = hooks.use_ref(|| 0u16);
+    let content_height_ref: Ref<u32> = hooks.use_ref(|| 0u32);
 
     // Measure the viewport (this component's) height and absolute top.
     let h = hooks.use_hook(move || MeasureHeightHook {
@@ -2226,7 +2231,11 @@ pub fn ScrollView<'a>(
                 } else {
                     viewport_height
                 };
-                let result = drain_scroll_delta(mode, pending, effective_viewport_height);
+                let result = drain_scroll_delta(
+                    mode,
+                    pending,
+                    u16::try_from(effective_viewport_height).unwrap_or(u16::MAX),
+                );
                 let unclamped_offset = old_offset.saturating_add(result.applied);
                 let new_offset = clamp_offset_to_scroll_range(
                     unclamped_offset,
@@ -2344,11 +2353,11 @@ pub fn ScrollView<'a>(
                 };
 
                 let old_offset = if auto_scroll && !user_scrolled_up_for_drag.get() {
-                    max_offset(content_height.get(), viewport_height as u16)
+                    max_offset(content_height.get(), viewport_height as u32)
                 } else {
                     scroll_offset_for_drag.get()
                 };
-                let max = max_offset(content_height.get(), viewport_height as u16);
+                let max = max_offset(content_height.get(), viewport_height as u32);
                 let (new_offset, actual_lines) = match direction {
                     crate::SelectionDragScrollDirection::Up => {
                         if old_offset <= 0 {
@@ -2509,22 +2518,22 @@ pub fn ScrollView<'a>(
 #[derive(Default, Props)]
 struct ScrollViewContentMeasurerProps<'a> {
     children: Vec<AnyElement<'a>>,
-    content_height_ref: Option<Ref<u16>>,
+    content_height_ref: Option<Ref<u32>>,
     selection: SelectionContext,
     selection_screen: Arc<Mutex<Option<Canvas>>>,
-    viewport_top: Option<State<u16>>,
-    viewport_height: Option<State<u16>>,
+    viewport_top: Option<State<u32>>,
+    viewport_height: Option<State<u32>>,
     pinned_to_bottom: bool,
 }
 
-// Hook that measures this component's height and writes it to a Ref<u16>
+// Hook that measures this component's height and writes it to a Ref<u32>
 // shared with the parent ScrollView.
 struct ContentHeightHook {
-    out: Option<Ref<u16>>,
+    out: Option<Ref<u32>>,
     selection: SelectionContext,
     selection_screen: Arc<Mutex<Option<Canvas>>>,
-    viewport_top: Option<State<u16>>,
-    viewport_height: Option<State<u16>>,
+    viewport_top: Option<State<u32>>,
+    viewport_height: Option<State<u32>>,
     pinned_to_bottom: bool,
 }
 
@@ -2604,7 +2613,7 @@ fn ScrollViewContentMeasurer<'a>(
 mod tests {
     use super::{
         allow_drag_autoscroll_tick, reset_drag_autoscroll_ticks_for_render,
-        scroll_drain_mode_for_xterm_js_host, user_scrolled_up_after_scroll,
+        scroll_drain_mode_for_xterm_js_host, scroll_key_delta, user_scrolled_up_after_scroll,
         DragAutoscrollTickState, WheelAccelState,
     };
     use crate::prelude::*;
@@ -2914,6 +2923,25 @@ mod tests {
             !output.contains("Line 15"),
             "bottom jump should have been replaced by g top jump: {output:?}"
         );
+    }
+
+    #[test]
+    fn test_selection_extension_keys_never_scroll() {
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Home, KeyCode::End] {
+            let key = KeyEvent {
+                code,
+                modifiers: KeyModifiers::SHIFT,
+                kind: KeyEventKind::Press,
+            };
+            assert_eq!(scroll_key_delta(&key, 10, true), None, "{code:?}");
+            assert_eq!(scroll_key_delta(&key, 10, false), None, "{code:?}");
+        }
+        let shift_page_down = KeyEvent {
+            code: KeyCode::PageDown,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+        };
+        assert_eq!(scroll_key_delta(&shift_page_down, 10, true), Some(10));
     }
 
     #[test]

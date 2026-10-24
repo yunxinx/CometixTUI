@@ -720,7 +720,13 @@ impl<'a, 'b, 'c, 'w> ComponentUpdater<'a, 'b, 'c, 'w> {
                                 child_node_ids.push(component.node_id());
                                 component
                             }
-                            _ => {
+                            replaced => {
+                                // A component of another type under the same key is gone
+                                // from the children, so the cleanup below never sees it.
+                                if let Some(replaced) = replaced {
+                                    self.context.drawn_node_removed |=
+                                        replaced.remove_layout_nodes(self.context.layout_engine);
+                                }
                                 let new_node_id = self
                                     .context
                                     .layout_engine
@@ -843,9 +849,11 @@ pub(crate) fn set_retained_blit_for_tests(enabled: Option<bool>) {
 /// utilize during the draw phase.
 pub struct ComponentDrawer<'a> {
     node_id: NodeId,
-    node_position: Point<i16>,
-    node_size: Size<u16>,
-    clip_rect: Rect<u16>,
+    // Canvas coordinates: a prerendered canvas can be far taller than a
+    // terminal, so they are as wide as the layout's integer range.
+    node_position: Point<i32>,
+    node_size: Size<u32>,
+    clip_rect: Rect<u32>,
     vertical_clip_active: bool,
     skip_children: bool,
     hide_children: bool,
@@ -872,8 +880,8 @@ impl ComponentDrawer<'_> {
             if layout.size.width <= 0.0 || layout.size.height <= 0.0 {
                 continue;
             }
-            let x = self.node_position.x as i32 + layout.location.x as i32;
-            let y = self.node_position.y as i32 + layout.location.y as i32;
+            let x = self.node_position.x + layout.location.x as i32;
+            let y = self.node_position.y + layout.location.y as i32;
             left = left.min(x);
             top = top.min(y);
             right = right.max(x + layout.size.width as i32);
@@ -904,16 +912,12 @@ impl ComponentDrawer<'_> {
     ///   node falls back to a normal draw);
     /// * the previous frame's cursor declaration is not inside the rectangle
     ///   (a blitted subtree runs no draw hooks, so it could not re-declare it);
-    /// * no absolutely positioned node outside the subtree painted into the
-    ///   rectangle on the previous canvas: `own_overlays` is the range of
-    ///   [`Self::overlay_count`] values the subtree's own draw spanned there.
-    ///   CC Ink drops `prevScreen` after an absolute node is removed and skips
-    ///   blitting rows under one that shrank; this covers both, and moves.
-    pub(crate) fn try_retained_blit(
-        &mut self,
-        rect: CanvasRect,
-        own_overlays: std::ops::Range<usize>,
-    ) -> bool {
+    /// * no absolutely positioned node painted into the rectangle on the
+    ///   previous canvas. CC Ink drops `prevScreen` after an absolute node is
+    ///   removed and skips blitting rows under one that shrank; this covers
+    ///   both, and moves. The caller never blits a subtree that drew such a
+    ///   node itself, so every overlay on the previous canvas was recorded.
+    pub(crate) fn try_retained_blit(&mut self, rect: CanvasRect) -> bool {
         if !retained_blit_enabled() {
             return false;
         }
@@ -935,10 +939,10 @@ impl ComponentDrawer<'_> {
         // Clipped subtrees drew partially last frame; their cells cannot be
         // assumed representative of the full subtree. Fall back.
         if self.vertical_clip_active
-            || (x as u16) < self.clip_rect.left
-            || ((x + width) as u16) > self.clip_rect.right
-            || (y as u16) < self.clip_rect.top
-            || ((y + height) as u16) > self.clip_rect.bottom
+            || x < self.clip_rect.left as usize
+            || x + width > self.clip_rect.right as usize
+            || y < self.clip_rect.top as usize
+            || y + height > self.clip_rect.bottom as usize
         {
             return false;
         }
@@ -948,12 +952,10 @@ impl ComponentDrawer<'_> {
                 return false;
             }
         }
-        let prev_overlays = self.context.prev_overlays;
-        let own_start = own_overlays.start.min(prev_overlays.len());
-        let own_end = own_overlays.end.clamp(own_start, prev_overlays.len());
-        if prev_overlays[..own_start]
+        if self
+            .context
+            .prev_overlays
             .iter()
-            .chain(&prev_overlays[own_end..])
             .any(|overlay| rects_intersect(*overlay, rect))
         {
             return false;
@@ -986,7 +988,7 @@ impl ComponentDrawer<'_> {
     }
 
     /// Gets the size of the component.
-    pub fn size(&self) -> Size<u16> {
+    pub fn size(&self) -> Size<u32> {
         self.node_size
     }
 
@@ -995,7 +997,7 @@ impl ComponentDrawer<'_> {
     /// This mirrors CC Ink's `get-max-width.ts` helper, generalized to both
     /// axes: content width/height are the computed node size minus computed
     /// padding and border. Values saturate at zero.
-    pub fn content_size(&self) -> Size<u16> {
+    pub fn content_size(&self) -> Size<u32> {
         let layout = self.layout();
         Size {
             width: (layout.size.width
@@ -1003,18 +1005,18 @@ impl ComponentDrawer<'_> {
                 - layout.padding.right
                 - layout.border.left
                 - layout.border.right)
-                .max(0.0) as u16,
+                .max(0.0) as u32,
             height: (layout.size.height
                 - layout.padding.top
                 - layout.padding.bottom
                 - layout.border.top
                 - layout.border.bottom)
-                .max(0.0) as u16,
+                .max(0.0) as u32,
         }
     }
 
     /// Gets the visible component size inside the current canvas clip.
-    pub fn visible_size(&self) -> Size<u16> {
+    pub fn visible_size(&self) -> Size<u32> {
         let rect = self.visible_rect();
         Size {
             width: rect.right - rect.left,
@@ -1023,22 +1025,22 @@ impl ComponentDrawer<'_> {
     }
 
     /// The component's canvas rectangle intersected with its inherited clip.
-    pub(crate) fn visible_rect(&self) -> Rect<u16> {
-        let x = i32::from(self.node_position.x);
-        let y = i32::from(self.node_position.y);
-        let left = x.max(i32::from(self.clip_rect.left));
-        let top = y.max(i32::from(self.clip_rect.top));
-        let right = (x + i32::from(self.node_size.width)).min(i32::from(self.clip_rect.right));
-        let bottom = (y + i32::from(self.node_size.height)).min(i32::from(self.clip_rect.bottom));
+    pub(crate) fn visible_rect(&self) -> Rect<u32> {
+        let x = i64::from(self.node_position.x);
+        let y = i64::from(self.node_position.y);
+        let left = x.max(i64::from(self.clip_rect.left));
+        let top = y.max(i64::from(self.clip_rect.top));
+        let right = (x + i64::from(self.node_size.width)).min(i64::from(self.clip_rect.right));
+        let bottom = (y + i64::from(self.node_size.height)).min(i64::from(self.clip_rect.bottom));
         Rect {
-            left: left as u16,
-            right: right.max(left) as u16,
-            top: top as u16,
-            bottom: bottom.max(top) as u16,
+            left: left as u32,
+            right: right.max(left) as u32,
+            top: top as u32,
+            bottom: bottom.max(top) as u32,
         }
     }
 
-    pub(crate) fn clip_rect(&self) -> Rect<u16> {
+    pub(crate) fn clip_rect(&self) -> Rect<u32> {
         self.clip_rect
     }
 
@@ -1049,21 +1051,21 @@ impl ComponentDrawer<'_> {
     /// an overflowing cross-axis width that is wider than the terminal canvas;
     /// wrapping against this clamped width keeps rendered line count consistent
     /// with the cells that can actually exist in the screen buffer.
-    pub fn remaining_canvas_size(&self) -> Size<u16> {
+    pub fn remaining_canvas_size(&self) -> Size<u32> {
         let x = self.node_position.x as isize;
         let y = self.node_position.y as isize;
         Size {
             width: (self.context.canvas.width() as isize - x)
                 .max(0)
-                .min(self.node_size.width as isize) as u16,
+                .min(self.node_size.width as isize) as u32,
             height: (self.context.canvas.height() as isize - y)
                 .max(0)
-                .min(self.node_size.height as isize) as u16,
+                .min(self.node_size.height as isize) as u32,
         }
     }
 
     /// Gets the position of the component relative to the top left of the canvas.
-    pub fn canvas_position(&self) -> Point<i16> {
+    pub fn canvas_position(&self) -> Point<i32> {
         self.node_position
     }
 
@@ -1350,8 +1352,8 @@ impl ComponentDrawer<'_> {
         let layout = self.layout();
         self.record_drawn_layout(&layout);
         let mut next_position = Point {
-            x: self.node_position.x + layout.location.x as i16,
-            y: self.node_position.y + layout.location.y as i16,
+            x: self.node_position.x + layout.location.x as i32,
+            y: self.node_position.y + layout.location.y as i32,
         };
         if next_position.y < 0
             && self.style().position == Position::Absolute
@@ -1367,13 +1369,13 @@ impl ComponentDrawer<'_> {
         }
         self.node_position = next_position;
         self.node_size = Size {
-            width: layout.size.width as u16,
-            height: layout.size.height as u16,
+            width: layout.size.width as u32,
+            height: layout.size.height as u32,
         };
         if self.style().position == Position::Absolute {
-            let (x, y) = (i32::from(next_position.x), i32::from(next_position.y));
-            let right = (x + i32::from(self.node_size.width)).max(0) as usize;
-            let bottom = (y + i32::from(self.node_size.height)).max(0) as usize;
+            let (x, y) = (i64::from(next_position.x), i64::from(next_position.y));
+            let right = (x + i64::from(self.node_size.width)).max(0) as usize;
+            let bottom = (y + i64::from(self.node_size.height)).max(0) as usize;
             let (left, top) = (x.max(0) as usize, y.max(0) as usize);
             if right > left && bottom > top {
                 self.context
@@ -1444,24 +1446,24 @@ impl ComponentDrawer<'_> {
         }
         let layout = self.layout();
         if overflow.x != Overflow::Visible {
+            let x = i64::from(self.node_position.x);
             self.clip_rect.left = self
                 .clip_rect
                 .left
-                .max((self.node_position.x + layout.border.left as i16).max(0) as u16);
+                .max((x + layout.border.left as i64).max(0) as u32);
             self.clip_rect.right = self.clip_rect.right.min(
-                (self.node_position.x + self.node_size.width as i16 - layout.border.right as i16)
-                    .max(0) as u16,
+                (x + i64::from(self.node_size.width) - layout.border.right as i64).max(0) as u32,
             );
         }
         if overflow.y != Overflow::Visible {
             self.vertical_clip_active = true;
+            let y = i64::from(self.node_position.y);
             self.clip_rect.top = self
                 .clip_rect
                 .top
-                .max((self.node_position.y + layout.border.top as i16).max(0) as u16);
+                .max((y + layout.border.top as i64).max(0) as u32);
             self.clip_rect.bottom = self.clip_rect.bottom.min(
-                (self.node_position.y + self.node_size.height as i16 - layout.border.bottom as i16)
-                    .max(0) as u16,
+                (y + i64::from(self.node_size.height) - layout.border.bottom as i64).max(0) as u32,
             );
         }
         f(self);
@@ -1687,17 +1689,17 @@ impl std::ops::DerefMut for LayoutEngine {
 /// recomputed a different intrinsic width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LayoutSnapshot {
-    x: i16,
-    y: i16,
-    height: u16,
+    x: i32,
+    y: i32,
+    height: u32,
 }
 
 impl From<&Layout> for LayoutSnapshot {
     fn from(layout: &Layout) -> Self {
         Self {
-            x: layout.location.x as i16,
-            y: layout.location.y as i16,
-            height: layout.size.height as u16,
+            x: layout.location.x as i32,
+            y: layout.location.y as i32,
+            height: layout.size.height as u32,
         }
     }
 }

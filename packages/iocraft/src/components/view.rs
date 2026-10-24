@@ -626,11 +626,12 @@ struct ViewHoverRecord {
 #[derive(Clone, Copy)]
 struct ViewEventRegion {
     rect: Rect<i32>,
-    visible_rect: Rect<u16>,
+    visible_rect: Rect<u32>,
 }
 
 impl ViewEventRegion {
     fn contains(&self, column: u16, row: u16) -> bool {
+        let (column, row) = (u32::from(column), u32::from(row));
         column >= self.visible_rect.left
             && column < self.visible_rect.right
             && row >= self.visible_rect.top
@@ -1995,10 +1996,10 @@ impl Component for View {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ViewEventRegion {
             rect: Rect {
-                left: position.x as i32,
-                right: position.x as i32 + size.width as i32,
-                top: position.y as i32,
-                bottom: position.y as i32 + size.height as i32,
+                left: position.x,
+                right: position.x + size.width as i32,
+                top: position.y,
+                bottom: position.y + size.height as i32,
             },
             visible_rect: drawer.visible_rect(),
         });
