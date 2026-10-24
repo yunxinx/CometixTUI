@@ -1699,3 +1699,62 @@ async fn test_a_keyed_child_replaced_by_another_type_leaves_no_layout_nodes() {
     let node_counts = node_counts.lock().unwrap().clone();
     assert_eq!(node_counts.first(), node_counts.last(), "{node_counts:?}");
 }
+
+#[derive(Default, Props)]
+struct BatchedFlagInputProps {
+    changes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[component]
+fn BatchedFlagInput(
+    mut hooks: Hooks,
+    props: &BatchedFlagInputProps,
+) -> impl Into<AnyElement<'static>> {
+    let mut value = hooks.use_state(String::new);
+    let changes = props.changes.clone();
+    let mut system = hooks.use_context_mut::<SystemContext>();
+    if value.to_string() == "\u{1f1fa}\u{1f1f3}" {
+        system.exit();
+    }
+    element! {
+        View(width: 20) {
+            TextInput(has_focus: true, value: value.to_string(), on_change: move |text: String| {
+                changes.lock().unwrap().push(text.clone());
+                value.set(text);
+            })
+        }
+    }
+}
+
+#[apply(test!)]
+async fn test_batched_flag_input_paints_only_complete_grapheme() {
+    for push_wake in [true, false] {
+        crate::render::wake::set_push_wake_for_tests(Some(push_wake));
+        let changes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events =
+            futures::stream::iter(['\u{1f1fa}', '\u{1f1f3}'].map(|ch| {
+                TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char(ch)))
+            }));
+        let canvases: Vec<_> = element!(BatchedFlagInput(changes: changes.clone()))
+            .mock_terminal_render_loop(MockTerminalConfig::with_events(events))
+            .collect()
+            .await;
+        assert_eq!(
+            *changes.lock().unwrap(),
+            ["\u{1f1fa}", "\u{1f1fa}\u{1f1f3}"]
+        );
+        let frames: Vec<_> = canvases.iter().map(|canvas| canvas.to_string()).collect();
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert!(
+            frames.last().unwrap().contains("\u{1f1fa}\u{1f1f3}"),
+            "{frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|frame| !frame.contains('\u{1f1fa}') || frame.contains("\u{1f1fa}\u{1f1f3}")),
+            "{frames:?}"
+        );
+    }
+    crate::render::wake::set_push_wake_for_tests(None);
+}

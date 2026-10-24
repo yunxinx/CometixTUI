@@ -1079,7 +1079,7 @@ mod tests {
             TerminalEvent::Resize(80, 24),
         ];
         let canvases: Vec<_> = element!(MirroredInput)
-            .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter(events)))
+            .mock_terminal_render_loop(MockTerminalConfig::with_delayed_events(events))
             .collect()
             .await;
         let frames: Vec<_> = canvases.iter().map(Canvas::to_string).collect();
@@ -1146,7 +1146,7 @@ mod tests {
             )
             .chain([TerminalEvent::Resize(80, 24)]);
         let canvases: Vec<_> = element!(MirroredInput)
-            .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter(events)))
+            .mock_terminal_render_loop(MockTerminalConfig::with_delayed_events(events))
             .collect()
             .await;
         let frames: Vec<_> = canvases.iter().map(Canvas::to_string).collect();
@@ -1187,12 +1187,12 @@ mod tests {
     #[apply(test!)]
     async fn test_auto_grow_scrolls_at_limit_and_resets_after_submit() {
         let frames: Vec<_> = element!(ControlledInput)
-            .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter([
+            .mock_terminal_render_loop(MockTerminalConfig::with_delayed_events([
                 TerminalEvent::Paste("one\ntwo\nthree\nfour\nfive".to_string()),
                 TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Enter)),
                 TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char('x'))),
                 TerminalEvent::Resize(80, 24),
-            ])))
+            ]))
             .collect()
             .await;
         let scrolled = frames

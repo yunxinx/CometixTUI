@@ -15,6 +15,7 @@ use crossterm::{
 use futures::{
     channel::{mpsc, oneshot},
     stream::{self, BoxStream, Stream, StreamExt},
+    task::AtomicWaker,
 };
 use futures_timer::Delay;
 use std::{
@@ -24,7 +25,7 @@ use std::{
     mem,
     pin::Pin,
     sync::{Arc, Mutex, Weak},
-    task::{Context, Poll, Waker},
+    task::{Context, Poll, Wake, Waker},
     time::{Duration, Instant},
 };
 
@@ -273,6 +274,8 @@ pub(crate) struct Terminal<'a> {
     output: Output,
     base_fullscreen: bool,
     event_stream: Option<BoxStream<'static, io::Result<TerminalEvent>>>,
+    pending_event: Option<io::Result<TerminalEvent>>,
+    event_stream_wake: Arc<EventStreamWake>,
     subscribers: Vec<Weak<TerminalEventsShared>>,
     event_cell_snapshot: Option<EventCellSnapshot>,
     terminal_focus_state: Option<bool>,
@@ -290,6 +293,26 @@ pub(crate) struct Terminal<'a> {
     synchronized_update_depth: usize,
     synchronized_update_started: bool,
     synchronized_update_supported: bool,
+}
+
+// Crossterm keeps the first Pending poll's waker in its background reader.
+// A stable bridge lets nonblocking peeks share that reader with later waits.
+struct EventStreamWake {
+    waker: AtomicWaker,
+}
+
+impl Default for EventStreamWake {
+    fn default() -> Self {
+        Self {
+            waker: AtomicWaker::new(),
+        }
+    }
+}
+
+impl Wake for EventStreamWake {
+    fn wake(self: Arc<Self>) {
+        self.waker.wake();
+    }
 }
 
 impl<'a> Terminal<'a> {
@@ -310,6 +333,8 @@ impl<'a> Terminal<'a> {
             output,
             base_fullscreen: fullscreen,
             event_stream: None,
+            pending_event: None,
+            event_stream_wake: Arc::new(EventStreamWake::default()),
             subscribers: Vec::new(),
             event_cell_snapshot: None,
             terminal_focus_state: None,
@@ -754,134 +779,169 @@ impl<'a> Terminal<'a> {
         std::mem::take(&mut self.resized)
     }
 
+    /// Peeks at already available input without dispatching it before props settle.
+    pub(crate) fn has_pending_input(&mut self) -> bool {
+        if self.pending_event.is_none()
+            && let Poll::Ready(Some(event)) = self.poll_event_stream_now()
+        {
+            self.pending_event = Some(event);
+        }
+        self.pending_event.as_ref().is_some_and(|event| {
+            matches!(event, Ok(TerminalEvent::Key(_) | TerminalEvent::Paste(_)))
+                && !event
+                    .as_ref()
+                    .is_ok_and(|event| self.event_requests_suspend(event))
+        })
+    }
+
+    fn event_requests_suspend(&self, event: &TerminalEvent) -> bool {
+        self.suspend_on_ctrl_z
+            && matches!(
+                event,
+                TerminalEvent::Key(KeyEvent {
+                    code: KeyCode::Char(ch),
+                    kind: KeyEventKind::Press,
+                    modifiers,
+                    ..
+                }) if ch.eq_ignore_ascii_case(&'z')
+                    && modifiers.contains(KeyModifiers::CONTROL)
+                    && !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
+            )
+    }
+
+    fn poll_event_stream_now(&mut self) -> Poll<Option<io::Result<TerminalEvent>>> {
+        let Some(event_stream) = self.event_stream.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let stream_waker = Waker::from(self.event_stream_wake.clone());
+        let mut context = Context::from_waker(&stream_waker);
+        event_stream.as_mut().poll_next(&mut context)
+    }
+
     pub async fn wait(&mut self) -> io::Result<()> {
         use futures::future::{Either, poll_fn, select};
 
         let event_cell_snapshot = self.event_cell_snapshot.clone();
-        match &mut self.event_stream {
-            Some(event_stream) => loop {
-                // Race the next terminal event against the resume (SIGCONT) signal so
-                // the render loop wakes immediately when the process is foregrounded,
-                // even with no pending input.
-                let inner = &mut self.inner;
-                let next =
-                    match select(event_stream.next(), poll_fn(|cx| inner.poll_resumed(cx))).await {
-                        Either::Left((next, _)) => next,
-                        Either::Right(((), _)) => return Ok(()),
-                    };
-                let Some(event) = next else {
-                    // Propagate stream exhaustion so applications can shut down
-                    // when their terminal disappears.
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "terminal event stream ended",
-                    ));
+        loop {
+            // Race the next terminal event against the resume (SIGCONT) signal so
+            // the render loop wakes immediately when the process is foregrounded,
+            // even with no pending input.
+            let inner = &mut self.inner;
+            let next = if let Some(event) = self.pending_event.take() {
+                Some(event)
+            } else {
+                let Some(event_stream) = self.event_stream.as_mut() else {
+                    poll_fn(|cx| inner.poll_resumed(cx)).await;
+                    return Ok(());
                 };
-                let event = event?;
-                let now = Instant::now();
-                if self
-                    .last_stdin_event_at
-                    .is_some_and(|last| now.duration_since(last) > STDIN_RESUME_GAP)
-                {
-                    let _ = self.inner.reassert_after_stdin_resume();
+                let event_stream_wake = self.event_stream_wake.clone();
+                let stream_waker = Waker::from(event_stream_wake.clone());
+                let next_event = poll_fn(move |cx| {
+                    event_stream_wake.waker.register(cx.waker());
+                    let mut stream_context = Context::from_waker(&stream_waker);
+                    event_stream.as_mut().poll_next(&mut stream_context)
+                });
+                match select(next_event, poll_fn(|cx| inner.poll_resumed(cx))).await {
+                    Either::Left((next, _)) => next,
+                    Either::Right(((), _)) => return Ok(()),
                 }
-                self.last_stdin_event_at = Some(now);
-                let is_ctrl_c = matches!(
-                    event,
-                    TerminalEvent::Key(KeyEvent {
-                        code: KeyCode::Char('c'),
-                        kind: KeyEventKind::Press,
-                        modifiers,
-                        ..
-                    }) if modifiers.contains(KeyModifiers::CONTROL)
-                        && !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
+            };
+            let Some(event) = next else {
+                // Propagate stream exhaustion so applications can shut down
+                // when their terminal disappears.
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "terminal event stream ended",
+                ));
+            };
+            let event = event?;
+            let now = Instant::now();
+            if self
+                .last_stdin_event_at
+                .is_some_and(|last| now.duration_since(last) > STDIN_RESUME_GAP)
+            {
+                let _ = self.inner.reassert_after_stdin_resume();
+            }
+            self.last_stdin_event_at = Some(now);
+            let is_ctrl_c = matches!(
+                event,
+                TerminalEvent::Key(KeyEvent {
+                    code: KeyCode::Char('c'),
+                    kind: KeyEventKind::Press,
+                    modifiers,
+                    ..
+                }) if modifiers.contains(KeyModifiers::CONTROL)
+                    && !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
+            );
+            if self.event_requests_suspend(&event) {
+                // Opt-in CC Ink/Claude Code Ctrl+Z behavior: hand the
+                // terminal back to the shell, stop the process on Unix, and
+                // let the SIGCONT repair path repaint from a clean slate
+                // after `fg`. Generic iocraft apps receive Ctrl+Z as normal
+                // input unless they explicitly enable this policy.
+                let _ = self.inner.suspend();
+                return Ok(());
+            }
+            match &event {
+                TerminalEvent::FocusGained => self.terminal_focus_state = Some(true),
+                TerminalEvent::FocusLost => self.terminal_focus_state = Some(false),
+                TerminalEvent::Response(response) => {
+                    if let TerminalResponse::Xtversion { name } = response {
+                        set_xtversion_name(name.clone());
+                    }
+                    dispatch_terminal_query_response(&mut self.query_queue, response.clone());
+                }
+                _ => {}
+            }
+            // CC Ink `App.tsx` "Failsafe: if we receive input, the terminal
+            // must be focused": a key or paste that arrives after a
+            // focus-out means the focus-in was dropped (some emulators
+            // do), so the input stands in for it. Focus subscribers see
+            // the synthesized focus-in before the input itself, the way
+            // CC's `setTerminalFocused(true)` notifies its store first.
+            if self.terminal_focus_state == Some(false)
+                && matches!(event, TerminalEvent::Key(_) | TerminalEvent::Paste(_))
+            {
+                self.terminal_focus_state = Some(true);
+                let _ = Self::dispatch_to_subscribers(
+                    &mut self.subscribers,
+                    TerminalEvent::FocusGained,
                 );
-                let is_ctrl_z = matches!(
-                    event,
-                    TerminalEvent::Key(KeyEvent {
-                        code: KeyCode::Char(ch),
-                        kind: KeyEventKind::Press,
-                        modifiers,
-                        ..
-                    }) if ch.eq_ignore_ascii_case(&'z')
-                        && modifiers.contains(KeyModifiers::CONTROL)
-                        && !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
-                );
-                if self.suspend_on_ctrl_z && is_ctrl_z {
-                    // Opt-in CC Ink/Claude Code Ctrl+Z behavior: hand the
-                    // terminal back to the shell, stop the process on Unix, and
-                    // let the SIGCONT repair path repaint from a clean slate
-                    // after `fg`. Generic iocraft apps receive Ctrl+Z as normal
-                    // input unless they explicitly enable this policy.
-                    let _ = self.inner.suspend();
-                    return Ok(());
+            }
+            let is_resize = matches!(event, TerminalEvent::Resize(..));
+            self.input_dispatched =
+                matches!(event, TerminalEvent::Key(_) | TerminalEvent::Paste(_));
+            if let TerminalEvent::Resize(width, height) = &event {
+                let next_size = (*width, *height);
+                if self.inner.size() == Some(next_size) {
+                    // Match CC Ink's resize handler: same-dimension resize
+                    // events are terminal-settling noise. Do not wake the
+                    // render loop or reset/reassert modes redundantly.
+                    continue;
                 }
-                match &event {
-                    TerminalEvent::FocusGained => self.terminal_focus_state = Some(true),
-                    TerminalEvent::FocusLost => self.terminal_focus_state = Some(false),
-                    TerminalEvent::Response(response) => {
-                        if let TerminalResponse::Xtversion { name } = response {
-                            set_xtversion_name(name.clone());
-                        }
-                        dispatch_terminal_query_response(&mut self.query_queue, response.clone());
-                    }
-                    _ => {}
-                }
-                // CC Ink `App.tsx` "Failsafe: if we receive input, the terminal
-                // must be focused": a key or paste that arrives after a
-                // focus-out means the focus-in was dropped (some emulators
-                // do), so the input stands in for it. Focus subscribers see
-                // the synthesized focus-in before the input itself, the way
-                // CC's `setTerminalFocused(true)` notifies its store first.
-                if self.terminal_focus_state == Some(false)
-                    && matches!(event, TerminalEvent::Key(_) | TerminalEvent::Paste(_))
-                {
-                    self.terminal_focus_state = Some(true);
-                    let _ = Self::dispatch_to_subscribers(
-                        &mut self.subscribers,
-                        TerminalEvent::FocusGained,
-                    );
-                }
-                let is_resize = matches!(event, TerminalEvent::Resize(..));
-                self.input_dispatched =
-                    matches!(event, TerminalEvent::Key(_) | TerminalEvent::Paste(_));
-                if let TerminalEvent::Resize(width, height) = &event {
-                    let next_size = (*width, *height);
-                    if self.inner.size() == Some(next_size) {
-                        // Match CC Ink's resize handler: same-dimension resize
-                        // events are terminal-settling noise. Do not wake the
-                        // render loop or reset/reassert modes redundantly.
-                        continue;
-                    }
-                    self.inner.set_size_from_resize_event(*width, *height);
-                    self.resized = true;
-                    let _ = self.inner.reassert_after_resize();
-                }
-                let event = Self::annotate_terminal_event(event, event_cell_snapshot.as_ref());
+                self.inner.set_size_from_resize_event(*width, *height);
+                self.resized = true;
+                let _ = self.inner.reassert_after_resize();
+            }
+            let event = Self::annotate_terminal_event(event, event_cell_snapshot.as_ref());
 
-                // Dispatch to the interested subscribers first — Ctrl+C is a
-                // normal event.
-                let (delivered, shared_state) =
-                    Self::dispatch_to_subscribers(&mut self.subscribers, event);
+            // Dispatch to the interested subscribers first — Ctrl+C is a
+            // normal event.
+            let (delivered, shared_state) =
+                Self::dispatch_to_subscribers(&mut self.subscribers, event);
 
-                if is_ctrl_c && !self.ignore_ctrl_c {
-                    if delivered {
-                        // Defer default exit until the render loop has polled component
-                        // hooks, giving propagation-aware listeners a chance to consume it.
-                        self.pending_ctrl_c.push(shared_state);
-                    } else {
-                        // No component can consume it, so preserve the default behavior.
-                        self.received_ctrl_c = true;
-                    }
+            if is_ctrl_c && !self.ignore_ctrl_c {
+                if delivered {
+                    // Defer default exit until the render loop has polled component
+                    // hooks, giving propagation-aware listeners a chance to consume it.
+                    self.pending_ctrl_c.push(shared_state);
+                } else {
+                    // No component can consume it, so preserve the default behavior.
+                    self.received_ctrl_c = true;
                 }
-                if self.received_ctrl_c || is_resize || self.input_dispatched {
-                    return Ok(());
-                }
-            },
-            None => {
-                let inner = &mut self.inner;
-                poll_fn(|cx| inner.poll_resumed(cx)).await;
-                Ok(())
+            }
+            if self.received_ctrl_c || is_resize || self.input_dispatched {
+                return Ok(());
             }
         }
     }
@@ -940,6 +1000,8 @@ impl Terminal<'static> {
                 output: Output::Stdout,
                 base_fullscreen,
                 event_stream: None,
+                pending_event: None,
+                event_stream_wake: Arc::new(EventStreamWake::default()),
                 subscribers: Vec::new(),
                 event_cell_snapshot: None,
                 terminal_focus_state: None,

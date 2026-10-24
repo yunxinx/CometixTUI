@@ -75,6 +75,10 @@ impl SystemContext {
         self.terminal_handoff = Some(request);
     }
 
+    pub(crate) fn has_terminal_handoff(&self) -> bool {
+        self.terminal_handoff.is_some()
+    }
+
     pub(crate) fn take_terminal_handoff(&mut self) -> Option<TerminalHandoffRequest> {
         self.terminal_handoff.take()
     }

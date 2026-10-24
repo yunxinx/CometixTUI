@@ -3281,10 +3281,10 @@ mod tests {
     #[apply(test!)]
     async fn test_scroll_view_emits_scroll_hint_for_small_scroll_delta() {
         let canvases: Vec<_> = element!(TestScrollView)
-            .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter(vec![
+            .mock_terminal_render_loop(MockTerminalConfig::with_delayed_events([
                 TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Down)),
                 TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char('q'))),
-            ])))
+            ]))
             .collect()
             .await;
 

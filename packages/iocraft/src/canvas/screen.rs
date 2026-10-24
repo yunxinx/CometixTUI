@@ -39,21 +39,6 @@ impl Character {
             0
         }
     }
-
-    pub(super) fn needs_width_compensation(&self) -> bool {
-        // Mirrors CC Ink's log-update.ts `needsWidthCompensation`: newer
-        // emoji and text-default emoji with VS16 may advance by only one column
-        // on terminals with stale wcwidth tables. ANSI output compensates with
-        // cursor addressing so the fix is harmless on terminals with correct
-        // width tables.
-        let Some(cp) = self.value.chars().next().map(|ch| ch as u32) else {
-            return false;
-        };
-        if (0x1fa70..=0x1faff).contains(&cp) || (0x1fb00..=0x1fbff).contains(&cp) {
-            return true;
-        }
-        self.value.len() >= 2 && self.value.contains('\u{fe0f}')
-    }
 }
 
 /// Overlays are the mechanism behind cursor inversion, search highlighting, and selection
@@ -994,6 +979,19 @@ impl Canvas {
         self.scroll_hint
     }
 
+    /// Carries changes from a render that has not reached the terminal yet.
+    pub(crate) fn inherit_unpainted_changes(&mut self, previous: &Self) {
+        for (dirty, previous_dirty) in self.dirty_rows.iter_mut().zip(&previous.dirty_rows) {
+            *dirty |= previous_dirty;
+        }
+        if let Some(damage) = previous.damage_region() {
+            self.mark_damage(damage);
+        }
+        self.force_full_repaint |= previous.force_full_repaint;
+        // This hint describes the change from `previous`, not the painted frame.
+        self.scroll_hint = None;
+    }
+
     /// Requests a full repaint for this canvas even if its cells are identical
     /// to the previous frame. This is the iocraft equivalent of CC Ink's
     /// `prevFrameContaminated`/full-damage backstop: when terminal contents or
@@ -1053,7 +1051,6 @@ impl Canvas {
         self.damage_region.is_some()
     }
 
-    #[cfg(test)]
     pub(crate) fn row_is_damaged(&self, y: usize) -> bool {
         self.damage_region
             .is_some_and(|region| region.intersects_row(y))
@@ -1155,11 +1152,9 @@ impl Canvas {
 
     /// [`Self::blit_region_from`] without marking the rows written.
     ///
-    /// ONLY valid when `src` is the terminal diff baseline (the previous
-    /// committed frame): the copied rows are then identical to that baseline
-    /// by construction, so leaving them unmarked lets the diff writer skip
-    /// them. Copying from any other canvas through this variant would hide
-    /// real changes from the terminal.
+    /// The source must be the terminal diff baseline, or the caller must carry
+    /// its unpainted changes with [`Self::inherit_unpainted_changes`] before
+    /// diffing. Otherwise copying unmarked rows could hide real changes.
     pub(crate) fn blit_region_from_baseline(
         &mut self,
         src: &Canvas,
@@ -2026,6 +2021,9 @@ impl Canvas {
     /// the inline renderer can track whether a write actually ended in VT autowrap's
     /// pending-wrap state instead of assuming `canvas.width()` was reached.
     pub(crate) fn ansi_row_rendered_width(&self, y: usize) -> usize {
+        if let Some((start, _)) = self.ansi_row_background_tail(y) {
+            return start;
+        }
         let row = self.row(y).unwrap_or(&[]);
         let mut rendered_width = 0;
         for (x, cell) in row.iter().enumerate() {

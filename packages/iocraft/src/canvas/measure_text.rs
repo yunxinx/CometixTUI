@@ -184,8 +184,8 @@ pub fn measure_text(text: &str, max_width: Option<usize>) -> TextMeasurement {
 
 /// Compute the **terminal display width** of a single grapheme cluster.
 ///
-/// This mirrors the logic of npm `string-width` / `Bun.stringWidth` that Claude Code
-/// uses for layout measurement:
+/// This follows the npm `string-width` / `Bun.stringWidth` shape that Claude Code
+/// uses for layout measurement, with two terminal-compatibility exceptions:
 ///
 /// 1. Zero-width clusters (pure control/format/mark codepoints) → 0
 /// 2. Multi-codepoint clusters containing at least two codepoints with nonzero width
@@ -196,6 +196,10 @@ pub fn measure_text(text: &str, max_width: Option<usize>) -> TextMeasurement {
 /// terminals and Unicode versions; the only authoritative answer would come from
 /// querying the terminal itself. For CJK text and common emoji this is accurate on
 /// modern terminals (kitty, iTerm2, WezTerm, Ghostty, Windows Terminal).
+///
+/// Unlike npm `string-width` and CC Ink, a lone regional indicator and a keycap
+/// base followed by VS16 occupy two columns. Ghostty and kitty both advance
+/// their cursor by two columns for these incomplete clusters.
 pub(crate) fn grapheme_width(grapheme: &str) -> usize {
     // Fast path: single ASCII byte.
     let bytes = grapheme.as_bytes();
@@ -235,16 +239,12 @@ pub(crate) fn grapheme_width(grapheme: &str) -> usize {
         return 2;
     }
 
-    // Incomplete keycap sequences (digit/#/* + VS16 without U+20E3) stay one
-    // column in CC Ink's stringWidth.ts. Complete keycaps fall through to the
-    // VS16 emoji-width rule below.
-    if grapheme.len() >= 4
-        && grapheme.contains('\u{fe0f}')
-        && !grapheme.contains('\u{20e3}')
-        && let Some(first) = grapheme.chars().next()
-        && (first.is_ascii_digit() || first == '#' || first == '*')
+    // Regional indicators advance two columns even before a flag pair is complete.
+    if grapheme
+        .chars()
+        .any(|ch| ('\u{1f1e6}'..='\u{1f1ff}').contains(&ch))
     {
-        return 1;
+        return 2;
     }
 
     // Single visible codepoint plus VS16 (emoji presentation selector): terminals
@@ -258,6 +258,17 @@ pub(crate) fn grapheme_width(grapheme: &str) -> usize {
 
     // Single visible codepoint, optionally with combining marks: use its East Asian Width.
     first_visible_width
+}
+
+/// Whether a cluster needs absolute column alignment after terminal output.
+pub(crate) fn grapheme_width_varies_by_terminal(grapheme: &str) -> bool {
+    let mut chars = grapheme.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    chars.next().is_some()
+        || ('\u{1f1e6}'..='\u{1f1ff}').contains(&first)
+        || ('\u{1fa70}'..='\u{1fbff}').contains(&first)
 }
 
 fn is_cc_zero_width_codepoint(ch: char) -> bool {

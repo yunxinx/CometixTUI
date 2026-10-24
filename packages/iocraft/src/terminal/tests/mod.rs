@@ -4,6 +4,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
+use std::task::{Context as TaskContext, Wake, Waker};
 
 #[derive(Clone, Default)]
 struct TestWriter {
@@ -2776,6 +2777,8 @@ fn test_resize_event_triggers_terminal_mode_reassertion() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        pending_event: None,
+        event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
         event_cell_snapshot: None,
         terminal_focus_state: None,
@@ -2826,6 +2829,8 @@ fn test_stdin_gap_reasserts_terminal_modes_like_cc_ink() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        pending_event: None,
+        event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
         event_cell_snapshot: None,
         terminal_focus_state: None,
@@ -2879,6 +2884,8 @@ fn test_same_size_resize_event_is_ignored() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        pending_event: None,
+        event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
         event_cell_snapshot: None,
         terminal_focus_state: None,
@@ -3051,6 +3058,8 @@ fn test_synchronized_update_wraps_clear_canvas_when_it_writes() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        pending_event: None,
+        event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
         event_cell_snapshot: None,
         terminal_focus_state: None,
@@ -3102,6 +3111,8 @@ fn test_synchronized_update_stays_lazy_for_identical_canvas_write() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        pending_event: None,
+        event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
         event_cell_snapshot: None,
         terminal_focus_state: None,
@@ -3150,6 +3161,8 @@ fn test_synchronized_update_wraps_current_damage_canvas_write() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        pending_event: None,
+        event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
         event_cell_snapshot: None,
         terminal_focus_state: None,
@@ -3209,6 +3222,8 @@ fn test_synchronized_update_wraps_previous_damage_canvas_write() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        pending_event: None,
+        event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
         event_cell_snapshot: None,
         terminal_focus_state: None,
@@ -3265,6 +3280,8 @@ fn test_synchronized_update_stays_lazy_for_identical_fullscreen_canvas_write() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        pending_event: None,
+        event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
         event_cell_snapshot: None,
         terminal_focus_state: None,
@@ -3342,6 +3359,8 @@ fn test_synchronized_update_wraps_pending_wrap_resolution() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        pending_event: None,
+        event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
         event_cell_snapshot: None,
         terminal_focus_state: None,
@@ -5288,4 +5307,67 @@ fn test_inline_bottom_gap_bookkeeping() {
     assert!(term.inline_shrink_requires_full_rewrite(8, 6));
     term.inline_bottom_gap = 0;
     assert!(!term.inline_shrink_requires_full_rewrite(8, 6));
+}
+
+#[test]
+fn test_pending_input_peek_wakes_the_next_waiter() {
+    struct WakeCount(AtomicUsize);
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // Like crossterm's background reader, retain the waker from the first
+    // Pending poll even when another task subsequently polls the stream.
+    let reader_waker = Arc::new(Mutex::new(None::<Waker>));
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let events = stream::poll_fn({
+        let reader_waker = reader_waker.clone();
+        let ready = ready.clone();
+        move |cx| {
+            if ready.swap(false, Ordering::SeqCst) {
+                Poll::Ready(Some(TerminalEvent::Key(KeyEvent::new(
+                    KeyEventKind::Press,
+                    KeyCode::Backspace,
+                ))))
+            } else {
+                reader_waker
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(|| cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    });
+    let (mut terminal, _output) = Terminal::mock(MockTerminalConfig::with_events(events));
+    terminal.start_event_stream().unwrap();
+    assert!(!terminal.has_pending_input());
+
+    let first = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let second = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let first_waker = Waker::from(first.clone());
+    let second_waker = Waker::from(second.clone());
+    let mut wait = Box::pin(terminal.wait());
+    assert!(
+        wait.as_mut()
+            .poll(&mut TaskContext::from_waker(&first_waker))
+            .is_pending()
+    );
+    assert!(
+        wait.as_mut()
+            .poll(&mut TaskContext::from_waker(&second_waker))
+            .is_pending()
+    );
+    ready.store(true, Ordering::SeqCst);
+    reader_waker.lock().unwrap().as_ref().unwrap().wake_by_ref();
+    assert_eq!(first.0.load(Ordering::SeqCst), 0);
+    assert_eq!(second.0.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        wait.as_mut()
+            .poll(&mut TaskContext::from_waker(&second_waker)),
+        Poll::Ready(Ok(()))
+    ));
+    drop(wait);
+    assert!(terminal.take_input_dispatched());
 }

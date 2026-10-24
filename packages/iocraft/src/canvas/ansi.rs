@@ -1,6 +1,47 @@
 use super::*;
 
+// A background-only suffix can be erased without printing at the right margin.
+pub(super) fn background_tail(
+    width: usize,
+    background: impl Fn(usize) -> Option<Color>,
+) -> Option<(usize, Color)> {
+    let mut start = width.checked_sub(1)?;
+    let color = background(start)?;
+    while start > 0 && background(start - 1) == Some(color) {
+        start -= 1;
+    }
+    Some((start, color))
+}
+
 impl Canvas {
+    pub(super) fn ansi_row_background_tail(&self, y: usize) -> Option<(usize, Color)> {
+        background_tail(self.width, |x| {
+            let cell = self.cell(x, y)?;
+            if cell.cell_width != CellWidth::Normal
+                || cell
+                    .character
+                    .as_ref()
+                    .is_some_and(|c| c.value != " " || c.hyperlink.is_some())
+            {
+                return None;
+            }
+            let mut style = CanvasResolvedStyle {
+                text: cell.character.as_ref().map_or_default(|c| c.style),
+                background_color: cell.background_color,
+            };
+            if let Some(overlay) = self
+                .overlays
+                .get(y)
+                .and_then(|row| row.get(x))
+                .copied()
+                .flatten()
+            {
+                style = style.with_overlay(overlay);
+            }
+            style.erase_background()
+        })
+    }
+
     pub(super) fn write_row_impl<W: Write>(
         &self,
         y: usize,
@@ -15,12 +56,14 @@ impl Canvas {
         // all, while erase-to-eol and OSC 8 hyperlinks still flow.
         let ansi_styles = ansi && styles_enabled();
 
+        let background_tail = ansi.then(|| self.ansi_row_background_tail(y)).flatten();
+        let row_end = background_tail.map_or(row.len(), |(start, _)| start);
         let mut background_color = None;
         let mut text_style = CanvasTextStyle::default();
         let mut active_hyperlink: Option<String> = None;
         let mut col = start_col.min(row.len());
         let mut rendered_width = col;
-        while col < row.len() {
+        while col < row_end {
             let cell_start_col = col;
             let cell = &row[col];
             let overlay = overlay_row
@@ -182,7 +225,7 @@ impl Canvas {
             if let Some(c) = &cell.character {
                 if ansi
                     && cell_display_width == 2
-                    && c.needs_width_compensation()
+                    && grapheme_width_varies_by_terminal(&c.value)
                     && cell_start_col + 1 < self.width
                 {
                     // CC Ink's robust emoji compensation: prefill the second
@@ -201,6 +244,9 @@ impl Canvas {
                     )?;
                 } else {
                     write!(w, "{}{}", c.value, " ".repeat(c.required_padding()))?;
+                    if ansi && grapheme_width_varies_by_terminal(&c.value) {
+                        write!(w, "\x1b[{}G", cell_start_col + cell_display_width + 1)?;
+                    }
                 }
             } else {
                 w.write_all(b" ")?;
@@ -231,7 +277,13 @@ impl Canvas {
             if needs_reset {
                 sgr_reset(&mut w)?;
             }
-            if rendered_width < self.width {
+            if let Some((_, color)) = background_tail {
+                sgr_bg(&mut w, color)?;
+                erase_to_eol(&mut w)?;
+                if ansi_styles {
+                    sgr_reset(&mut w)?;
+                }
+            } else if rendered_width < self.width {
                 erase_to_eol(&mut w)?;
                 if ansi_styles {
                     sgr_reset(&mut w)?;

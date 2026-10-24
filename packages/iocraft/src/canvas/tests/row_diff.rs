@@ -462,3 +462,61 @@ fn test_row_eq_ignores_trailing_invisible_spaces() {
         "trailing invisible padding should not force a row rewrite"
     );
 }
+
+#[test]
+fn test_ansi_writers_clear_background_tail_without_printing_spaces() {
+    let mut canvas = Canvas::new(10, 1);
+    let mut view = canvas.subview_mut(0, 0, 0, 0, 10, 1);
+    view.set_background_color(0, 0, 10, 1, Color::DarkBlue);
+    view.set_text(0, 0, "abc", CanvasTextStyle::default());
+    let mut row = Vec::new();
+    canvas.write_ansi_row_without_newline(0, &mut row).unwrap();
+    let mut pools = CanvasPackedCellPools::new();
+    let packed = canvas.pack_with(&mut pools);
+    let packed_row = packed
+        .ansi_row_with_style_cache(&pools, &mut CanvasStyleTransitionCache::new(), 0, 0)
+        .unwrap();
+    for row in [String::from_utf8(row).unwrap(), packed_row] {
+        assert!(!row.contains(' '), "{row:?}");
+        assert!(row.ends_with("\x1b[K\x1b[0m"), "{row:?}");
+    }
+    assert_eq!(canvas.ansi_row_rendered_width(0), 3);
+}
+
+#[test]
+fn test_ansi_writers_realign_terminal_dependent_graphemes() {
+    for (grapheme, width) in [
+        ("\u{1f1fa}", 2),
+        ("\u{1f1fa}\u{1f1f3}", 2),
+        ("5\u{fe0f}\u{20e3}", 2),
+        ("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}", 2),
+        ("e\u{0301}", 1),
+    ] {
+        let mut canvas = Canvas::new(10, 1);
+        canvas.subview_mut(0, 0, 0, 0, 10, 1).set_text(
+            0,
+            0,
+            &format!("a{grapheme}z"),
+            CanvasTextStyle::default(),
+        );
+        let mut row = Vec::new();
+        canvas.write_ansi_row_without_newline(0, &mut row).unwrap();
+        let mut pools = CanvasPackedCellPools::new();
+        let packed = canvas.pack_with(&mut pools);
+        let packed_row = packed
+            .ansi_row_with_style_cache(&pools, &mut CanvasStyleTransitionCache::new(), 0, 0)
+            .unwrap();
+        for row in [String::from_utf8(row).unwrap(), packed_row] {
+            assert!(
+                row.contains(&format!("{grapheme}\x1b[{}Gz", width + 2)),
+                "{row:?}"
+            );
+            if width == 2 {
+                assert!(
+                    row.contains(&format!("\x1b[3G \x1b[2G{grapheme}")),
+                    "{row:?}"
+                );
+            }
+        }
+    }
+}

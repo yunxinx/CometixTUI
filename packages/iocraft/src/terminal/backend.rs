@@ -1068,6 +1068,8 @@ impl TerminalImpl for StdTerminal<'_> {
                 && y < prev_height
                 && !canvas.row_written(y)
                 && !prev.row_written(y)
+                && !canvas.row_is_damaged(y)
+                && !prev.row_is_damaged(y)
             {
                 continue;
             }

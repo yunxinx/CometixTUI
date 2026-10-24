@@ -229,11 +229,11 @@ mod tests {
         let key = TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char('x')));
         let frames: Vec<String> = smol::block_on(
             element!(CachedOverlaidMemoApp)
-                .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter(vec![
+                .mock_terminal_render_loop(MockTerminalConfig::with_delayed_events(vec![
                     key.clone(),
                     key,
                     TerminalEvent::Resize(80, 24),
-                ])))
+                ]))
                 .map(|canvas| canvas.to_string())
                 .collect(),
         );

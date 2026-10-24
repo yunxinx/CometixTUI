@@ -974,10 +974,10 @@ impl ComponentDrawer<'_> {
         {
             return false;
         }
-        // Baseline variant: `prev` here is the terminal diff baseline (the
-        // previous committed frame), so the copied rows stay unmarked and the
-        // diff writer can skip their cell scans. A layout pass blits from the
-        // frame's first pass instead and damages its whole canvas.
+        // The source is the preceding render. If it has not been painted, the
+        // render loop carries its dirty rows into this canvas before diffing.
+        // A layout pass blits from the frame's first pass instead and damages
+        // its whole canvas.
         self.context
             .canvas
             .blit_region_from_baseline(prev, x, y, width, height);
@@ -1821,9 +1821,7 @@ impl<'a> Tree<'a> {
         self.overlays = std::mem::take(&mut output.overlays);
         output.did_clear_terminal_output |= first.did_clear_terminal_output;
         output.alternate_screen_changed |= first.alternate_screen_changed;
-        if first.canvas.should_force_full_repaint() {
-            output.canvas.force_full_repaint();
-        }
+        output.canvas.inherit_unpainted_changes(&first.canvas);
         // The second pass copies retained subtrees from the first pass's canvas, which the
         // terminal never saw: the whole frame is diffed against the one it did.
         let (width, height) = (output.canvas.width(), output.canvas.height());
@@ -2241,6 +2239,7 @@ impl<'a> Tree<'a> {
     ) -> io::Result<()> {
         term.start_event_stream()?;
         let mut prev_canvas: Option<Canvas> = None;
+        let mut unpainted_canvas: Option<Canvas> = None;
         // The last inline frame, held while a dynamic alternate screen is shown.
         let mut main_screen_canvas: Option<Canvas> = None;
         let mut prev_terminal_size: Option<(u16, u16)> = None;
@@ -2252,8 +2251,8 @@ impl<'a> Tree<'a> {
             // has been stable for `RESIZE_SETTLE`, polling the component tree the
             // whole time like the frame throttle. Nothing is painted meanwhile, so
             // no intermediate frame can observe the new size and reset early.
-            // Input still ends the wait: each input event is painted before the
-            // next one is dispatched, and a later resize settles again.
+            // Input still ends the wait: each event is reconciled before the next
+            // is dispatched, ready input shares one paint, and later resizes settle again.
             if term.take_resized() {
                 let mut deadline = std::time::Instant::now() + RESIZE_SETTLE;
                 let mut resumed_during_settle = false;
@@ -2275,6 +2274,7 @@ impl<'a> Tree<'a> {
                     if term.take_resumed() {
                         term.reinitialize_after_resume()?;
                         prev_canvas = None;
+                        unpainted_canvas = None;
                         prev_terminal_size = None;
                         resumed_during_settle = true;
                         break;
@@ -2309,6 +2309,7 @@ impl<'a> Tree<'a> {
             if term.take_resumed() {
                 term.reinitialize_after_resume()?;
                 prev_canvas = None;
+                unpainted_canvas = None;
                 prev_terminal_size = None;
             }
             term.refresh_size();
@@ -2334,9 +2335,46 @@ impl<'a> Tree<'a> {
                     if terminal_size_changed {
                         None
                     } else {
-                        prev_canvas.as_ref()
+                        unpainted_canvas.as_ref().or(prev_canvas.as_ref())
                     },
                 );
+                if !terminal_size_changed
+                    && let Some(unpainted) = unpainted_canvas.as_ref()
+                {
+                    output.canvas.inherit_unpainted_changes(unpainted);
+                }
+                // Reconcile every ready input against the preceding render, but diff
+                // only the completed batch against the last canvas actually painted.
+                // Screen transitions and clears are paint boundaries: their terminal
+                // state must be committed before another event can change it again.
+                while prev_canvas.is_some()
+                    && !output.did_clear_terminal_output
+                    && !output.alternate_screen_changed
+                    && !self.system_context.should_exit()
+                    && !self.system_context.has_terminal_handoff()
+                    && !term.received_ctrl_c()
+                    && term.has_pending_input()
+                {
+                    term.wait().now_or_never()
+                        .expect("peeked input is ready to dispatch")?;
+                    let _ = term.take_input_dispatched();
+                    let _ = self.root_component.wait().now_or_never();
+                    term.resolve_pending_ctrl_c();
+                    let mut next = self.render(
+                        terminal_size.map(|(w, _)| w as usize),
+                        Some(&mut term),
+                        profile_enabled,
+                        Some(&output.canvas),
+                    );
+                    next.canvas.inherit_unpainted_changes(&output.canvas);
+                    next.phase_profile.update += output.phase_profile.update;
+                    next.phase_profile.layout += output.phase_profile.layout;
+                    next.phase_profile.draw += output.phase_profile.draw;
+                    next.phase_profile.layout_measures += output.phase_profile.layout_measures;
+                    next.phase_profile.canvas_alloc += output.phase_profile.canvas_alloc;
+                    next.phase_profile.settle_rounds += output.phase_profile.settle_rounds;
+                    output = next;
+                }
                 term.set_scrollback_replay(self.system_context.scrollback_replay());
                 let terminal_diff_planning = term.canvas_diff_planning();
                 let (should_repaint, repaint_reason, changed_cells, diff_rows_scanned) =
@@ -2471,10 +2509,17 @@ impl<'a> Tree<'a> {
                 // Canvas equality ignores damage so this does not wake idle
                 // renders by itself.
                 let canvas_swap_start = profile_enabled.then(std::time::Instant::now);
-                prev_canvas = Some(output.canvas);
+                if should_repaint {
+                    prev_canvas = Some(output.canvas);
+                    unpainted_canvas = None;
+                } else {
+                    // Retained layout and hit-testing follow every render, while
+                    // terminal diffs retain the last frame actually written.
+                    unpainted_canvas = Some(output.canvas);
+                }
                 frame_phases.canvas_swap =
                     canvas_swap_start.map_or(Duration::ZERO, |start| start.elapsed());
-                if let Some(canvas) = prev_canvas.as_ref() {
+                if let Some(canvas) = unpainted_canvas.as_ref().or(prev_canvas.as_ref()) {
                     let snapshot_start = profile_enabled.then(std::time::Instant::now);
                     term.set_event_cell_snapshot(canvas);
                     frame_phases.event_snapshot =
@@ -2516,6 +2561,7 @@ impl<'a> Tree<'a> {
                 }
                 term.reacquire_terminal()?;
                 prev_canvas = None;
+                unpainted_canvas = None;
                 prev_terminal_size = None;
                 continue;
             }
@@ -2537,6 +2583,7 @@ impl<'a> Tree<'a> {
             if term.take_resumed() {
                 term.reinitialize_after_resume()?;
                 prev_canvas = None;
+                unpainted_canvas = None;
                 prev_terminal_size = None;
                 continue;
             }
@@ -2582,6 +2629,7 @@ impl<'a> Tree<'a> {
                         if term.take_resumed() {
                             term.reinitialize_after_resume()?;
                             prev_canvas = None;
+                            unpainted_canvas = None;
                             prev_terminal_size = None;
                             resumed_during_throttle = true;
                         }

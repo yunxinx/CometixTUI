@@ -2781,12 +2781,23 @@ impl CanvasPackedScreen {
             return Ok(());
         }
 
+        let background_tail = super::ansi::background_tail(self.width, |x| {
+            let view = pools.cell_view(self.cell(x, y)?);
+            if view.width != CanvasPackedCellWidth::Normal
+                || view.character != " "
+                || view.hyperlink.is_some()
+            {
+                return None;
+            }
+            view.style.unwrap_or_default().erase_background()
+        });
+        let row_end = background_tail.map_or(self.width, |(start, _)| start);
         let mut current_style = CanvasResolvedStyle::default();
         let mut current_style_id = 0u32;
         let mut current_hyperlink: Option<&str> = None;
         let mut last_rendered_style_id = None;
         let mut cursor_x = start_col;
-        for x in start_col..self.width {
+        for x in start_col..row_end {
             let Some(cell) = self.visible_cell(pools, x, y, last_rendered_style_id) else {
                 continue;
             };
@@ -2823,7 +2834,7 @@ impl CanvasPackedScreen {
             }
 
             if cell_width == 2
-                && packed_grapheme_needs_width_compensation(view.character)
+                && grapheme_width_varies_by_terminal(view.character)
                 && x + 1 < self.width
             {
                 write!(
@@ -2836,6 +2847,9 @@ impl CanvasPackedScreen {
                 )?;
             } else {
                 w.write_all(view.character.as_bytes())?;
+                if grapheme_width_varies_by_terminal(view.character) {
+                    write!(w, "\x1b[{}G", x + cell_width + 1)?;
+                }
             }
             cursor_x = x.saturating_add(cell_width);
             last_rendered_style_id = Some(view.style_id);
@@ -2850,7 +2864,13 @@ impl CanvasPackedScreen {
         } else if current_style_id != 0 {
             sgr_reset(&mut w)?;
         }
-        erase_to_eol(&mut w)?;
+        if let Some((start, color)) = background_tail {
+            write_cursor_forward(&mut w, start.saturating_sub(cursor_x))?;
+            sgr_bg(&mut w, color)?;
+            erase_to_eol(&mut w)?;
+        } else {
+            erase_to_eol(&mut w)?;
+        }
         // Level 0's zero-SGR contract: the erase itself is layout, but the
         // trailing reset is styling and must not leak.
         if crate::ansi::styles_enabled() {
@@ -2878,15 +2898,6 @@ fn write_cursor_forward(w: &mut impl Write, cols: usize) -> io::Result<()> {
         return Ok(());
     }
     write!(w, "\x1b[{cols}C")
-}
-
-fn packed_grapheme_needs_width_compensation(value: &str) -> bool {
-    let Some(cp) = value.chars().next().map(|ch| ch as u32) else {
-        return false;
-    };
-    (0x1fa70..=0x1faff).contains(&cp)
-        || (0x1fb00..=0x1fbff).contains(&cp)
-        || (value.len() >= 2 && value.contains('\u{fe0f}'))
 }
 
 impl CanvasPackedOutputClip {

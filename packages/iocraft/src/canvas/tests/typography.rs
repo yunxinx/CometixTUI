@@ -5,10 +5,18 @@ use crossterm::csi;
 
 #[test]
 fn test_grapheme_width() {
+    assert_eq!(grapheme_width("\u{1f1fa}"), 2);
+    assert_eq!(grapheme_width("5\u{fe0f}"), 2);
+    assert_eq!(grapheme_width("\u{1f1fa}\u{1f1f3}"), 2);
+    assert_eq!(grapheme_width("5\u{fe0f}\u{20e3}"), 2);
+    assert_eq!(
+        grapheme_width("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"),
+        2
+    );
     assert_eq!(grapheme_width("a"), 1);
     assert_eq!(grapheme_width("中"), 2);
     assert_eq!(grapheme_width("☀\u{fe0f}"), 2); // sun + VS16
-    assert_eq!(grapheme_width("1\u{fe0f}"), 1); // incomplete keycap + VS16
+    assert_eq!(grapheme_width("1\u{fe0f}"), 2); // incomplete keycap + VS16
     assert_eq!(grapheme_width("1\u{fe0f}\u{20e3}"), 2); // complete keycap
     assert_eq!(grapheme_width("e\u{0301}"), 1); // e + combining acute accent
     assert_eq!(grapheme_width("\u{0301}"), 0); // combining acute accent
@@ -27,7 +35,7 @@ fn test_string_display_width() {
     assert_eq!(string_display_width("a\x08b\x07c"), 3);
     assert_eq!(string_display_width("\x1b[31mred\x1b[0m"), 3);
     assert_eq!(string_display_width("a\x1b]0;title\x07b"), 2);
-    assert_eq!(string_display_width("1\u{fe0f}"), 1);
+    assert_eq!(string_display_width("1\u{fe0f}"), 2);
     assert_eq!(string_display_width("a\u{7f}b\u{80}c"), 3);
     assert_eq!(string_display_width("a\u{0600}b\u{06dd}c"), 3);
 }

@@ -145,6 +145,18 @@ impl CanvasResolvedStyle {
         }
     }
 
+    pub(super) fn erase_background(self) -> Option<Color> {
+        if self.text.underline
+            || self.text.strikethrough
+            || self.text.invert
+            || self.text.overline
+            || self.text.blink
+        {
+            return None;
+        }
+        self.background_color.filter(|color| *color != Color::Reset)
+    }
+
     /// Returns whether this style has a visible effect on a space cell.
     ///
     /// CC Ink encodes this as bit 0 of packed `StylePool` IDs so sparse row

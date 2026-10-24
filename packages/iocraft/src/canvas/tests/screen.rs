@@ -160,23 +160,23 @@ fn test_canvas_full_background_color() {
 
     let mut expected = Vec::new();
 
-    // line 1: all 6 cells are emitted with the background. The row is
-    // already full width, so no EL is needed at the right margin.
+    // A background-only suffix is cleared with EL instead of writing spaces
+    // into the terminal's right margin.
     write!(expected, csi!("0m")).unwrap();
     write!(expected, csi!("101m")).unwrap();
-    write!(expected, "      ").unwrap();
+    write!(expected, csi!("K")).unwrap();
     write!(expected, csi!("0m")).unwrap();
     write!(expected, "\r\n").unwrap();
 
     // line 2
     write!(expected, csi!("101m")).unwrap();
-    write!(expected, "      ").unwrap();
+    write!(expected, csi!("K")).unwrap();
     write!(expected, csi!("0m")).unwrap();
     write!(expected, "\r\n").unwrap();
 
     // line 3
     write!(expected, csi!("101m")).unwrap();
-    write!(expected, "      ").unwrap();
+    write!(expected, csi!("K")).unwrap();
     write!(expected, csi!("0m")).unwrap();
     write!(expected, "\r\n").unwrap();
 

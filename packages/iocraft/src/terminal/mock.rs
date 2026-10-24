@@ -54,6 +54,17 @@ impl MockTerminalConfig {
         }
     }
 
+    /// Delays each event so tests that inspect painted frames keep distinct input batches.
+    #[cfg(test)]
+    pub(crate) fn with_delayed_events(
+        events: impl IntoIterator<Item = TerminalEvent, IntoIter: Send + 'static>,
+    ) -> Self {
+        Self::with_events(stream::iter(events).then(|event| async move {
+            Delay::new(Duration::from_millis(50)).await;
+            event
+        }))
+    }
+
     /// Forwards every `set_title` call to `sink` so tests can assert on
     /// title write frequency without a byte-level writer.
     #[cfg(test)]
