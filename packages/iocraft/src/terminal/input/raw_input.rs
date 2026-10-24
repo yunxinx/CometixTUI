@@ -72,27 +72,29 @@ impl Default for TerminalRawInputModeOptions {
 /// backend: optional cursor hide, keyboard enhancement push, mouse capture,
 /// focus reporting, and bracketed paste. It intentionally does not call
 /// `enable_raw_mode()` and does not start reading stdin.
+/// Commands are serialized as ANSI on every platform; the caller's input backend
+/// owns the corresponding terminal capabilities and OS console modes.
 pub fn write_terminal_raw_input_mode_enter(
     writer: &mut (impl Write + ?Sized),
     options: TerminalRawInputModeOptions,
 ) -> io::Result<()> {
     if options.hide_cursor {
-        writer.queue(cursor::Hide)?;
+        write_ansi_command(writer, cursor::Hide)?;
     }
     if let Some(flags) = options.keyboard_enhancement_flags {
-        writer.queue(event::PushKeyboardEnhancementFlags(flags))?;
+        write_ansi_command(writer, event::PushKeyboardEnhancementFlags(flags))?;
     }
     if options.xterm_modify_other_keys {
         writer.write_all(TERMINAL_MODIFY_OTHER_KEYS_ENABLE.as_bytes())?;
     }
     if options.mouse_capture {
-        writer.queue(event::EnableMouseCapture)?;
+        write_ansi_command(writer, event::EnableMouseCapture)?;
     }
     if options.focus_events {
-        writer.queue(event::EnableFocusChange)?;
+        write_ansi_command(writer, event::EnableFocusChange)?;
     }
     if options.bracketed_paste {
-        writer.queue(event::EnableBracketedPaste)?;
+        write_ansi_command(writer, event::EnableBracketedPaste)?;
     }
     Ok(())
 }
@@ -107,22 +109,22 @@ pub fn write_terminal_raw_input_mode_exit(
     options: TerminalRawInputModeOptions,
 ) -> io::Result<()> {
     if options.bracketed_paste {
-        writer.queue(event::DisableBracketedPaste)?;
+        write_ansi_command(writer, event::DisableBracketedPaste)?;
     }
     if options.focus_events {
-        writer.queue(event::DisableFocusChange)?;
+        write_ansi_command(writer, event::DisableFocusChange)?;
     }
     if options.mouse_capture {
-        writer.queue(event::DisableMouseCapture)?;
+        write_ansi_command(writer, event::DisableMouseCapture)?;
     }
     if options.xterm_modify_other_keys {
         writer.write_all(TERMINAL_MODIFY_OTHER_KEYS_DISABLE.as_bytes())?;
     }
     if options.keyboard_enhancement_flags.is_some() {
-        writer.queue(event::PopKeyboardEnhancementFlags)?;
+        write_ansi_command(writer, event::PopKeyboardEnhancementFlags)?;
     }
     if options.hide_cursor {
-        writer.queue(cursor::Show)?;
+        write_ansi_command(writer, cursor::Show)?;
     }
     Ok(())
 }

@@ -38,6 +38,7 @@ const STDIN_RESUME_GAP: Duration = Duration::from_secs(5);
 
 mod backend;
 mod capability;
+mod command;
 mod events;
 mod fullscreen;
 mod input;
@@ -59,6 +60,7 @@ use capability::{
     is_synchronized_output_supported_with_env, is_xterm_js_with_env_and_xtversion,
     osc_color_query_sequence_with_env, supports_extended_keys_with_env,
 };
+use command::{TerminalWriter, write_ansi_command};
 pub use events::*;
 use events::{EventCellSnapshot, TerminalEventsShared};
 pub use fullscreen::*;

@@ -55,21 +55,7 @@ pub(super) trait TerminalImpl: Write + Send {
     /// - Elsewhere, OSC 0 is written directly with the shared Kitty ST / BEL
     ///   terminator policy and flushed immediately, since a title-only write
     ///   is not followed by a frame flush when the canvas is unchanged.
-    fn set_title(&mut self, title: &str) -> io::Result<()> {
-        #[cfg(windows)]
-        {
-            let clean = crate::ansi::sanitize_terminal_title(title);
-            self.dest().execute(terminal::SetTitle(clean))?;
-            Ok(())
-        }
-        #[cfg(not(windows))]
-        {
-            let sequence = crate::ansi::terminal_title_sequence(title);
-            let dest = self.dest();
-            dest.write_all(sequence.as_bytes())?;
-            dest.flush()
-        }
-    }
+    fn set_title(&mut self, title: &str) -> io::Result<()>;
 
     /// Writes a raw non-visual control sequence to the render output.
     ///
@@ -286,7 +272,7 @@ impl Drop for ResumeSignalListener {
 }
 
 pub(super) fn clear_canvas_inline(
-    dest: &mut (impl Write + ?Sized),
+    dest: &mut TerminalWriter<'_>,
     prev_canvas_height: u16,
 ) -> io::Result<()> {
     let lines_to_rewind = prev_canvas_height - 1;
@@ -412,7 +398,7 @@ pub(super) struct SavedMainScreen {
 
 pub(super) struct StdTerminal<'a> {
     pub(super) input_is_terminal: bool,
-    pub(super) dest: Box<dyn Write + Send + 'a>,
+    pub(super) dest: TerminalWriter<'a>,
     pub(super) alt: Box<dyn Write + Send + 'a>,
     pub(super) fullscreen: bool,
     pub(super) mouse_capture: bool,
@@ -474,6 +460,22 @@ impl Write for StdTerminal<'_> {
 }
 
 impl TerminalImpl for StdTerminal<'_> {
+    fn set_title(&mut self, title: &str) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            let clean = crate::ansi::sanitize_terminal_title(title);
+            self.dest.execute(terminal::SetTitle(clean))?;
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            let sequence = crate::ansi::terminal_title_sequence(title);
+            let dest = self.dest();
+            dest.write_all(sequence.as_bytes())?;
+            dest.flush()
+        }
+    }
+
     fn refresh_size(&mut self) {
         self.size = terminal::size().ok()
     }
@@ -816,7 +818,7 @@ impl TerminalImpl for StdTerminal<'_> {
             return Ok(());
         }
 
-        clear_canvas_inline(&mut *self.dest, self.prev_canvas_height)
+        clear_canvas_inline(&mut self.dest, self.prev_canvas_height)
     }
 
     fn clear_screen(&mut self) -> io::Result<()> {
@@ -1223,7 +1225,7 @@ impl<'a> StdTerminal<'a> {
             && supports_extended_keys()
             && terminal::supports_keyboard_enhancement().unwrap_or(false);
         let mut term = Self {
-            dest,
+            dest: TerminalWriter::new(dest),
             alt,
             input_is_terminal,
             fullscreen,

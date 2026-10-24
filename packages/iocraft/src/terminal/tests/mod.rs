@@ -1,6 +1,5 @@
 use super::*;
 use crate::prelude::*;
-use crossterm::QueueableCommand;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -444,6 +443,10 @@ impl Write for ResizeReassertTerminal {
 }
 
 impl TerminalImpl for ResizeReassertTerminal {
+    fn set_title(&mut self, _title: &str) -> io::Result<()> {
+        Ok(())
+    }
+
     fn size(&self) -> Option<(u16, u16)> {
         self.size
     }
@@ -522,11 +525,16 @@ fn render_canvas_to_vt(canvas: &Canvas, cols: usize, rows: usize) -> avt::Vt {
 
 fn render_canvases_to_vt(canvases: &[&Canvas], cols: usize, rows: usize) -> avt::Vt {
     let mut buf = Vec::new();
-    for (i, canvas) in canvases.iter().enumerate() {
-        if i > 0 {
-            super::clear_canvas_inline(&mut buf, canvases[i - 1].height() as _).unwrap();
+    {
+        let mut writer = TerminalWriter::ansi(Box::new(&mut buf));
+        for (i, canvas) in canvases.iter().enumerate() {
+            if i > 0 {
+                super::clear_canvas_inline(&mut writer, canvases[i - 1].height() as _).unwrap();
+            }
+            canvas
+                .write_ansi_without_final_newline(&mut *writer)
+                .unwrap();
         }
-        canvas.write_ansi_without_final_newline(&mut buf).unwrap();
     }
     let mut vt = avt::Vt::new(cols, rows);
     vt.feed_str(&String::from_utf8(buf).unwrap());
@@ -921,7 +929,7 @@ fn test_fullscreen_clear_preserves_output_above() {
     write!(setup, "log\r\n").unwrap();
     canvas.write_ansi_without_final_newline(&mut setup).unwrap();
     write!(setup, "\r\ntail").unwrap();
-    setup.queue(cursor::MoveTo(0, 0)).unwrap();
+    write_ansi_command(&mut setup, cursor::MoveTo(0, 0)).unwrap();
     setup.extend_from_slice(&clear_buf.lock().unwrap());
 
     let mut vt = avt::Vt::new(10, 5);
@@ -940,7 +948,7 @@ fn new_fullscreen_term(
 ) -> StdTerminal<'static> {
     StdTerminal {
         input_is_terminal: false,
-        dest: Box::new(dest),
+        dest: TerminalWriter::ansi(Box::new(dest)),
         alt: Box::new(io::sink()),
         fullscreen: true,
         mouse_capture: false,
@@ -976,7 +984,7 @@ fn new_inline_term_with_size(
 ) -> StdTerminal<'static> {
     StdTerminal {
         input_is_terminal: false,
-        dest: Box::new(dest),
+        dest: TerminalWriter::ansi(Box::new(dest)),
         alt: Box::new(io::sink()),
         fullscreen: false,
         mouse_capture: false,
@@ -1022,8 +1030,8 @@ fn inline_diff_vt(prev: &Canvas, next: &Canvas, term_size: (u16, u16)) -> (Vec<u
 fn assert_inline_full_reset(diff: &[u8], context: &str) {
     let diff = String::from_utf8_lossy(diff);
     assert!(
-        diff.contains("\x1b[2J\x1b[3J\x1b[H"),
-        "{context} should use the CC Ink full reset sequence: {diff:?}"
+        diff.contains(clear_terminal_sequence()),
+        "{context} should use the host terminal's full reset sequence: {diff:?}"
     );
     assert!(
         !diff.contains("\x1b[?1049h") && !diff.contains("\x1b[?1049l"),
@@ -1197,12 +1205,8 @@ fn test_clear_terminal_full_resets_inline_state() {
         "full terminal clear should erase visible screen: {output:?}"
     );
     assert!(
-        output.contains("\x1b[3J"),
-        "full terminal clear should purge scrollback: {output:?}"
-    );
-    assert!(
-        output.ends_with("\x1b[2J\x1b[3J\x1b[H"),
-        "full terminal clear should use the CC Ink modern clear sequence: {output:?}"
+        output.ends_with(clear_terminal_sequence()),
+        "full terminal clear should use the host terminal's reset sequence: {output:?}"
     );
     assert!(
         !output.contains("\x1b[?1049h") && !output.contains("\x1b[?1049l"),
@@ -1950,6 +1954,20 @@ fn test_terminal_raw_input_mode_sequences_are_opt_in_and_reversible() {
         exit.contains("\x1b[?25h"),
         "exit should show cursor: {exit:?}"
     );
+
+    let mouse_options = TerminalRawInputModeOptions {
+        mouse_capture: true,
+        ..options
+    };
+    let mut enter = Vec::new();
+    write_terminal_raw_input_mode_enter(&mut enter, mouse_options).unwrap();
+    let enter = String::from_utf8(enter).unwrap();
+    assert!(enter.contains("\x1b[?1006h"), "{enter:?}");
+
+    let mut exit = Vec::new();
+    write_terminal_raw_input_mode_exit(&mut exit, mouse_options).unwrap();
+    let exit = String::from_utf8(exit).unwrap();
+    assert!(exit.contains("\x1b[?1006l"), "{exit:?}");
 }
 
 #[test]
@@ -3525,6 +3543,10 @@ impl Write for ScriptedTerminal {
 }
 
 impl TerminalImpl for ScriptedTerminal {
+    fn set_title(&mut self, title: &str) -> io::Result<()> {
+        self.inner.set_title(title)
+    }
+
     fn size(&self) -> Option<(u16, u16)> {
         self.inner.size()
     }
@@ -4348,8 +4370,8 @@ fn test_inline_width_resize_replays_scrollback_between_purge_and_canvas() {
 
     let diff = String::from_utf8_lossy(&diff_buf.lock().unwrap()).to_string();
     let purge = diff
-        .find("\x1b[2J\x1b[3J\x1b[H")
-        .expect("width change purges");
+        .find(clear_terminal_sequence())
+        .expect("width change resets the terminal");
     let history = diff
         .find("old@10")
         .expect("history replays at the new width");
