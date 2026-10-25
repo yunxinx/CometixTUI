@@ -1628,13 +1628,13 @@ impl Canvas {
     /// coordinates are clamped silently.
     pub fn get_text(&self, x: usize, y: usize, w: usize, h: usize) -> String {
         let mut lines = Vec::with_capacity(h);
-        for row_idx in y..y + h {
-            let Some(row) = self.cells.get(row_idx) else {
+        for offset in 0..h {
+            let Some(row) = y.checked_add(offset).and_then(|row| self.cells.get(row)) else {
                 lines.push(String::new());
                 continue;
             };
             let start = x.min(row.len());
-            let end = (x + w).min(row.len());
+            let end = x.saturating_add(w).min(row.len());
             let slice = &row[start..end];
             let last_non_empty = slice.iter().rposition(|cell| cell.character.is_some());
             let trim_end = match last_non_empty {
@@ -1658,6 +1658,7 @@ impl Canvas {
                     None => s.push(' '),
                 }
             }
+            s.truncate(s.trim_end().len());
             lines.push(s);
         }
         lines.join(

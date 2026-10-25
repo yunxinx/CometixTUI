@@ -1,7 +1,7 @@
 use super::*;
 
 /// Represents a writeable region of a [`Canvas`]. All coordinates provided to functions of this
-/// type are relative to the subview origin and clipped to its bounds.
+/// type are relative to the subview origin and clipped to the subview and canvas bounds.
 pub struct CanvasSubviewMut<'a> {
     pub(super) x: isize,
     pub(super) y: isize,
@@ -12,86 +12,83 @@ pub struct CanvasSubviewMut<'a> {
     pub(super) canvas: &'a mut Canvas,
 }
 
+// Absolute, half-open bounds. Keep arithmetic widened until intersection is complete.
+struct ClipBounds {
+    left: i128,
+    top: i128,
+    right: i128,
+    bottom: i128,
+}
+
 impl CanvasSubviewMut<'_> {
+    // A clip can extend beyond isize even though its intersection fits on the canvas.
+    fn clip_bounds(&self) -> ClipBounds {
+        let width = self.canvas.width() as i128;
+        let height = self.canvas.height() as i128;
+        let left = (self.clip_x as i128).clamp(0, width);
+        let top = (self.clip_y as i128).clamp(0, height);
+        ClipBounds {
+            left,
+            top,
+            right: (self.clip_x as i128 + self.clip_width as i128).clamp(left, width),
+            bottom: (self.clip_y as i128 + self.clip_height as i128).clamp(top, height),
+        }
+    }
+
+    // Translate a relative rectangle and intersect it before narrowing to canvas coordinates.
+    fn clipped_rect(&self, x: isize, y: isize, w: usize, h: usize) -> (usize, usize, usize, usize) {
+        let clip = self.clip_bounds();
+        let left = self.x as i128 + x as i128;
+        let top = self.y as i128 + y as i128;
+        let start_x = left.clamp(clip.left, clip.right);
+        let start_y = top.clamp(clip.top, clip.bottom);
+        let end_x = (left + w as i128).clamp(start_x, clip.right);
+        let end_y = (top + h as i128).clamp(start_y, clip.bottom);
+        (
+            start_x as usize,
+            start_y as usize,
+            (end_x - start_x) as usize,
+            (end_y - start_y) as usize,
+        )
+    }
+
+    fn clipped_point(&self, x: isize, y: isize) -> Option<(usize, usize)> {
+        let (x, y, w, h) = self.clipped_rect(x, y, 1, 1);
+        (w > 0 && h > 0).then_some((x, y))
+    }
+
     /// Returns a reference to a cell at the given **relative** subview position.
     ///
     /// Returns `None` if the resulting absolute position is out of bounds or
     /// outside the clip region.
     pub fn cell(&self, x: isize, y: isize) -> Option<&CanvasCell> {
-        let abs_x = self.x + x;
-        let abs_y = self.y + y;
-        if abs_x < self.clip_x
-            || abs_y < self.clip_y
-            || abs_x < 0
-            || abs_y < 0
-            || abs_x >= self.clip_x + self.clip_width as isize
-            || abs_y >= self.clip_y + self.clip_height as isize
-        {
-            return None;
-        }
-        self.canvas.cell(abs_x as usize, abs_y as usize)
+        let (x, y) = self.clipped_point(x, y)?;
+        self.canvas.cell(x, y)
     }
 
     /// Extracts plain text from a rectangular region using **relative** subview
-    /// coordinates. The region is clamped to the clip bounds.
+    /// coordinates. The region is clipped to both the clip bounds and the canvas bounds.
     pub fn get_text(&self, x: isize, y: isize, w: usize, h: usize) -> String {
-        let mut left = self.x + x;
-        let mut top = self.y + y;
-        let mut right = left + w as isize;
-        let mut bottom = top + h as isize;
-
-        left = left.max(self.clip_x).max(0);
-        top = top.max(self.clip_y).max(0);
-        right = right.min(self.clip_x + self.clip_width as isize).max(0);
-        bottom = bottom.min(self.clip_y + self.clip_height as isize).max(0);
-
-        self.canvas.get_text(
-            left as _,
-            top as _,
-            (right - left).max(0) as _,
-            (bottom - top).max(0) as _,
-        )
+        let (x, y, w, h) = self.clipped_rect(x, y, w, h);
+        self.canvas.get_text(x, y, w, h)
     }
 
     /// Fills the region with the given color.
     pub fn set_background_color(&mut self, x: isize, y: isize, w: usize, h: usize, color: Color) {
-        let mut left = self.x + x;
-        let mut top = self.y + y;
-        let mut right = left + w as isize;
-        let mut bottom = top + h as isize;
-
-        left = left.max(self.clip_x).max(0);
-        top = top.max(self.clip_y).max(0);
-        right = right.min(self.clip_x + self.clip_width as isize).max(0);
-        bottom = bottom.min(self.clip_y + self.clip_height as isize).max(0);
-
-        self.canvas.set_background_color(
-            left as _,
-            top as _,
-            (right - left).max(0) as _,
-            (bottom - top).max(0) as _,
-            color,
-        );
+        let (x, y, w, h) = self.clipped_rect(x, y, w, h);
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.canvas.set_background_color(x, y, w, h, color);
     }
 
     /// Removes text from the region without touching overlay/damage metadata.
     pub fn clear_text(&mut self, x: isize, y: isize, w: usize, h: usize) {
-        let mut left = self.x + x;
-        let mut top = self.y + y;
-        let mut right = left + w as isize;
-        let mut bottom = top + h as isize;
-
-        left = left.max(self.clip_x).max(0);
-        top = top.max(self.clip_y).max(0);
-        right = right.min(self.clip_x + self.clip_width as isize).max(0);
-        bottom = bottom.min(self.clip_y + self.clip_height as isize).max(0);
-
-        self.canvas.clear_text(
-            left as _,
-            top as _,
-            (right - left).max(0) as _,
-            (bottom - top).max(0) as _,
-        );
+        let (x, y, w, h) = self.clipped_rect(x, y, w, h);
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.canvas.clear_text(x, y, w, h);
     }
 
     /// Clears cells/styles/hyperlinks/overlays in this subview and marks the
@@ -102,56 +99,35 @@ impl CanvasSubviewMut<'_> {
     /// relative to the subview and clipped to its clip rect before wide-glyph
     /// boundary repair and damage calculation are delegated to the root canvas.
     pub fn clear_region(&mut self, x: isize, y: isize, w: usize, h: usize) {
-        let mut left = self.x + x;
-        let mut top = self.y + y;
-        let mut right = left + w as isize;
-        let mut bottom = top + h as isize;
-
-        left = left.max(self.clip_x).max(0);
-        top = top.max(self.clip_y).max(0);
-        right = right.min(self.clip_x + self.clip_width as isize).max(0);
-        bottom = bottom.min(self.clip_y + self.clip_height as isize).max(0);
-
-        self.canvas.clear_region(
-            left as _,
-            top as _,
-            (right - left).max(0) as _,
-            (bottom - top).max(0) as _,
-        );
+        let (x, y, w, h) = self.clipped_rect(x, y, w, h);
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.canvas.clear_region(x, y, w, h);
     }
 
     /// Marks a rectangular region as excluded from fullscreen text selection.
     /// Coordinates are relative to the subview and clipped to the subview's clip bounds.
     pub fn mark_no_select_region(&mut self, x: isize, y: isize, w: usize, h: usize) {
-        let mut left = self.x + x;
-        let mut top = self.y + y;
-        let mut right = left + w as isize;
-        let mut bottom = top + h as isize;
-
-        left = left.max(self.clip_x).max(0);
-        top = top.max(self.clip_y).max(0);
-        right = right.min(self.clip_x + self.clip_width as isize).max(0);
-        bottom = bottom.min(self.clip_y + self.clip_height as isize).max(0);
-
-        self.canvas.mark_no_select_region(
-            left as _,
-            top as _,
-            (right - left).max(0) as _,
-            (bottom - top).max(0) as _,
-        );
+        let (x, y, w, h) = self.clipped_rect(x, y, w, h);
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.canvas.mark_no_select_region(x, y, w, h);
     }
 
     /// Marks a relative row as a soft-wrap continuation of the previous row.
     /// `prev_content_end` is relative to this subview and is translated to an
-    /// absolute canvas column before being stored.
+    /// absolute canvas column and clamped to the canvas width before being stored.
     pub fn mark_soft_wrap_continuation(&mut self, y: isize, prev_content_end: usize) {
-        let abs_y = self.y + y;
-        if abs_y < self.clip_y || abs_y < 0 || abs_y >= self.clip_y + self.clip_height as isize {
+        let (_, y, _, h) = self.clipped_rect(0, y, 0, 1);
+        if h == 0 {
             return;
         }
-        let abs_prev_content_end = (self.x + prev_content_end as isize).max(0) as usize;
+        let abs_prev_content_end = (self.x as i128 + prev_content_end as i128)
+            .clamp(0, self.canvas.width() as i128) as usize;
         self.canvas
-            .mark_soft_wrap_continuation(abs_y as usize, abs_prev_content_end);
+            .mark_soft_wrap_continuation(y, abs_prev_content_end);
     }
 
     /// Copies a rectangular region from `src` into this subview.
@@ -212,52 +188,24 @@ impl CanvasSubviewMut<'_> {
             return;
         }
 
-        let mut src_left = src_x as isize;
-        let mut src_top = src_y as isize;
-        let mut dst_left = self.x + dst_x;
-        let mut dst_top = self.y + dst_y;
-        let mut copy_width = width as isize;
-        let mut copy_height = height as isize;
-
-        let clip_left = self.clip_x.max(0);
-        let clip_top = self.clip_y.max(0);
-        let clip_right = (self.clip_x + self.clip_width as isize)
-            .min(self.canvas.width() as isize)
-            .max(0);
-        let clip_bottom = (self.clip_y + self.clip_height as isize)
-            .min(self.canvas.height() as isize)
-            .max(0);
-
-        if dst_left < clip_left {
-            let delta = clip_left - dst_left;
-            dst_left += delta;
-            src_left += delta;
-            copy_width -= delta;
-        }
-        if dst_top < clip_top {
-            let delta = clip_top - dst_top;
-            dst_top += delta;
-            src_top += delta;
-            copy_height -= delta;
-        }
-
-        copy_width = copy_width
-            .min(clip_right - dst_left)
-            .min(src.width() as isize - src_left);
-        copy_height = copy_height
-            .min(clip_bottom - dst_top)
-            .min(src.height() as isize - src_top);
-
-        if copy_width <= 0 || copy_height <= 0 {
+        let (dst_left, dst_top, copy_width, copy_height) =
+            self.clipped_rect(dst_x, dst_y, width, height);
+        if copy_width == 0 || copy_height == 0 {
             return;
         }
+        // Clipping moves the destination right/down; move the source by the same amount.
+        let shifted_source = |src: usize, dst: usize, origin: i128| {
+            usize::try_from(src as i128 + (dst as i128 - origin)).unwrap_or(usize::MAX)
+        };
+        let src_left = shifted_source(src_x, dst_left, self.x as i128 + dst_x as i128);
+        let src_top = shifted_source(src_y, dst_top, self.y as i128 + dst_y as i128);
+        let copy_width = copy_width.min(src.width().saturating_sub(src_left));
+        let copy_height = copy_height.min(src.height().saturating_sub(src_top));
+        if copy_width == 0 || copy_height == 0 {
+            return;
+        }
+        let clip_right = self.clip_bounds().right as usize;
 
-        let src_left = src_left as usize;
-        let src_top = src_top as usize;
-        let dst_left = dst_left as usize;
-        let dst_top = dst_top as usize;
-        let copy_width = copy_width as usize;
-        let copy_height = copy_height as usize;
         // Subview blits copy from arbitrary sources (e.g. ScrollBox moving
         // viewport content), so the destination rows genuinely change and are
         // always marked written — independent of the damage flag, which only
@@ -293,7 +241,7 @@ impl CanvasSubviewMut<'_> {
 
             if src_right < src.width()
                 && dst_right < self.canvas.width()
-                && (dst_right as isize) < clip_right
+                && dst_right < clip_right
                 && src.cells[src_row][src_right - 1].cell_width == CellWidth::Wide
             {
                 self.canvas.cells_row_mut(dst_row)[dst_right] = CanvasCell {
@@ -319,37 +267,19 @@ impl CanvasSubviewMut<'_> {
     /// Out-of-bounds or outside-clip positions are silently ignored.
     /// See [`Canvas::declare_cursor`].
     pub fn declare_cursor(&mut self, x: isize, y: isize, visible: bool) {
-        let abs_x = self.x + x;
-        let abs_y = self.y + y;
-        if abs_x < self.clip_x
-            || abs_y < self.clip_y
-            || abs_x < 0
-            || abs_y < 0
-            || abs_x >= self.clip_x + self.clip_width as isize
-            || abs_y >= self.clip_y + self.clip_height as isize
-        {
+        let Some((x, y)) = self.clipped_point(x, y) else {
             return;
-        }
-        self.canvas
-            .declare_cursor(abs_x as usize, abs_y as usize, visible);
+        };
+        self.canvas.declare_cursor(x, y, visible);
     }
 
     /// Sets a style overlay on a cell at the given **relative** subview position.
     /// Out-of-bounds or outside-clip positions are silently ignored.
     pub fn set_overlay(&mut self, x: isize, y: isize, overlay: StyleOverlay) {
-        let abs_x = self.x + x;
-        let abs_y = self.y + y;
-        if abs_x < self.clip_x
-            || abs_y < self.clip_y
-            || abs_x < 0
-            || abs_y < 0
-            || abs_x >= self.clip_x + self.clip_width as isize
-            || abs_y >= self.clip_y + self.clip_height as isize
-        {
+        let Some((x, y)) = self.clipped_point(x, y) else {
             return;
-        }
-        self.canvas
-            .set_overlay(abs_x as usize, abs_y as usize, overlay);
+        };
+        self.canvas.set_overlay(x, y, overlay);
     }
 
     /// Writes text to the region.
@@ -366,13 +296,23 @@ impl CanvasSubviewMut<'_> {
         style: CanvasTextStyle,
         hyperlink: Option<&str>,
     ) {
-        let x = self.x + x;
-        let min_x = self.clip_x.max(0);
-        let max_x = self.clip_x + self.clip_width as isize - 1;
-        let min_y = self.clip_y.max(0);
-        let max_y = (self.clip_y + self.clip_height as isize).min(self.canvas.height() as _) - 1;
-        for (y, line) in (self.y + y..).zip(text.lines()) {
-            if y >= min_y && y <= max_y {
+        let clip = self.clip_bounds();
+        // Text starting left of the clip may enter it; text starting right of it cannot.
+        let Ok(x) = isize::try_from(self.x as i128 + x as i128) else {
+            return;
+        };
+        if clip.left == clip.right || clip.top == clip.bottom || x as i128 >= clip.right {
+            return;
+        }
+        let min_x = clip.left as isize;
+        let max_x = (clip.right - 1) as isize;
+        let start_y = self.y as i128 + y as i128;
+        for (offset, line) in text.lines().enumerate() {
+            let y = start_y + offset as i128;
+            if y >= clip.bottom {
+                break;
+            }
+            if y >= clip.top {
                 self.canvas
                     .set_text_row_str_clipped(x, y as usize, min_x, max_x, line, style, hyperlink);
             }

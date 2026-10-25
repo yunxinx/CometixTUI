@@ -779,6 +779,187 @@ fn test_get_text_partial_row() {
 }
 
 #[test]
+fn test_extraction_trims_stored_whitespace_without_trimming_the_start() {
+    let mut canvas = Canvas::new(12, 2);
+    canvas.subview_mut(0, 0, 0, 0, 12, 2).set_text(
+        0,
+        0,
+        " a \u{2003}\n   ",
+        CanvasTextStyle::default(),
+    );
+    assert_eq!(canvas.get_text(0, 0, 12, 2), " a\n");
+}
+
+#[test]
+fn test_extreme_rectangles_clip_before_narrowing() {
+    let mut canvas = Canvas::new(2, 1);
+    assert_eq!(canvas.get_text(usize::MAX, 0, 1, 1), "");
+    assert_eq!(canvas.get_text(0, usize::MAX, 1, 2), "\n");
+    {
+        let mut view = canvas.subview_mut(0, 0, 0, 0, usize::MAX, usize::MAX);
+        view.set_text(0, 0, "ok", CanvasTextStyle::default());
+        view.set_background_color(0, 0, usize::MAX, usize::MAX, Color::Blue);
+        assert_eq!(view.get_text(0, 0, usize::MAX, 1), "ok");
+        assert_eq!(view.cell(1, 0).unwrap().background_color, Some(Color::Blue));
+        view.clear_text(isize::MAX, 0, usize::MAX, 1);
+        view.clear_region(isize::MAX, 0, usize::MAX, 1);
+        assert_eq!(view.get_text(0, 0, 2, 1), "ok");
+        assert_eq!(view.get_text(0, 0, 2, usize::MAX), "ok");
+    }
+    assert_eq!(
+        canvas.subview_mut(0, 0, 0, 0, 2, 5).get_text(0, 0, 2, 5),
+        "ok"
+    );
+    {
+        let mut negative = canvas.subview_mut(isize::MIN, 0, 0, 0, 2, 1);
+        negative.set_background_color(isize::MIN, 0, usize::MAX, 1, Color::Red);
+        negative.set_text(isize::MIN, 0, "bad", CanvasTextStyle::default());
+        negative.mark_no_select_region(isize::MIN, 0, usize::MAX, 1);
+    }
+    {
+        let mut positive = canvas.subview_mut(1, 1, 0, 0, 2, 1);
+        assert!(positive.cell(isize::MAX, 0).is_none());
+        assert!(positive.cell(0, isize::MAX).is_none());
+        positive.declare_cursor(isize::MAX, isize::MAX, true);
+        positive.set_overlay(isize::MAX, isize::MAX, StyleOverlay::inverse());
+        positive.set_text(isize::MAX, -1, "bad", CanvasTextStyle::default());
+        positive.set_text(-1, isize::MAX, "bad\nbad", CanvasTextStyle::default());
+    }
+    assert_eq!(canvas.get_text(0, 0, 2, 1), "ok");
+    assert_eq!(
+        canvas.cell(0, 0).unwrap().background_color,
+        Some(Color::Blue)
+    );
+    assert!(!canvas.is_no_select(0, 0));
+    assert!(!canvas.resolved_text_style(0, 0).unwrap().invert);
+    assert_eq!(canvas.cursor_declaration(), None);
+    assert_eq!(canvas.damage_region(), None);
+
+    // Full-size clips still admit text, links and cell/selection metadata.
+    {
+        let mut view = canvas.subview_mut(0, 0, 0, 0, usize::MAX, usize::MAX);
+        view.set_text_with_link(0, 0, "ok", CanvasTextStyle::default(), Some("https://x"));
+        view.set_overlay(1, 0, StyleOverlay::inverse());
+        view.declare_cursor(1, 0, true);
+        view.mark_no_select_region(1, 0, usize::MAX, usize::MAX);
+    }
+    assert_eq!(canvas.get_text(0, 0, 2, 1), "ok");
+    assert_eq!(canvas.hyperlink_at(1, 0).as_deref(), Some("https://x"));
+    assert!(canvas.resolved_text_style(1, 0).unwrap().invert);
+    assert!(!canvas.is_no_select(0, 0));
+    assert!(canvas.is_no_select(1, 0));
+    assert_eq!(
+        canvas.cursor_declaration(),
+        Some(CursorDeclaration {
+            x: 1,
+            y: 0,
+            visible: true
+        })
+    );
+    {
+        let mut view = canvas.subview_mut(0, 0, 0, 0, usize::MAX, usize::MAX);
+        view.clear_text(0, 0, usize::MAX, usize::MAX);
+        assert_eq!(view.get_text(0, 0, 2, 1), "");
+        view.set_text(0, 0, "ok", CanvasTextStyle::default());
+        view.clear_region(0, 0, usize::MAX, usize::MAX);
+    }
+    assert_eq!(canvas.get_text(0, 0, 2, 1), "");
+    assert_eq!(canvas.cell(1, 0).unwrap().background_color, None);
+    assert!(!canvas.resolved_text_style(1, 0).unwrap_or_default().invert);
+    assert_eq!(canvas.hyperlink_at(1, 0), None);
+    assert_eq!(
+        canvas.damage_region(),
+        Some(DamageRegion {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1
+        })
+    );
+
+    // A left-clipped string must retain the original column of each glyph.
+    canvas
+        .subview_mut(0, 0, 1, 0, usize::MAX, usize::MAX)
+        .set_text(-1, 0, "bad", CanvasTextStyle::default());
+    assert_eq!(canvas.get_text(0, 0, 2, 1), " d");
+
+    let mut wrapped = Canvas::new(4, 2);
+    wrapped
+        .subview_mut(isize::MAX, 0, 0, 0, usize::MAX, usize::MAX)
+        .mark_soft_wrap_continuation(1, usize::MAX);
+    assert_eq!(wrapped.soft_wrap_continuation(1), 4);
+    wrapped
+        .subview_mut(0, 1, 0, 0, usize::MAX, usize::MAX)
+        .mark_soft_wrap_continuation(isize::MAX, 0);
+    assert_eq!(wrapped.soft_wrap_continuation(1), 4);
+
+    // Clipping the destination moves the source origin by the same amount.
+    let mut src = Canvas::new(4, 2);
+    src.subview_mut(0, 0, 0, 0, 4, 2)
+        .set_text(0, 0, "abcd\nefgh", CanvasTextStyle::default());
+    src.set_overlay(2, 1, StyleOverlay::inverse());
+    src.mark_no_select_region(2, 1, 1, 1);
+    src.mark_soft_wrap_continuation(1, 4);
+    for clean in [false, true] {
+        let mut dst = Canvas::new(2, 1);
+        let mut view = dst.subview_mut(0, 0, 0, 0, usize::MAX, usize::MAX);
+        if clean {
+            view.blit_region_from_clean(&src, -1, -1, 1, 0, usize::MAX, usize::MAX);
+        } else {
+            view.blit_region_from(&src, -1, -1, 1, 0, usize::MAX, usize::MAX);
+        }
+        assert_eq!(dst.get_text(0, 0, 2, 1), "gh");
+        assert!(dst.resolved_text_style(0, 0).unwrap().invert);
+        assert!(dst.is_no_select(0, 0));
+        assert!(!dst.is_no_select(1, 0));
+        assert_eq!(dst.soft_wrap_continuation(0), 2);
+        assert_eq!(
+            dst.damage_region(),
+            if clean {
+                None
+            } else {
+                Some(DamageRegion {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 1,
+                })
+            }
+        );
+    }
+    // The destination intersects the canvas, but its translated source is beyond usize::MAX.
+    let mut dst = Canvas::new(2, 1);
+    dst.subview_mut(isize::MIN, 0, 0, 0, usize::MAX, usize::MAX)
+        .blit_region_from(&src, isize::MIN + 2, 0, 2, 0, usize::MAX, 1);
+    assert_eq!(dst.get_text(0, 0, 2, 1), "");
+    assert_eq!(dst.damage_region(), None);
+
+    // Repair a wide tail beyond the copied rectangle only when it is inside the clip.
+    let mut wide = Canvas::new(4, 1);
+    wide.subview_mut(0, 0, 0, 0, 4, 1)
+        .set_text(1, 0, "中", CanvasTextStyle::default());
+    for (clip_width, tail_width, damage_width) in [
+        (usize::MAX, CellWidth::WidthTail, 2),
+        (2, CellWidth::Normal, 1),
+    ] {
+        let mut dst = Canvas::new(4, 1);
+        dst.subview_mut(1, 0, 0, 0, clip_width, usize::MAX)
+            .blit_region_from(&wide, 0, 0, 1, 0, 1, 1);
+        assert_eq!(dst.cell(1, 0).unwrap().cell_width, CellWidth::Wide);
+        assert_eq!(dst.cell(2, 0).unwrap().cell_width, tail_width);
+        assert_eq!(
+            dst.damage_region(),
+            Some(DamageRegion {
+                x: 1,
+                y: 0,
+                width: damage_width,
+                height: 1
+            })
+        );
+    }
+}
+
+#[test]
 fn test_cell_text_style() {
     let mut canvas = Canvas::new(10, 1);
     let style = CanvasTextStyle {

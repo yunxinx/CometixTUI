@@ -46,7 +46,7 @@ CI runs checks on Ubuntu and Windows independently and saves an HTML coverage re
 
 ## iocraft upstream sync
 
-This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) changes up to `2158a53` on top of the base fork, which last merged `3e26e2b` (v0.9.1). Applicable changes were applied directly or re-implemented in this fork's structure; a closing `-s ours` merge records the sync point. The 33 upstream commits are accounted for below: 18 Ported, 12 Already covered, and 3 Not taken. Code and comment cleanup was incorporated with the corresponding ports.
+This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) changes up to `7b5f4e7` on top of the base fork, which last merged `3e26e2b` (v0.9.1). Applicable changes were applied directly or re-implemented in this fork's structure; a closing `-s ours` merge records the sync point. The 38 upstream commits are accounted for below: 20 Ported, 14 Already covered, and 4 Not taken. Code and comment cleanup was incorporated with the corresponding ports.
 
 ### Ported
 
@@ -69,6 +69,9 @@ This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) chang
 - Windows `TextInput` accepts non-control, non-ASCII-alphanumeric AltGr characters reported as Ctrl+Alt, while retaining Ctrl+Alt letter/digit shortcuts (`iocraft#233`). Covered by the platform-specific `test_is_altgr_char` tests in `packages/iocraft/src/components/text_input.rs`.
 - Local mouse hooks ignore events outside the component's visible area, including ancestor clipping; coordinates remain relative to the original, unclipped origin (`iocraft#276`). Covered for both plain and propagated hooks by `test_local_mouse_respects_ancestor_clip_without_moving_origin` in `packages/iocraft/src/hooks/use_terminal_events.rs`.
 
+- `ScrollViewHandle::scroll_by` and keyboard or wheel scrolling saturate the scroll offset before clamping it, so an extreme relative scroll stops at the end of the range instead of overflowing (`iocraft#308`). Covered by `test_scroll_view_handle_clamps_large_relative_scroll` in `packages/iocraft/src/components/scroll_view.rs`.
+- Canvas subview operations clip their rectangles in widened arithmetic before narrowing, so extreme offsets and sizes neither overflow nor reach outside the clip, and `Canvas::get_text` accepts extreme coordinates (`iocraft#293`). This covers every `CanvasSubviewMut` operation, including this fork's `clear_region`, `mark_no_select_region`, `mark_soft_wrap_continuation`, `blit_region_from`, `declare_cursor`, `set_overlay`, and `set_text_with_link`. Covered by `test_extreme_rectangles_clip_before_narrowing` and `test_extraction_trims_stored_whitespace_without_trimming_the_start` in `packages/iocraft/src/canvas/tests/screen.rs`. Link targets keep this fork's removal of control characters, which already kept them from terminating the OSC 8 sequence, rather than upstream's percent-encoding.
+
 ### Fork fixes made during the sync
 
 - The chalk tmux truecolor guard uses an equivalent boolean expression accepted by Rust 1.94.0 clippy.
@@ -87,6 +90,7 @@ This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) chang
 - `element!` initializes optional props using each field type's `Default`; a handwritten `impl Default` on the props struct is no longer used. Fields whose types do not implement `Default` must be marked `#[iocraft(required)]` and supplied by the caller.
 - `NewlineProps::count` is now `Option<i32>`. Omitting it still reserves one row, and `element!(Newline(count: 2))` remains valid.
 - `UIRouterProps::app` is required, and `UIRouterProps` no longer implements `Default`.
+- `Canvas::get_text` trims trailing whitespace that cells store, not only empty cells, as its documentation states (`iocraft#293`). `CanvasSubviewMut::get_text` stops at the canvas's last row when the clip extends below it.
 
 ### Already covered
 
@@ -103,8 +107,12 @@ This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) chang
 - TextInput auto-grow derives layout from current props and text rows, so disabling and re-enabling it restores the height (`iocraft#266`).
 - Button uses View's primary-button release-click handling, so right and middle buttons do not activate it (`iocraft#295`); its documentation now specifies the primary button.
 
+- Local mouse coordinates are computed in `i64` against a `u32` visible area and pin to `u16::MAX`, so they do not wrap at `i16::MAX` (`iocraft#275`).
+- Child clip rectangles are computed in `i64` and stored as `u32`, so a node wider or taller than `i16::MAX` keeps its visible children (`iocraft#277`).
+
 ### Not taken
 
 - The upstream release commit (`iocraft#230`) is omitted; this fork does not follow upstream versions or CHANGELOG entries.
 - The upstream v0.9.3 release commit (`iocraft#245`) is omitted for the same reason.
 - The agent guides, contributing guide, and pull request template from `iocraft#306` are not imported; this fork keeps its own contributor workflow. Its code cleanup was incorporated with the corresponding ports.
+- The Copilot instructions added by upstream commit `8a2da30` are not imported, as with the `iocraft#306` guides.
