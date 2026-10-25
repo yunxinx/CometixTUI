@@ -1065,6 +1065,8 @@ mod tests {
 
     #[apply(test!)]
     async fn test_input_reports_its_cursor_with_its_value_and_mounts_at_its_width() {
+        // The first frame relies on the same-frame layout pass, which requires push-wake.
+        crate::render::wake::set_push_wake_for_tests(Some(true));
         let key = |code| TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, code));
         let events = [
             key(KeyCode::Tab),
@@ -1080,6 +1082,7 @@ mod tests {
             .mock_terminal_render_loop(MockTerminalConfig::with_delayed_events(events))
             .collect()
             .await;
+        crate::render::wake::set_push_wake_for_tests(None);
         let frames: Vec<_> = canvases.iter().map(Canvas::to_string).collect();
         // Each edit's frame already carries the cursor it leaves behind.
         let mut mirrored: Vec<&str> = frames
@@ -1365,6 +1368,8 @@ mod tests {
 
     #[apply(test!)]
     async fn test_text_input_wide_cursor_beyond_u16_on_first_draw() {
+        // The first frame relies on the same-frame layout pass, which requires push-wake.
+        crate::render::wake::set_push_wake_for_tests(Some(true));
         #[component]
         fn WideCursor(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             let handle = hooks.use_ref(|| {
@@ -1383,11 +1388,14 @@ mod tests {
             }
         }
         let canvas = element!(WideCursor).render(Some(20));
+        crate::render::wake::set_push_wake_for_tests(None);
         assert_eq!(canvas.cursor_declaration().unwrap().x, 19);
     }
 
     #[apply(test!)]
     async fn test_text_input_scrolls_beyond_u16_coordinates() {
+        // The first frame relies on the same-frame layout pass, which requires push-wake.
+        crate::render::wake::set_push_wake_for_tests(Some(true));
         let value = format!("{}TAIL", "x".repeat(65_532));
         let frames = element!(CursorProbe(initial_value: value.clone(), width: 20, height: 1))
             .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter([
@@ -1421,12 +1429,15 @@ mod tests {
         ])))
         .collect::<Vec<_>>()
         .await;
+        crate::render::wake::set_push_wake_for_tests(None);
         assert_eq!(frames[0].to_string(), "x\nTAIL \n");
         assert_eq!(frames[0].cursor_declaration().unwrap().y, 1);
     }
 
     #[apply(test!)]
     async fn test_text_input_unwrapped_multiline_value_scrolls_back_when_longest_line_shrinks() {
+        // The first frame relies on the same-frame layout pass, which requires push-wake.
+        crate::render::wake::set_push_wake_for_tests(Some(true));
         #[component]
         fn ShrinkingInput(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             let mut value = hooks.use_state(|| "abcd\nabcdefghij".to_string());
@@ -1461,6 +1472,7 @@ mod tests {
             .map(|canvas| canvas.to_string())
             .collect::<Vec<_>>()
             .await;
+        crate::render::wake::set_push_wake_for_tests(None);
 
         assert_eq!(frames.first().map(String::as_str), Some("fghij \n"));
         assert_eq!(frames.last().map(String::as_str), Some("abcde \n"));
@@ -1496,6 +1508,8 @@ mod tests {
     /// content. Matches upstream #225.
     #[test]
     fn test_text_input_auto_grow_height_follows_wrapped_rows() {
+        // The first frame relies on the same-frame layout pass, which requires push-wake.
+        crate::render::wake::set_push_wake_for_tests(Some(true));
         #[derive(Default, Props)]
         struct AutoGrowProps {
             value: String,
@@ -1522,6 +1536,7 @@ mod tests {
         let three_rows = element!(AutoGrowInput(value: "one two six".to_string()))
             .render(None)
             .to_string();
+        crate::render::wake::set_push_wake_for_tests(None);
 
         // Height tracks the wrapped row count rather than staying fixed.
         assert_eq!(one_row.lines().filter(|l| !l.is_empty()).count(), 1);

@@ -1810,6 +1810,8 @@ impl<'a> Tree<'a> {
         // changed, and the frame is rendered again before anything is written, as React
         // re-renders a layout effect's state write before paint. Sizes come from the parents, so
         // one more pass settles them; a change it leaves is harvested for the next frame.
+        // Like render-phase settling, this pass requires push-wake; under
+        // `IOCRAFT_DISABLE=push-wake`, size changes are picked up on the next frame.
         if !first.layout_pass_requested
             || !wake::push_wake_enabled()
             || !self.root_component.settle_render_phase()
