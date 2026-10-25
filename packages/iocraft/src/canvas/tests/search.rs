@@ -4,6 +4,68 @@ use crate::prelude::*;
 use crossterm::csi;
 
 #[test]
+fn test_search_folds_unicode_and_maps_expansions_to_terminal_cells() {
+    let mut canvas = Canvas::new(24, 1);
+    canvas.subview_mut(0, 0, 0, 0, 24, 1).set_text(
+        0,
+        0,
+        "ΟΣ οσ ος 中Straße İ",
+        CanvasTextStyle::default(),
+    );
+    let mut pools = CanvasPackedCellPools::new();
+    let mut line_cache = CanvasPackedLineCache::new();
+    let mut packed = CanvasPackedScreen::new(24, 1);
+    packed.write_line_with_cache(
+        &mut pools,
+        &mut line_cache,
+        0,
+        0,
+        "ΟΣ οσ ος 中Straße İ",
+        CanvasResolvedStyle::default(),
+        None,
+    );
+    for query in ["ΟΣ", "οσ", "ος"] {
+        assert_eq!(
+            canvas.scan_text_positions(query),
+            vec![
+                TextMatchPosition {
+                    row: 0,
+                    col: 0,
+                    len: 2
+                },
+                TextMatchPosition {
+                    row: 0,
+                    col: 3,
+                    len: 2
+                },
+                TextMatchPosition {
+                    row: 0,
+                    col: 6,
+                    len: 2
+                },
+            ],
+            "{query}"
+        );
+        assert_eq!(
+            packed.scan_text_positions(&pools, query),
+            canvas.scan_text_positions(query)
+        );
+        assert!(canvas.apply_search_highlight(query, StyleOverlay::inverse()));
+        assert!(canvas.resolved_text_style(1, 0).unwrap().invert);
+    }
+    for (query, col, len) in [("中STRASSE", 9, 8), ("sse", 15, 2), ("i\u{307}", 18, 1)] {
+        assert_eq!(
+            packed.scan_text_positions(&pools, query),
+            canvas.scan_text_positions(query)
+        );
+        assert_eq!(
+            canvas.scan_text_positions(query),
+            vec![TextMatchPosition { row: 0, col, len }]
+        );
+    }
+}
+
+#[test]
 fn test_scan_text_positions_is_case_insensitive_and_wide_aware() {
     let mut canvas = Canvas::new(12, 1);
     canvas

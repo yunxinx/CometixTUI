@@ -30,6 +30,7 @@ pub(crate) use measure_text::{
 pub use output::*;
 pub use packed_screen::*;
 pub use screen::*;
+pub use search::fold_search_text;
 pub use selection::*;
 pub use style_pool::*;
 

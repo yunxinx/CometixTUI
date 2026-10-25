@@ -1,5 +1,13 @@
 use super::*;
 
+/// Applies Unicode default case folding for case-insensitive substring search.
+///
+/// Filtering unrendered text with this function uses the same equivalence rules as
+/// [`Canvas::scan_text_positions`], including final sigma and expanding mappings.
+pub fn fold_search_text(text: &str) -> String {
+    caseless::default_case_fold_str(text)
+}
+
 impl Canvas {
     fn searchable_row_text_in_cols(
         &self,
@@ -25,14 +33,14 @@ impl Canvas {
                 continue;
             }
 
-            let lower = cell
+            let folded = cell
                 .character
                 .as_ref()
-                .map(|character| character.value.to_lowercase())
+                .map(|character| fold_search_text(&character.value))
                 .unwrap_or_else(|| " ".to_string());
             let cell_idx = col_of_cell.len();
-            byte_to_cell.extend(std::iter::repeat_n(cell_idx, lower.len()));
-            text.push_str(&lower);
+            byte_to_cell.extend(std::iter::repeat_n(cell_idx, folded.len()));
+            text.push_str(&folded);
             col_of_cell.push(col);
         }
         (text, col_of_cell, byte_to_cell)
@@ -47,7 +55,7 @@ impl Canvas {
         max_y: usize,
         relative_to_region: bool,
     ) -> Vec<TextMatchPosition> {
-        let query = query.to_lowercase();
+        let query = fold_search_text(query);
         if query.is_empty() || self.width == 0 || self.height() == 0 {
             return Vec::new();
         }

@@ -1870,13 +1870,10 @@ impl CanvasPackedScreen {
                 continue;
             }
 
-            let lower = self
-                .char_in_cell(pools, col, row)
-                .unwrap_or(" ")
-                .to_lowercase();
+            let folded = fold_search_text(self.char_in_cell(pools, col, row).unwrap_or(" "));
             let cell_idx = col_of_cell.len();
-            byte_to_cell.extend(std::iter::repeat_n(cell_idx, lower.len()));
-            text.push_str(&lower);
+            byte_to_cell.extend(std::iter::repeat_n(cell_idx, folded.len()));
+            text.push_str(&folded);
             col_of_cell.push(col);
         }
         (text, col_of_cell, byte_to_cell)
@@ -1893,7 +1890,7 @@ impl CanvasPackedScreen {
         max_y: usize,
         relative_to_region: bool,
     ) -> Vec<TextMatchPosition> {
-        let query = query.to_lowercase();
+        let query = fold_search_text(query);
         if query.is_empty() || self.width == 0 || self.height == 0 {
             return Vec::new();
         }

@@ -9,6 +9,7 @@ This fork extends [Haleclipse/CometixTUI](https://github.com/Haleclipse/CometixT
 - `TextInputProps::max_height` caps the visible rows of an auto-growing multiline input. The viewport follows the cursor and resets its scroll offset when content shrinks.
 - An unwrapped `TextInput` limits horizontal scrolling by its widest buffer row, so shrinking a multiline value until every line fits returns the viewport to column zero. Covered by `test_text_input_unwrapped_multiline_value_scrolls_back_when_longest_line_shrinks`.
 - `TextInputProps::on_change_cursor_offset` reports every cursor move made by input, after `on_change` when the input also edited the value, so a parent that mirrors both sees them in the same event and frame. An edit sets the cursor together with its value instead of leaving the next render to infer it from the value it receives. A cursor offset set on a `TextInputHandle` while no input is mounted applies when one mounts with it.
+- Canvas and packed-screen search and `fold_search_text` use Unicode default case folding for both text and queries. Greek sigma variants and expanding mappings such as `ß` → `ss` match consistently; search positions and highlights remain measured in terminal cells. Covered by `test_search_folds_unicode_and_maps_expansions_to_terminal_cells`.
 - Keybinding handlers outside a pending chord's contexts leave it for the matching context to resolve.
 
 It also changes how the inline renderer reacts to terminal resizes:

@@ -29,6 +29,7 @@ generational-box = "0.7.10"
 regex = "1.12.3"
 # Runtime-agnostic timer used for render-loop frame throttling.
 futures-timer = "3"
+caseless = "0.2.2"
 
 [target.'cfg(unix)'.dependencies]
 # Already present in crossterm's unix dependency tree; used directly for
