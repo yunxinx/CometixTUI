@@ -1,6 +1,7 @@
 use super::*;
 
-// A background-only suffix can be erased without printing at the right margin.
+// A background-only suffix can be erased with bounded ECH without printing
+// at the right margin. Canvas width need not equal physical terminal width.
 pub(super) fn background_tail(
     width: usize,
     background: impl Fn(usize) -> Option<Color>,
@@ -277,9 +278,9 @@ impl Canvas {
             if needs_reset {
                 sgr_reset(&mut w)?;
             }
-            if let Some((_, color)) = background_tail {
+            if let Some((start, color)) = background_tail {
                 sgr_bg(&mut w, color)?;
-                erase_to_eol(&mut w)?;
+                erase_characters(&mut w, self.width.saturating_sub(start.max(start_col)))?;
                 if ansi_styles {
                     sgr_reset(&mut w)?;
                 }

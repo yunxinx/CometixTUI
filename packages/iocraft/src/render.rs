@@ -75,6 +75,12 @@ impl LayoutInvalidations {
 /// painted; matches codex's transcript reflow debounce.
 const RESIZE_SETTLE: Duration = Duration::from_millis(75);
 
+// Ready input still reconciles one event at a time, but a continuously ready
+// source must not postpone painting indefinitely. Check the time budget between
+// renders: one expensive event can exceed it, but cannot extend the next batch.
+const MAX_INPUT_BATCH_EVENTS: usize = 64;
+const INPUT_BATCH_BUDGET: Duration = Duration::from_millis(8);
+
 fn changed_cell_count_enabled() -> bool {
     #[cfg(test)]
     {
@@ -2328,6 +2334,8 @@ impl<'a> Tree<'a> {
                 if let Some(prev) = prev_canvas.as_ref() {
                     term.restore_inline_rows_after_height_shrink(prev)?;
                 }
+                let batch_started = std::time::Instant::now();
+                let mut batch_events = 1;
                 let mut output = self.render(
                     terminal_size.map(|(w, _)| w as usize),
                     Some(&mut term),
@@ -2353,6 +2361,8 @@ impl<'a> Tree<'a> {
                     && !self.system_context.should_exit()
                     && !self.system_context.has_terminal_handoff()
                     && !term.received_ctrl_c()
+                    && batch_events < MAX_INPUT_BATCH_EVENTS
+                    && batch_started.elapsed() < INPUT_BATCH_BUDGET
                     && term.has_pending_input()
                 {
                     term.wait().now_or_never()
@@ -2374,6 +2384,7 @@ impl<'a> Tree<'a> {
                     next.phase_profile.canvas_alloc += output.phase_profile.canvas_alloc;
                     next.phase_profile.settle_rounds += output.phase_profile.settle_rounds;
                     output = next;
+                    batch_events += 1;
                 }
                 term.set_scrollback_replay(self.system_context.scrollback_replay());
                 let terminal_diff_planning = term.canvas_diff_planning();

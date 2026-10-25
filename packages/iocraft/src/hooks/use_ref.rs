@@ -5,9 +5,7 @@ use core::{
     hash::{Hash, Hasher},
     ops,
 };
-use generational_box::{
-    AnyStorage, BorrowError, BorrowMutError, GenerationalBox, Owner, SyncStorage,
-};
+use generational_box::{AnyStorage, GenerationalBox, Owner, SyncStorage};
 
 mod private {
     pub trait Sealed {}
@@ -105,16 +103,7 @@ impl<T: Sync + Send + 'static> Ref<T> {
     /// multiple copies of the same ref, writes to one will be blocked for as long as any
     /// reference returned by this method exists.</div>
     pub fn try_read(&self) -> Option<RefRef<'_, T>> {
-        loop {
-            match self.inner.try_read() {
-                Ok(inner) => break Some(RefRef { inner }),
-                Err(BorrowError::AlreadyBorrowedMut(_)) => match self.inner.try_write() {
-                    Err(BorrowMutError::Dropped(_)) => break None,
-                    _ => continue,
-                },
-                Err(BorrowError::Dropped(_)) => break None,
-            };
-        }
+        self.inner.try_read().ok().map(|inner| RefRef { inner })
     }
 
     /// Returns a mutable reference to the ref's value.

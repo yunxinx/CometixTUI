@@ -2764,7 +2764,8 @@ impl CanvasPackedScreen {
     /// `renderFrameSlice(...)` sparse row writer: spacer/default cells are
     /// skipped with cursor-forward movement, style transitions are cached via
     /// [`CanvasStyleTransitionCache`], OSC 8 hyperlinks are opened/closed around
-    /// linked cells, and the row is reset/erased to EOL on exit. The caller must
+    /// linked cells, and unused row tails are cleared on exit. A full row is
+    /// never erased after writing its last cell. The caller must
     /// position the terminal cursor at `start_col` before writing this fragment.
     pub fn write_ansi_row_with_style_cache<W: Write>(
         &self,
@@ -2864,8 +2865,8 @@ impl CanvasPackedScreen {
         if let Some((start, color)) = background_tail {
             write_cursor_forward(&mut w, start.saturating_sub(cursor_x))?;
             sgr_bg(&mut w, color)?;
-            erase_to_eol(&mut w)?;
-        } else {
+            erase_characters(&mut w, self.width.saturating_sub(start.max(cursor_x)))?;
+        } else if cursor_x < self.width {
             erase_to_eol(&mut w)?;
         }
         // Level 0's zero-SGR contract: the erase itself is layout, but the

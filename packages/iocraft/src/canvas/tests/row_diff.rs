@@ -464,23 +464,89 @@ fn test_row_eq_ignores_trailing_invisible_spaces() {
 }
 
 #[test]
-fn test_ansi_writers_clear_background_tail_without_printing_spaces() {
-    let mut canvas = Canvas::new(10, 1);
-    let mut view = canvas.subview_mut(0, 0, 0, 0, 10, 1);
-    view.set_background_color(0, 0, 10, 1, Color::DarkBlue);
-    view.set_text(0, 0, "abc", CanvasTextStyle::default());
-    let mut row = Vec::new();
-    canvas.write_ansi_row_without_newline(0, &mut row).unwrap();
-    let mut pools = CanvasPackedCellPools::new();
-    let packed = canvas.pack_with(&mut pools);
-    let packed_row = packed
-        .ansi_row_with_style_cache(&pools, &mut CanvasStyleTransitionCache::new(), 0, 0)
-        .unwrap();
-    for row in [String::from_utf8(row).unwrap(), packed_row] {
-        assert!(!row.contains(' '), "{row:?}");
-        assert!(row.ends_with("\x1b[K\x1b[0m"), "{row:?}");
+fn test_ansi_writers_keep_background_tail_within_canvas() {
+    for content in ["", "abc"] {
+        let mut canvas = Canvas::new(5, 1);
+        let mut view = canvas.subview_mut(0, 0, 0, 0, 5, 1);
+        view.set_background_color(0, 0, 5, 1, Color::DarkBlue);
+        view.set_text(0, 0, content, CanvasTextStyle::default());
+        let mut public_output = Vec::new();
+        canvas.write_ansi(&mut public_output).unwrap();
+        for start_col in [0, 4] {
+            let mut row = Vec::new();
+            canvas
+                .write_ansi_row_from_col_without_newline(0, start_col, &mut row)
+                .unwrap();
+            let mut pools = CanvasPackedCellPools::new();
+            let packed = canvas.pack_with(&mut pools);
+            let packed_row = packed
+                .ansi_row_with_style_cache(
+                    &pools,
+                    &mut CanvasStyleTransitionCache::new(),
+                    0,
+                    start_col,
+                )
+                .unwrap();
+            let outputs = [
+                (0, String::from_utf8(public_output.clone()).unwrap()),
+                (start_col, String::from_utf8(row).unwrap()),
+                (start_col, packed_row),
+            ];
+            for (start, output) in outputs {
+                let mut vt = avt::Vt::new(10, 2);
+                vt.feed_str("\x1b[42m0123456789\x1b[0m\r");
+                vt.feed_str(&format!("\x1b[{}G", start + 1));
+                vt.feed_str(&output);
+                let cells = vt.line(0).cells();
+                for (x, cell) in cells.iter().enumerate() {
+                    let painted = (start..5).contains(&x);
+                    assert_eq!(
+                        cell.pen().background(),
+                        Some(avt::Color::Indexed(if painted { 4 } else { 2 })),
+                        "column {x}, {output:?}"
+                    );
+                    let expected = if painted {
+                        content.chars().nth(x).unwrap_or(' ')
+                    } else {
+                        char::from(b'0' + x as u8)
+                    };
+                    assert_eq!(cell.char(), expected, "column {x}, {output:?}");
+                }
+            }
+        }
+        assert_eq!(canvas.ansi_row_rendered_width(0), content.len());
     }
-    assert_eq!(canvas.ansi_row_rendered_width(0), 3);
+}
+
+#[test]
+fn test_packed_row_preserves_right_margin_grapheme_and_clears_short_row() {
+    for width in [3, 5] {
+        let mut canvas = Canvas::new(width, 1);
+        canvas.subview_mut(0, 0, 0, 0, width, 1).set_text(
+            0,
+            0,
+            "abe\u{0301}",
+            CanvasTextStyle::default(),
+        );
+        let mut pools = CanvasPackedCellPools::new();
+        let packed = canvas.pack_with(&mut pools);
+        let row = packed
+            .ansi_row_with_style_cache(&pools, &mut CanvasStyleTransitionCache::new(), 0, 0)
+            .unwrap();
+        assert!(row.contains("abe\u{0301}"), "{row:?}");
+        let mut vt = avt::Vt::new(width, 2);
+        vt.feed_str(&"x".repeat(width));
+        vt.feed_str("\r");
+        // avt stores one code point per cell and cannot model combining marks.
+        // Use the canonically equivalent glyph to check the writer's unchanged
+        // cursor/erase commands; the original bytes are also verified in tmux.
+        vt.feed_str(&row.replace("e\u{0301}", "é"));
+        assert_eq!(
+            vt.line(0).text(),
+            if width == 3 { "abé" } else { "abé  " },
+            "{row:?}"
+        );
+    }
 }
 
 #[test]

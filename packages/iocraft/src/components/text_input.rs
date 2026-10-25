@@ -45,7 +45,11 @@ impl Hook for CursorOverlayState {
             };
             let mut canvas = drawer.canvas();
             for offset in 0..self.char_width {
-                canvas.set_overlay((self.col + offset) as isize, self.row as isize, overlay);
+                canvas.set_overlay(
+                    self.col as isize + offset as isize,
+                    self.row as isize,
+                    overlay,
+                );
             }
         }
         drawer
@@ -285,21 +289,17 @@ impl TextBuffer {
         Self { rows, text }
     }
 
-    fn row_column_for_offset(&self, offset: usize) -> (u16, u16) {
+    fn row_column_for_offset(&self, offset: usize) -> (usize, usize) {
         for (i, row) in self.rows.iter().enumerate() {
             if offset >= row.offset {
                 let offset_in_row = offset - row.offset;
                 if offset_in_row <= row.len {
-                    let col =
-                        crate::canvas::string_display_width(&self.text[row.offset..offset]) as u16;
-                    return (i as _, col);
+                    let col = crate::canvas::string_display_width(&self.text[row.offset..offset]);
+                    return (i, col);
                 }
             }
         }
-        (
-            self.rows.len() as _,
-            self.rows.last().map_or(0, |r| r.width as _),
-        )
+        (self.rows.len(), self.rows.last().map_or(0, |r| r.width))
     }
 
     fn lines(&self) -> impl Iterator<Item = &str> {
@@ -332,9 +332,8 @@ impl TextBuffer {
         }
     }
 
-    fn offset_for_closest_column_in_row(&self, row: u16, col: u16) -> usize {
-        let row = &self.rows[row as usize];
-        let col = col as usize;
+    fn offset_for_closest_column_in_row(&self, row: usize, col: usize) -> usize {
+        let row = &self.rows[row];
         if col >= row.width {
             row.offset + row.len
         } else {
@@ -351,7 +350,7 @@ impl TextBuffer {
         }
     }
 
-    fn above_offset(&self, offset: usize, col_preference: Option<u16>) -> usize {
+    fn above_offset(&self, offset: usize, col_preference: Option<usize>) -> usize {
         let (row, col) = self.row_column_for_offset(offset);
         if row == 0 {
             return offset;
@@ -359,9 +358,9 @@ impl TextBuffer {
         self.offset_for_closest_column_in_row(row - 1, col_preference.unwrap_or(col))
     }
 
-    fn below_offset(&self, offset: usize, col_preference: Option<u16>) -> usize {
+    fn below_offset(&self, offset: usize, col_preference: Option<usize>) -> usize {
         let (row, col) = self.row_column_for_offset(offset);
-        if row as usize + 1 >= self.rows.len() {
+        if row + 1 >= self.rows.len() {
             return offset;
         }
         self.offset_for_closest_column_in_row(row + 1, col_preference.unwrap_or(col))
@@ -369,12 +368,12 @@ impl TextBuffer {
 
     fn row_start_offset(&self, offset: usize) -> usize {
         let (row, _) = self.row_column_for_offset(offset);
-        self.rows[row as usize].offset
+        self.rows[row].offset
     }
 
     fn row_end_offset(&self, offset: usize) -> usize {
         let (row, _) = self.row_column_for_offset(offset);
-        let r = &self.rows[row as usize];
+        let r = &self.rows[row];
         r.offset + r.len
     }
 }
@@ -505,10 +504,11 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
     let mut prev_value = hooks.use_state(|| "".to_string());
     let mut cursor_offset = hooks.use_state(|| 0usize);
     let mut requested_cursor_offset = hooks.use_state(|| None);
-    let mut scroll_offset_row = hooks.use_state(|| 0u16);
-    let mut scroll_offset_col = hooks.use_state(|| 0u16);
+    let mut scroll_offset_row = hooks.use_state(|| 0usize);
+    let mut scroll_offset_col = hooks.use_state(|| 0usize);
     let mut vertical_movement_col_preference = hooks.use_state(|| None);
     let (width, height) = hooks.use_size(!auto_grow);
+    let (width, height) = (usize::from(width), usize::from(height));
 
     let mut pending_cursor_offset = None;
     if let Some(handle_ref) = props.handle.as_mut() {
@@ -526,13 +526,13 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
         // Reserve the last column for the cursor.
         width.max(1) - 1
     } else {
-        usize::MAX as _
+        usize::MAX
     };
 
     let buffer = hooks.use_memo(
         {
             let text = props.value.clone();
-            move || Arc::new(TextBuffer::new(text, max_text_width as _))
+            move || Arc::new(TextBuffer::new(text, max_text_width))
         },
         (&props.value, max_text_width),
     );
@@ -541,12 +541,8 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
         .row_count()
         .max(1)
         .min(props.max_height.unwrap_or(u16::MAX).max(1) as usize);
-    let height = if auto_grow {
-        visible_rows as u16
-    } else {
-        height
-    };
-    let max_scroll_row = buffer.row_count().saturating_sub(height as usize) as u16;
+    let height = if auto_grow { visible_rows } else { height };
+    let max_scroll_row = buffer.row_count().saturating_sub(height);
     if scroll_offset_row.get() > max_scroll_row {
         scroll_offset_row.set(max_scroll_row);
     }
@@ -592,7 +588,7 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
         if cursor_row >= scroll_offset_row.get() + height {
             scroll_offset_row.set(cursor_row - height + 1);
         } else if cursor_row < scroll_offset_row.get() {
-            scroll_offset_row.set(cursor_row as _);
+            scroll_offset_row.set(cursor_row);
         }
         if auto_grow {
             // Content wraps into extra rows instead of scrolling sideways.
@@ -602,11 +598,11 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
         } else if cursor_col >= scroll_offset_col.get() + width {
             scroll_offset_col.set(cursor_col - width + 1);
         } else if cursor_col < scroll_offset_col.get() {
-            scroll_offset_col.set(cursor_col as _);
+            scroll_offset_col.set(cursor_col);
         }
 
         // Scroll back when the content shrinks so it isn't cut off.
-        let content_width = buffer.max_row_width() as u16;
+        let content_width = buffer.max_row_width();
         let max_scroll_offset_col = (content_width + 1).saturating_sub(width);
         if scroll_offset_col.get() > max_scroll_offset_col {
             scroll_offset_col.set(max_scroll_offset_col);
@@ -619,8 +615,10 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
     // pure style layer that doesn't interfere with the text content.
     let cursor_overlay = hooks.use_cursor_overlay();
     cursor_overlay.active = has_focus;
-    cursor_overlay.col = cursor_col.saturating_sub(scroll_offset_col.get());
-    cursor_overlay.row = cursor_row.saturating_sub(scroll_offset_row.get());
+    cursor_overlay.col =
+        u16::try_from(cursor_col.saturating_sub(scroll_offset_col.get())).unwrap_or(u16::MAX);
+    cursor_overlay.row =
+        u16::try_from(cursor_row.saturating_sub(scroll_offset_row.get())).unwrap_or(u16::MAX);
     cursor_overlay.physical_cursor = props.physical_cursor;
     cursor_overlay.char_width = if has_focus && safe_cursor_offset < props.value.len() {
         props.value[safe_cursor_offset..]
@@ -809,7 +807,7 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
 
     element! {
         View(overflow: Overflow::Hidden, width: 100pct, height: if auto_grow { Size::Length(visible_rows as u32) } else if multiline { Size::Percent(100.0) } else { Size::Length(1) }, position: Position::Relative) {
-            View(position: Position::Absolute, top: -(scroll_offset_row.get() as i32), left: -(scroll_offset_col.get() as i32)) {
+            View(position: Position::Absolute, top: -i32::try_from(scroll_offset_row.get()).unwrap_or(i32::MAX), left: -i32::try_from(scroll_offset_col.get()).unwrap_or(i32::MAX)) {
                 TextBufferView(
                     buffer,
                     color: props.color,
@@ -1363,6 +1361,68 @@ mod tests {
         let expected = ["  \n", " 一二! \n"];
         assert_eq!(actual.first().map(String::as_str), Some(expected[0]));
         assert_eq!(actual.last().map(String::as_str), Some(expected[1]));
+    }
+
+    #[apply(test!)]
+    async fn test_text_input_wide_cursor_beyond_u16_on_first_draw() {
+        #[component]
+        fn WideCursor(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+            let handle = hooks.use_ref(|| {
+                let mut handle = TextInputHandle::default();
+                handle.set_cursor_offset(65_536);
+                handle
+            });
+            element! {
+                View(width: 20) {
+                    TextInput(
+                        value: format!("{}中", "x".repeat(65_536)),
+                        has_focus: true,
+                        handle,
+                    )
+                }
+            }
+        }
+        let canvas = element!(WideCursor).render(Some(20));
+        assert_eq!(canvas.cursor_declaration().unwrap().x, 19);
+    }
+
+    #[apply(test!)]
+    async fn test_text_input_scrolls_beyond_u16_coordinates() {
+        let value = format!("{}TAIL", "x".repeat(65_532));
+        let frames = element!(CursorProbe(initial_value: value.clone(), width: 20, height: 1))
+            .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter([
+                TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Home)),
+                TerminalEvent::Resize(80, 24),
+            ])))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(frames[0].to_string(), "xxxxxxxxxxxxxxxTAIL \n");
+        assert_eq!(frames[0].cursor_declaration().unwrap().x, 19);
+        assert_eq!(frames.last().unwrap().to_string(), "xxxxxxxxxxxxxxxxxxxx\n");
+        assert_eq!(frames.last().unwrap().cursor_declaration().unwrap().x, 0);
+
+        let frames = element!(MyComponent)
+            .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter([
+                TerminalEvent::Paste(value),
+                TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char('!'))),
+            ])))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(frames.last().unwrap().to_string(), " xxxxTAIL! \n");
+
+        let frames = element!(CursorProbe(
+            initial_value: format!("{}TAIL", "x\n".repeat(65_536)),
+            width: 20,
+            height: 2,
+            multiline: true,
+        ))
+        .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter([
+            TerminalEvent::Resize(80, 24),
+        ])))
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(frames[0].to_string(), "x\nTAIL \n");
+        assert_eq!(frames[0].cursor_declaration().unwrap().y, 1);
     }
 
     #[apply(test!)]

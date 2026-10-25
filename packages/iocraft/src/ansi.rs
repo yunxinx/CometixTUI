@@ -14,6 +14,15 @@ pub(crate) fn erase_to_eol(w: &mut impl Write) -> io::Result<()> {
     w.write_all(csi!("K").as_bytes())
 }
 
+// ECH preserves the cursor and bounds the erase to the canvas, even when the
+// physical terminal is wider. A zero parameter means one cell, so omit it.
+pub(crate) fn erase_characters(w: &mut impl Write, count: usize) -> io::Result<()> {
+    if count > 0 {
+        write!(w, csi!("{}X"), count)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn sgr_attr(w: &mut impl Write, attr: Attribute) -> io::Result<()> {
     write!(w, csi!("{}m"), attr.sgr())
 }

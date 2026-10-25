@@ -54,7 +54,7 @@ Terminal rendering engine extended with CC Ink's retained screen-buffer architec
 
 - **Post-render `StyleOverlay`** — cursor inversion, search highlighting, selection rendering applied *after* the component tree draws, so components don't need awareness of overlays
 - **CSI K attribute bleed fix** — full SGR reset before erase-to-EOL; single row-end exit path (fixes kitty rendering)
-- **Grapheme-cluster width measurement** — per-cluster calculation matching npm `string-width` (accurate for CJK, ZWJ emoji, VS16)
+- **Grapheme-cluster width measurement** — per-cluster calculation for CJK, ZWJ emoji, and VS16, with intentional terminal compatibility differences from npm `string-width` for lone regional indicators and keycap bases followed by VS16; see [FORK.md](FORK.md)
 - **`CellWidth` tracking** — `Normal` / `Wide` / `WidthTail` enum for correct CJK/emoji alignment
 - **ANSI helpers module** (`ansi.rs`) — semantic functions replacing raw escape writes; tmux truecolor auto-clamp (RGB→ANSI-256); OSC 8 hyperlink detection with CC Ink terminal allowlist
 - **Retained screen primitives** — per-cell canvas diffing, damage regions, clear/blit helpers, soft-wrap metadata, noSelect metadata, packed canvas snapshot/output-queue
@@ -139,7 +139,7 @@ CC Ink's fullscreen capabilities ported to Rust:
 
 ### Layout
 
-- **Taffy 0.12.1** (upstream: 0.5.2) — flexbox + grid + layout-cache soundness fix
+- **Taffy 0.15.0** (upstream: 0.5.2) — flexbox + grid + layout-cache soundness fix
 - **CSS Grid DSL** — `grid_template_areas`, `grid_template_columns/rows` with CSS string parsing
 - **CC Ink style shorthands** — additional layout style properties matching ink's API surface
 - **Border text labels** — dashed/per-edge border styling, opaque overlays, absolute overlay clamping

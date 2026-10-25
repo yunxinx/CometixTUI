@@ -154,29 +154,28 @@ fn test_canvas_full_background_color() {
     let mut actual = Vec::new();
     canvas.write_ansi(&mut actual).unwrap();
 
-    // the important thing here is that the background color is reset before each line is
-    // cleared and before each newline
+    // The background is applied to the bounded erase and reset before each newline.
     // see: https://github.com/ccbrown/iocraft/issues/142
 
     let mut expected = Vec::new();
 
-    // A background-only suffix is cleared with EL instead of writing spaces
-    // into the terminal's right margin.
+    // A background-only suffix uses bounded ECH without writing at the
+    // right margin or coloring cells outside the canvas.
     write!(expected, csi!("0m")).unwrap();
     write!(expected, csi!("101m")).unwrap();
-    write!(expected, csi!("K")).unwrap();
+    write!(expected, csi!("6X")).unwrap();
     write!(expected, csi!("0m")).unwrap();
     write!(expected, "\r\n").unwrap();
 
     // line 2
     write!(expected, csi!("101m")).unwrap();
-    write!(expected, csi!("K")).unwrap();
+    write!(expected, csi!("6X")).unwrap();
     write!(expected, csi!("0m")).unwrap();
     write!(expected, "\r\n").unwrap();
 
     // line 3
     write!(expected, csi!("101m")).unwrap();
-    write!(expected, csi!("K")).unwrap();
+    write!(expected, csi!("6X")).unwrap();
     write!(expected, csi!("0m")).unwrap();
     write!(expected, "\r\n").unwrap();
 

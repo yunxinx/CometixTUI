@@ -1700,6 +1700,51 @@ async fn test_a_keyed_child_replaced_by_another_type_leaves_no_layout_nodes() {
     assert_eq!(node_counts.first(), node_counts.last(), "{node_counts:?}");
 }
 
+#[component]
+fn ReadyInputCounter(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let mut count = hooks.use_state(|| 0usize);
+    hooks.use_terminal_events(move |event| {
+        if matches!(event, TerminalEvent::Key(key) if key.code == KeyCode::Char('x')) {
+            count += 1;
+        }
+    });
+    element!(Text(content: count.to_string()))
+}
+
+#[apply(test!)]
+async fn test_ready_input_backlog_paints_before_draining() {
+    for push_wake in [true, false] {
+        crate::render::wake::set_push_wake_for_tests(Some(push_wake));
+        let events = std::iter::repeat_n(
+            TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char('x'))),
+            512,
+        )
+        .chain([TerminalEvent::Key(KeyEvent {
+            kind: KeyEventKind::Press,
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+        })]);
+        let frames = element!(ReadyInputCounter)
+            .mock_terminal_render_loop(MockTerminalConfig::with_events(futures::stream::iter(
+                events,
+            )))
+            .map(|canvas| canvas.to_string().trim().parse::<usize>().unwrap())
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(frames.first(), Some(&0));
+        assert_eq!(frames.last(), Some(&512));
+        assert!(
+            frames.windows(2).all(|pair| pair[0] < pair[1]),
+            "{frames:?}"
+        );
+        assert!(
+            frames.iter().any(|count| (1..512).contains(count)),
+            "input must paint before the source drains: {frames:?}"
+        );
+    }
+    crate::render::wake::set_push_wake_for_tests(None);
+}
+
 #[derive(Default, Props)]
 struct BatchedFlagInputProps {
     changes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,

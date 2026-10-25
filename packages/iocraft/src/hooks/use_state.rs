@@ -7,9 +7,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll, Waker},
 };
-use generational_box::{
-    AnyStorage, BorrowError, BorrowMutError, GenerationalBox, Owner, SyncStorage,
-};
+use generational_box::{AnyStorage, GenerationalBox, Owner, SyncStorage};
 
 mod private {
     pub trait Sealed {}
@@ -263,16 +261,7 @@ impl<T: Sync + Send + 'static> State<T> {
     /// multiple copies of the same state, writes to one will be blocked for as long as any
     /// reference returned by this method exists.</div>
     pub fn try_read(&self) -> Option<StateRef<'_, T>> {
-        loop {
-            match self.inner.try_read() {
-                Ok(inner) => break Some(StateRef { inner }),
-                Err(BorrowError::AlreadyBorrowedMut(_)) => match self.inner.try_write() {
-                    Err(BorrowMutError::Dropped(_)) => break None,
-                    _ => continue,
-                },
-                Err(BorrowError::Dropped(_)) => break None,
-            };
-        }
+        self.inner.try_read().ok().map(|inner| StateRef { inner })
     }
 
     /// Returns a mutable reference to the state's value.
