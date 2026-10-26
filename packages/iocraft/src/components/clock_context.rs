@@ -165,22 +165,26 @@ mod tests {
 
     #[test]
     fn delay_to_next_lands_on_the_period_grid() {
-        let clock = Clock::new();
+        let mut clock = Clock::new();
+        // Start off-grid without sleeping: at epoch zero a full-period
+        // delay is indistinguishable from a delay to the next grid line.
+        Arc::get_mut(&mut clock.inner).unwrap().epoch -= Duration::from_millis(37);
         let interval = Duration::from_millis(100);
         let period = clock.period(interval).as_millis();
         let before = clock.now_ms();
         let delay = clock.delay_to_next(interval);
+        let after = clock.now_ms();
         // Strictly in (0, period]: never zero (that would re-fire the same
         // line), never past the next line.
         assert!(
             delay > Duration::ZERO && delay.as_millis() <= period,
             "{delay:?}"
         );
-        let target = before + delay.as_millis();
-        assert_eq!(
-            target % period,
-            0,
-            "target {target} is not on the {period}ms grid"
+        // The internal clock read is somewhere in this inclusive range,
+        // even if the caller's reads straddle a millisecond or grid line.
+        assert!(
+            (before..=after).any(|now| (now + delay.as_millis()).is_multiple_of(period)),
+            "delay {delay:?} from {before}..={after}ms misses the {period}ms grid"
         );
     }
 

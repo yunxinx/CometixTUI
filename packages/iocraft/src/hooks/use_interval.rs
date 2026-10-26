@@ -179,7 +179,29 @@ mod tests {
                 .mock_terminal_render_loop(MockTerminalConfig::default())
                 .collect(),
         );
-        assert_eq!(canvases.last().unwrap().to_string(), "count=2\n");
+        let counts: Vec<u8> = canvases
+            .iter()
+            .map(|canvas| {
+                canvas
+                    .to_string()
+                    .trim()
+                    .strip_prefix("count=")
+                    .expect("interval counter should render")
+                    .parse()
+                    .expect("interval counter should render a count")
+            })
+            .collect();
+        let (&last, earlier) = counts.split_last().expect("at least one frame");
+        assert!(
+            last >= 2,
+            "interval never reached the exit threshold: {counts:?}"
+        );
+        // Non-input updates may coalesce; exit belongs to the first frame
+        // that observes the threshold, even when its count has passed it.
+        assert!(
+            earlier.iter().all(|&count| count < 2),
+            "render loop continued after the exit threshold: {counts:?}"
+        );
     }
 
     #[component]

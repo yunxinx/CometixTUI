@@ -246,11 +246,29 @@ mod tests {
             .await;
         super::set_push_wake_for_tests(None);
         let last = frames.last().expect("at least one frame");
+        let counts: Vec<u32> = frames
+            .iter()
+            .map(|frame| {
+                frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("count="))
+                    .expect("deep counter should render")
+                    .parse()
+                    .expect("deep counter should render a count")
+            })
+            .collect();
+        let (&last_count, earlier_counts) = counts.split_last().unwrap();
         // The deep counter advanced past its initial value: its future's
         // wakes were routed and harvested rather than dropped.
         assert!(
-            last.contains("count=3"),
+            last_count >= 3,
             "deep counter never advanced under push-wake harvesting: {last:?}"
+        );
+        // Timer updates may coalesce, but the first frame at the exit
+        // threshold must be the last one.
+        assert!(
+            earlier_counts.iter().all(|&count| count < 3),
+            "render loop continued after the exit threshold: {frames:?}"
         );
         assert!(last.contains("static header"));
     }
@@ -530,6 +548,28 @@ mod scan_tests {
 
     const QUIET_ROWS: usize = 200;
 
+    fn assert_exits_at_tick(frames: &[String], prefix: &str, threshold: u8) {
+        let ticks: Vec<Option<u8>> = frames
+            .iter()
+            .map(|frame| {
+                frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .map(|value| value.parse().expect("ticker should render a count"))
+            })
+            .collect();
+        let (last, earlier) = ticks.split_last().expect("at least one frame");
+        assert!(last.is_some_and(|tick| tick >= threshold), "{frames:?}");
+        // A late-mounted ticker can have waiting frames. Once mounted,
+        // coalesced ticks may skip counts, but exit must not skip a frame.
+        assert!(
+            earlier
+                .iter()
+                .all(|tick| tick.is_none_or(|tick| tick < threshold)),
+            "render loop continued after the exit threshold: {frames:?}"
+        );
+    }
+
     // A large subtree that never wakes. Whether the scan walks it cannot be
     // seen from inside (a clean component's own poll is skipped either way),
     // so the test counts the scan's descents instead.
@@ -574,18 +614,18 @@ mod scan_tests {
     fn test_scan_skips_clean_sibling_subtree() {
         SCAN_DESCENTS.with(|count| count.set(0));
         super::set_push_wake_for_tests(Some(true));
-        let canvases: Vec<_> = smol::block_on(
+        let frames: Vec<_> = smol::block_on(
             element!(SiblingSubtreesApp)
                 .mock_terminal_render_loop(MockTerminalConfig::default())
+                .map(|canvas| canvas.to_string())
                 .collect(),
         );
         super::set_push_wake_for_tests(None);
-        let rendered = canvases.last().unwrap().to_string();
-        assert!(rendered.contains("ticks=5"), "{rendered:?}");
+        assert_exits_at_tick(&frames, "ticks=", 5);
         let descents = SCAN_DESCENTS.with(|count| count.get());
         // One arming scan covers the whole tree (~QUIET_ROWS + a handful);
-        // each of the five ticks should then descend a handful of components
-        // on the ticker's path. Walking the quiet rows once per tick would
+        // each subsequent scan should descend a handful of components on
+        // the ticker's path. Walking the quiet rows once per tick would
         // put this at ten-plus full trees.
         assert!(
             descents < 2 * QUIET_ROWS,
@@ -709,9 +749,6 @@ mod scan_tests {
                 panic!("render loop parked: a late-mounted component was never scanned")
             }
         };
-        assert!(
-            frames.last().unwrap().contains("late ticks=2"),
-            "{frames:?}"
-        );
+        assert_exits_at_tick(&frames, "late ticks=", 2);
     }
 }

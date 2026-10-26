@@ -236,33 +236,19 @@ mod tests {
         );
     }
 
-    // Two 100ms animations mounted at different times tick at the same
-    // instants (the clock's grid), and each ticks once per 100ms — not on
-    // every base poll and not twice around a grid line.
     #[component]
     fn TwoAnimations(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
-        let mut system = hooks.use_context_mut::<SystemContext>();
-        let first = hooks.use_animation_frame(Some(Duration::from_millis(100)));
-        let mut first_ticks = hooks.use_ref(|| 0u32);
-        let mut last_first = hooks.use_ref(|| 0u128);
-        if first.time_ms != last_first.get() {
-            last_first.set(first.time_ms);
-            first_ticks.set(first_ticks.get() + 1);
-        }
-        let done = hooks.use_state(|| false);
-        let mut done_for_future = done;
-        hooks.use_future(async move {
-            smol::Timer::after(Duration::from_millis(560)).await;
-            done_for_future.set(true);
+        let mut show_late = hooks.use_state(|| false);
+        hooks.use_terminal_events(move |event| {
+            if let TerminalEvent::Key(_) = event {
+                show_late.set(true);
+            }
         });
-        if done.get() {
-            system.exit();
-        }
         element! {
             View(flex_direction: FlexDirection::Column) {
-                Text(content: format!("first_ticks={}", first_ticks.get()))
-                #(if first.time_ms > 40 {
-                    element!(LateAnimation).into_any()
+                GridAnimation(label: "early")
+                #(if show_late.get() {
+                    element!(GridAnimation(label: "late")).into_any()
                 } else {
                     element!(Text(content: "waiting")).into_any()
                 })
@@ -270,42 +256,95 @@ mod tests {
         }
     }
 
+    #[derive(Default, Props)]
+    struct GridAnimationProps {
+        label: &'static str,
+    }
+
     #[component]
-    fn LateAnimation(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
-        let frame = hooks.use_animation_frame(Some(Duration::from_millis(100)));
-        element!(Text(content: format!("late_time={}", frame.time_ms)))
+    fn GridAnimation(
+        mut hooks: Hooks,
+        props: &GridAnimationProps,
+    ) -> impl Into<AnyElement<'static>> {
+        // 500ms quantizes to 512ms on the shared clock's 16ms base tick.
+        let frame = hooks.use_animation_frame(Some(Duration::from_millis(500)));
+        let mut ticks = hooks.use_ref(|| 0u32);
+        let mut last_time = hooks.use_ref(|| frame.time_ms);
+        if frame.time_ms != last_time.get() {
+            last_time.set(frame.time_ms);
+            ticks.set(ticks.get() + 1);
+        }
+        element!(Text(content: format!("{}={}", props.label, ticks.get())))
     }
 
     #[test]
     fn test_equal_intervals_tick_once_per_period_on_the_grid() {
-        let canvases: Vec<_> = smol::block_on(
-            element!(TwoAnimations)
-                .mock_terminal_render_loop(MockTerminalConfig::default())
-                .collect(),
-        );
-        let rendered = canvases.last().unwrap().to_string();
-        let ticks = rendered
-            .lines()
-            .find_map(|line| line.strip_prefix("first_ticks="))
-            .and_then(|value| value.parse::<u32>().ok())
-            .expect("tick count");
-        // 100ms quantizes to the 112ms period on the 16ms base tick; 560ms
-        // holds the initial read plus 4–5 grid lines, ±1 for where the epoch
-        // falls relative to the grid.
-        assert!(
-            (4..=7).contains(&ticks),
-            "ticks={ticks} rendered={rendered:?}"
-        );
-        // The late animation mounted off-grid (just after the first 112ms
-        // line) and must have ticked at least once since; a tick reads the
-        // clock when its `Delay` fires, a few ms after the grid line under
-        // test load.
-        let late = rendered
-            .lines()
-            .find_map(|line| line.strip_prefix("late_time="))
-            .and_then(|value| value.parse::<u128>().ok())
-            .expect("late time");
-        assert!(late >= 224, "late animation never ticked: {late}");
-        assert!(late % 112 <= 20, "late animation not on the grid: {late}");
+        smol::block_on(async {
+            let clock = Clock::new();
+            let (events, input) = futures::channel::mpsc::unbounded();
+            let mut app = element! {
+                ContextProvider(value: crate::Context::owned(clock.clone())) {
+                    TwoAnimations
+                }
+            };
+            let mut output = app.mock_terminal_render_loop(MockTerminalConfig::with_events(input));
+            let rendered = std::cell::RefCell::new(String::new());
+            let executor = smol::LocalExecutor::new();
+            let _render = executor.spawn(async {
+                while let Some(canvas) = output.next().await {
+                    *rendered.borrow_mut() = canvas.to_string();
+                }
+                panic!("render loop should remain active");
+            });
+
+            // Drive the real render loop only at these checkpoints. Mounting
+            // halfway through the period separates grid arming (512ms) from
+            // start-relative arming (768ms). Observe at their midpoint, with
+            // 128ms on either side for timer delivery and test scheduling.
+            //
+            // Withhold polling across 1024ms until 1280ms, then check at 1664ms:
+            // grid rearming targets 1536ms, start-relative rearming 1792ms.
+            // The intervening probes must not tick, catching base-tick timers
+            // or duplicate updates between grid lines. No callback timestamp
+            // is required to land on the grid itself.
+            // Each observation must finish before the next relevant grid
+            // line or the earliest incorrect timer. Initialization and the
+            // negative probes do not need a separate per-render time limit.
+            for (at, before, expected) in [
+                (0u128, 512, "early=0\nwaiting\n"),
+                (256, 512, "early=0\nlate=0\n"),
+                (640, 768, "early=1\nlate=1\n"),
+                (768, 1024, "early=1\nlate=1\n"),
+                (1280, 1536, "early=2\nlate=2\n"),
+                (1408, 1536, "early=2\nlate=2\n"),
+                (1664, 1792, "early=3\nlate=3\n"),
+            ] {
+                smol::Timer::after(Duration::from_millis(
+                    u64::try_from(at.saturating_sub(clock.now_ms())).unwrap(),
+                ))
+                .await;
+                if at == 256 {
+                    events
+                        .unbounded_send(TerminalEvent::Key(KeyEvent::new(
+                            KeyEventKind::Press,
+                            KeyCode::Enter,
+                        )))
+                        .unwrap();
+                }
+                // Honor wakes raised while polling (e.g. a timer writing
+                // state) before reading the canvas, but do not await timers.
+                while executor.try_tick() {}
+                let observed_at = clock.now_ms();
+                assert!(
+                    observed_at < before,
+                    "missed the {at}ms observation window before the {before}ms grid/timer boundary: polled at {observed_at}ms"
+                );
+                assert_eq!(
+                    rendered.borrow().as_str(),
+                    expected,
+                    "at {observed_at}ms (target {at}ms)"
+                );
+            }
+        });
     }
 }

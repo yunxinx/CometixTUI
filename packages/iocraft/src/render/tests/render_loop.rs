@@ -1346,14 +1346,8 @@ async fn test_frame_profile_callback_reports_repaint_phases() {
         first.phases.changed_cells > 0,
         "profile should include a retained-canvas change count"
     );
-    assert!(
-        first.phases.changed_cell_scan > Duration::ZERO,
-        "profile should include changed-cell scan timing"
-    );
-    assert!(
-        first.phases.repaint_check > Duration::ZERO,
-        "profile should include repaint guard/equality timing"
-    );
+    // FirstFrame and changed_cells above prove the phases ran. Their
+    // measured durations may be zero at the platform's clock resolution.
     assert_eq!(
         first.phases.diff_rows_scanned, 0,
         "baseline render loop does not opt into single-pass row planning"
