@@ -108,6 +108,28 @@ pub(super) fn canvas_row_ansi_from_col(canvas: &Canvas, y: usize, start_col: usi
     String::from_utf8(row).expect("canvas ANSI rows are valid UTF-8")
 }
 
+fn clear_removed_columns_patch(
+    row: usize,
+    previous_width: usize,
+    next_width: usize,
+) -> Option<TerminalPatch> {
+    if next_width >= previous_width {
+        return None;
+    }
+    // Row writers only know the new width. Clear the removed columns with
+    // default styling, without touching cells beyond the previous canvas.
+    let reset = if crate::ansi::styles_enabled() {
+        "\x1b[0m"
+    } else {
+        ""
+    };
+    Some(TerminalPatch::Stdout(format!(
+        "\x1b[{row};{}H{reset}\x1b[{}X",
+        next_width + 1,
+        previous_width - next_width
+    )))
+}
+
 /// Produces absolute fullscreen canvas diff patches for a custom renderer.
 ///
 /// This is an opt-in patch-list counterpart to iocraft's built-in fullscreen
@@ -115,7 +137,9 @@ pub(super) fn canvas_row_ansi_from_col(canvas: &Canvas, y: usize, start_col: usi
 /// addressing from a known origin: unchanged rows are skipped, changed rows are
 /// written from their first changed column through EOL, damaged rows are honored
 /// through [`Canvas::row_change_start`], and rows removed by a shorter next
-/// canvas are cleared with `CSI 2 K`. The function performs no terminal I/O and
+/// canvas are cleared with `CSI 2 K`. Columns removed by a narrower next canvas
+/// are erased with default styling up to the previous width using bounded ECH.
+/// The function performs no terminal I/O and
 /// does not add cursor anchor/park or synchronized-output wrappers; pair it with
 /// [`plan_terminal_fullscreen_diff_patches`], [`optimize_terminal_patches`], and
 /// [`terminal_patches_to_ansi`] as needed.
@@ -160,6 +184,13 @@ pub fn terminal_fullscreen_canvas_diff_patches(
             diff.push(TerminalPatch::Stdout(canvas_row_ansi_from_col(
                 next, y, start_col,
             )));
+            if let Some(previous) = previous
+                && y < previous.height()
+                && let Some(clear) =
+                    clear_removed_columns_patch(row, previous.width(), next.width())
+            {
+                diff.push(clear);
+            }
         } else {
             diff.push(TerminalPatch::Stdout("\x1b[2K".to_string()));
         }
@@ -221,6 +252,12 @@ pub fn terminal_fullscreen_packed_canvas_diff_patches(
                 y,
                 start_col,
             )));
+            if let Some(previous) = previous
+                && y < previous.height
+                && let Some(clear) = clear_removed_columns_patch(row, previous.width, next.width)
+            {
+                diff.push(clear);
+            }
         } else {
             diff.push(TerminalPatch::Stdout("\x1b[2K".to_string()));
         }

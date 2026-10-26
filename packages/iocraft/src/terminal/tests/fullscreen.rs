@@ -2,6 +2,87 @@ use super::super::*;
 use crate::prelude::*;
 
 #[test]
+fn test_fullscreen_frame_width_shrink_clears_removed_columns() {
+    for packed in [false, true] {
+        for terminal_width in [10, 14] {
+            for top_row in [0, 1] {
+                for (width, content) in [(5, "abc"), (5, "abcde"), (0, "")] {
+                    let make_canvas = |width, content| {
+                        let mut canvas = Canvas::new(width, 1);
+                        let mut view = canvas.subview_mut(0, 0, 0, 0, width, 1);
+                        view.set_background_color(0, 0, width, 1, Color::DarkBlue);
+                        view.set_text(0, 0, content, CanvasTextStyle::default());
+                        canvas.clear_damage();
+                        canvas
+                    };
+                    let first = make_canvas(10, "abcdefghij");
+                    let next = make_canvas(width, content);
+                    let options = TerminalFullscreenCanvasFramePatchOptions {
+                        canvas_diff: TerminalFullscreenCanvasDiffOptions {
+                            top_row,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let plans = if packed {
+                        let mut pools = CanvasPackedCellPools::new();
+                        let first = first.pack_with(&mut pools);
+                        let next = next.pack_with(&mut pools);
+                        let mut state = TerminalFullscreenPackedCanvasFrameState::new();
+                        [
+                            state.plan_frame(&first, &pools, options.clone()),
+                            state.plan_frame(&next, &pools, options.clone()),
+                            state.plan_frame(&next, &pools, options),
+                        ]
+                    } else {
+                        let mut state = TerminalFullscreenCanvasFrameState::new();
+                        [
+                            state.plan_frame(&first, options.clone()),
+                            state.plan_frame(&next, options.clone()),
+                            state.plan_frame(&next, options),
+                        ]
+                    };
+                    assert!(!plans[0].is_empty());
+                    assert!(!plans[1].is_empty());
+                    assert!(plans[2].is_empty());
+
+                    let mut vt = avt::Vt::new(terminal_width, 3);
+                    let outside = if terminal_width == 14 { "KEEP" } else { "" };
+                    vt.feed_str(&format!(
+                        "\x1b[{};1H\x1b[42m0123456789{outside}\x1b[0m",
+                        top_row + 1
+                    ));
+                    for (frame, plan) in plans.iter().enumerate() {
+                        let ansi = terminal_patches_to_ansi(&plan.patches, true);
+                        vt.feed_str(&ansi);
+                        let expected = if frame == 0 {
+                            format!("abcdefghij{outside}")
+                        } else {
+                            format!("{content:10}{outside}")
+                        };
+                        assert_eq!(
+                            vt.line(top_row as usize).text(),
+                            expected,
+                            "packed={packed}, width={width}, frame={frame}, {ansi:?}"
+                        );
+                        for (col, cell) in vt.line(top_row as usize).cells().iter().enumerate() {
+                            let background = if col >= 10 {
+                                Some(avt::Color::Indexed(2))
+                            } else if frame == 0 || col < width {
+                                Some(avt::Color::Indexed(4))
+                            } else {
+                                None
+                            };
+                            assert_eq!(cell.pen().background(), background, "column {col}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn test_plan_terminal_fullscreen_diff_patches_matches_cc_alt_screen_anchor_and_park() {
     let mut diff = vec![TerminalPatch::Stdout("body".to_string())];
     let plan = plan_terminal_fullscreen_diff_patches(TerminalFullscreenDiffPatchOptions {

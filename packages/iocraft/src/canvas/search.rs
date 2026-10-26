@@ -1,11 +1,18 @@
 use super::*;
+use caseless::Caseless;
 
 /// Applies Unicode default case folding for case-insensitive substring search.
 ///
 /// Filtering unrendered text with this function uses the same equivalence rules as
 /// [`Canvas::scan_text_positions`], including final sigma and expanding mappings.
 pub fn fold_search_text(text: &str) -> String {
-    caseless::default_case_fold_str(text)
+    // caseless 0.2.2 has Unicode 16 data. Lowercase with the toolchain's newer
+    // tables first to retain its simple case pairs, then fold expansions and
+    // scripts such as Cherokee whose default fold is uppercase.
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .default_case_fold()
+        .collect()
 }
 
 impl Canvas {
@@ -100,6 +107,10 @@ impl Canvas {
                     len: absolute_end.saturating_sub(start_col),
                 });
                 search_from = pos + query.len();
+                // A folded match may end inside an expanded grapheme. Resume
+                // after its entire source cell so visible spans cannot overlap.
+                search_from +=
+                    byte_to_cell[search_from..].partition_point(|&cell| cell == end_cell);
             }
         }
         positions

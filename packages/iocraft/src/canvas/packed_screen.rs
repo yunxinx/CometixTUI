@@ -1935,6 +1935,10 @@ impl CanvasPackedScreen {
                     len: absolute_end.saturating_sub(start_col),
                 });
                 search_from = pos + query.len();
+                // A folded match may end inside an expanded grapheme. Resume
+                // after its entire source cell so visible spans cannot overlap.
+                search_from +=
+                    byte_to_cell[search_from..].partition_point(|&cell| cell == end_cell);
             }
         }
         positions

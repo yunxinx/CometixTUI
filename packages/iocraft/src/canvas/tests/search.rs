@@ -4,6 +4,85 @@ use crate::prelude::*;
 use crossterm::csi;
 
 #[test]
+fn test_search_preserves_unicode_17_case_pairs() {
+    for (upper, lower) in [
+        ("\u{a7ce}", "\u{a7cf}"),
+        ("\u{a7d2}", "\u{a7d3}"),
+        ("\u{a7d4}", "\u{a7d5}"),
+        ("\u{16ea0}", "\u{16ebb}"),
+        ("\u{16eb8}", "\u{16ed3}"),
+    ] {
+        assert_eq!(fold_search_text(upper), lower);
+        assert_eq!(fold_search_text(lower), lower);
+        for text in [upper, lower] {
+            let mut canvas = Canvas::new(2, 1);
+            canvas
+                .subview_mut(0, 0, 0, 0, 2, 1)
+                .set_text(0, 0, text, CanvasTextStyle::default());
+            let mut pools = CanvasPackedCellPools::new();
+            let packed = canvas.pack_with(&mut pools);
+            for query in [upper, lower] {
+                let expected = vec![TextMatchPosition {
+                    row: 0,
+                    col: 0,
+                    len: 1,
+                }];
+                assert_eq!(
+                    canvas.scan_text_positions(query),
+                    expected,
+                    "{text:?}/{query:?}"
+                );
+                assert_eq!(packed.scan_text_positions(&pools, query), expected);
+            }
+        }
+    }
+    // Cherokee default folding uses uppercase, so lowercasing alone is not a fold.
+    assert_eq!(fold_search_text("\u{13a0}\u{ab70}"), "\u{13a0}\u{13a0}");
+    assert_eq!(fold_search_text("ΟΣ ος ß ﬃ İ"), "οσ οσ ss ffi i\u{307}");
+}
+
+#[test]
+fn test_search_expansions_do_not_overlap_terminal_cells() {
+    for (text, query, spans) in [
+        ("ß", "s", vec![(0, 1)]),
+        ("ﬃ", "f", vec![(0, 1)]),
+        ("sßs", "ss", vec![(0, 2)]),
+        ("ßßs", "s", vec![(0, 1), (1, 1), (2, 1)]),
+        ("sßs ss", "ss", vec![(0, 2), (4, 2)]),
+        ("中ßß", "s", vec![(2, 1), (3, 1)]),
+    ] {
+        let mut canvas = Canvas::new(12, 3);
+        canvas
+            .subview_mut(0, 0, 0, 0, 12, 3)
+            .set_text(2, 1, text, CanvasTextStyle::default());
+        let mut pools = CanvasPackedCellPools::new();
+        let packed = canvas.pack_with(&mut pools);
+        let absolute: Vec<_> = spans
+            .iter()
+            .map(|&(col, len)| TextMatchPosition {
+                row: 1,
+                col: col + 2,
+                len,
+            })
+            .collect();
+        let relative: Vec<_> = spans
+            .iter()
+            .map(|&(col, len)| TextMatchPosition { row: 0, col, len })
+            .collect();
+        assert_eq!(
+            [
+                canvas.scan_text_positions(query),
+                packed.scan_text_positions(&pools, query),
+                canvas.scan_text_positions_region(2, 1, 10, 1, query),
+                packed.scan_text_positions_region(&pools, 2, 1, 10, 1, query),
+            ],
+            [absolute.clone(), absolute, relative.clone(), relative],
+            "text {text:?}, query {query:?}"
+        );
+    }
+}
+
+#[test]
 fn test_search_folds_unicode_and_maps_expansions_to_terminal_cells() {
     let mut canvas = Canvas::new(24, 1);
     canvas.subview_mut(0, 0, 0, 0, 24, 1).set_text(
