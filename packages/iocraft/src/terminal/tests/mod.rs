@@ -23,6 +23,48 @@ impl Write for TestWriter {
 }
 
 #[test]
+fn test_caller_input_stream_survives_terminal_handoff() {
+    let (mut terminal, _) = Terminal::mock(MockTerminalConfig::default());
+    let source = stream::iter([Ok(TerminalEvent::Key(KeyEvent::new(
+        KeyEventKind::Press,
+        KeyCode::Char('x'),
+    )))]);
+    terminal.set_input_stream(source.boxed()).unwrap();
+    terminal.release_terminal().unwrap();
+    terminal.reacquire_terminal().unwrap();
+    assert!(matches!(
+        terminal.poll_event_stream_now(),
+        Poll::Ready(Some(Ok(TerminalEvent::Key(KeyEvent {
+            code: KeyCode::Char('x'),
+            ..
+        }))))
+    ));
+}
+
+#[test]
+fn test_utf8_input_stream_retains_partial_and_malformed_characters() {
+    let bytes = vec![Ok(vec![0xff, 0xe6]), Ok(vec![0x97]), Ok(vec![0xa9, 0xe6])];
+    let events = smol::block_on(
+        TerminalRawInputFallibleEventStream::new_utf8(stream::iter(bytes)).collect::<Vec<_>>(),
+    );
+    let codes: Vec<_> = events
+        .into_iter()
+        .map(|event| match event.unwrap() {
+            TerminalEvent::Key(key) => key.code,
+            other => panic!("expected text, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            KeyCode::Char('\u{fffd}'),
+            KeyCode::Char('早'),
+            KeyCode::Char('\u{fffd}')
+        ]
+    );
+}
+
+#[test]
 fn test_event_cell_snapshot_follows_mouse_capture() {
     let mut terminal = Terminal::new(
         Box::new(TestWriter::default()),
@@ -30,6 +72,7 @@ fn test_event_cell_snapshot_follows_mouse_capture() {
         Output::Stdout,
         false,
         false,
+        None,
     )
     .unwrap();
     let canvas = Canvas::new(4, 2);
@@ -58,6 +101,7 @@ fn test_terminal_set_clipboard_writes_raw_osc52_without_sync_update() {
         Output::Stdout,
         false,
         false,
+        None,
     )
     .unwrap();
     stdout.buf.lock().unwrap().clear(); // discard setup cursor-hide bytes
@@ -82,6 +126,7 @@ fn test_terminal_control_sequence_writes_raw_without_sync_update() {
         Output::Stdout,
         false,
         false,
+        None,
     )
     .unwrap();
     stdout.buf.lock().unwrap().clear(); // discard setup cursor-hide bytes
@@ -128,6 +173,7 @@ fn test_terminal_side_band_writes_flush_immediately() {
         Output::Stdout,
         false,
         false,
+        None,
     )
     .unwrap();
     let baseline = stdout.flushes.load(Ordering::SeqCst);
@@ -168,6 +214,7 @@ fn test_terminal_drop_clears_progress_after_showing_cursor() {
         Output::Stdout,
         false,
         false,
+        None,
     )
     .unwrap();
     stdout.buf.lock().unwrap().clear();
@@ -414,6 +461,7 @@ fn test_terminal_set_clipboard_with_multiplexer_wraps_osc52() {
         Output::Stdout,
         false,
         false,
+        None,
     )
     .unwrap();
     stdout.buf.lock().unwrap().clear();
@@ -511,6 +559,7 @@ fn test_std_terminal() {
         Output::Stdout,
         false,
         true,
+        None,
     )
     .unwrap();
     assert!(!terminal.is_raw_mode_enabled());
@@ -2594,6 +2643,7 @@ fn test_terminal_query_methods_write_side_band_and_resolve() {
         Output::Stdout,
         false,
         false,
+        None,
     )
     .unwrap();
 
@@ -2777,6 +2827,7 @@ fn test_resize_event_triggers_terminal_mode_reassertion() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        caller_input_stream: false,
         pending_event: None,
         event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
@@ -2829,6 +2880,7 @@ fn test_stdin_gap_reasserts_terminal_modes_like_cc_ink() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        caller_input_stream: false,
         pending_event: None,
         event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
@@ -2884,6 +2936,7 @@ fn test_same_size_resize_event_is_ignored() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        caller_input_stream: false,
         pending_event: None,
         event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
@@ -2943,6 +2996,7 @@ fn test_end_of_synchronized_update_reports_errors() {
         Output::Stdout,
         false,
         false,
+        None,
     )
     .unwrap();
     terminal.synchronized_update_supported = true;
@@ -2968,6 +3022,7 @@ fn test_synchronized_update_is_lazy() {
         Output::Stdout,
         false,
         false,
+        None,
     )
     .unwrap();
     term.synchronized_update_supported = true;
@@ -3010,6 +3065,7 @@ fn test_synchronized_update_stays_lazy_for_noop_cursor_positioning() {
         Output::Stdout,
         false,
         false,
+        None,
     )
     .unwrap();
     term.synchronized_update_supported = true;
@@ -3034,6 +3090,7 @@ fn test_synchronized_update_stays_lazy_for_noop_clear_canvas() {
         Output::Stdout,
         false,
         false,
+        None,
     )
     .unwrap();
     term.synchronized_update_supported = true;
@@ -3058,6 +3115,7 @@ fn test_synchronized_update_wraps_clear_canvas_when_it_writes() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        caller_input_stream: false,
         pending_event: None,
         event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
@@ -3111,6 +3169,7 @@ fn test_synchronized_update_stays_lazy_for_identical_canvas_write() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        caller_input_stream: false,
         pending_event: None,
         event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
@@ -3161,6 +3220,7 @@ fn test_synchronized_update_wraps_current_damage_canvas_write() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        caller_input_stream: false,
         pending_event: None,
         event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
@@ -3222,6 +3282,7 @@ fn test_synchronized_update_wraps_previous_damage_canvas_write() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        caller_input_stream: false,
         pending_event: None,
         event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
@@ -3280,6 +3341,7 @@ fn test_synchronized_update_stays_lazy_for_identical_fullscreen_canvas_write() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        caller_input_stream: false,
         pending_event: None,
         event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
@@ -3319,6 +3381,7 @@ fn test_synchronized_update_wraps_cursor_positioning_when_it_writes() {
         Output::Stdout,
         false,
         false,
+        None,
     )
     .unwrap();
     term.synchronized_update_supported = true;
@@ -3359,6 +3422,7 @@ fn test_synchronized_update_wraps_pending_wrap_resolution() {
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
+        caller_input_stream: false,
         pending_event: None,
         event_stream_wake: Arc::new(super::EventStreamWake::default()),
         subscribers: Vec::new(),
@@ -3407,6 +3471,7 @@ fn test_synchronized_update_skips_markers_when_unsupported() {
         Output::Stdout,
         false,
         false,
+        None,
     )
     .unwrap();
     term.synchronized_update_supported = false;
@@ -3481,6 +3546,7 @@ fn test_fullscreen_terminal_enters_alt_screen_clears_and_homes() {
         Output::Stdout,
         true,
         false,
+        None,
     )
     .unwrap();
 
@@ -3508,6 +3574,7 @@ fn test_dynamic_alternate_screen_enters_clears_homes_and_exits() {
         Output::Stdout,
         false,
         false,
+        None,
     )
     .unwrap();
 
@@ -5073,6 +5140,7 @@ fn test_borrowed_writers() {
             Output::Stdout,
             false,
             true,
+            None,
         )
         .unwrap();
         let canvas = Canvas::new(10, 1);

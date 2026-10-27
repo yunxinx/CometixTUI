@@ -274,6 +274,7 @@ pub(crate) struct Terminal<'a> {
     output: Output,
     base_fullscreen: bool,
     event_stream: Option<BoxStream<'static, io::Result<TerminalEvent>>>,
+    caller_input_stream: bool,
     pending_event: Option<io::Result<TerminalEvent>>,
     event_stream_wake: Arc<EventStreamWake>,
     subscribers: Vec<Weak<TerminalEventsShared>>,
@@ -322,6 +323,7 @@ impl<'a> Terminal<'a> {
         output: Output,
         fullscreen: bool,
         mouse_capture: bool,
+        keyboard_support: Option<bool>,
     ) -> io::Result<Self> {
         // dest is the render destination, alt is the other stream
         let (dest, alt) = match output {
@@ -329,10 +331,17 @@ impl<'a> Terminal<'a> {
             Output::Stderr => (stderr, stdout),
         };
         Ok(Self {
-            inner: Box::new(StdTerminal::new(dest, alt, fullscreen, mouse_capture)?),
+            inner: Box::new(StdTerminal::new(
+                dest,
+                alt,
+                fullscreen,
+                mouse_capture,
+                keyboard_support,
+            )?),
             output,
             base_fullscreen: fullscreen,
             event_stream: None,
+            caller_input_stream: false,
             pending_event: None,
             event_stream_wake: Arc::new(EventStreamWake::default()),
             subscribers: Vec::new(),
@@ -685,9 +694,12 @@ impl<'a> Terminal<'a> {
     /// Releases raw/input modes so another process (or direct writes) can own
     /// the terminal. Dropping the event stream releases crossterm's input
     /// reader while the terminal is handed off; it is recreated by
-    /// [`Terminal::reacquire_terminal`].
+    /// [`Terminal::reacquire_terminal`]. Caller-owned streams retain their buffered
+    /// events and are not polled until the handoff finishes.
     pub fn release_terminal(&mut self) -> io::Result<()> {
-        self.event_stream = None;
+        if !self.caller_input_stream {
+            self.event_stream = None;
+        }
         self.inner.release_terminal_modes()
     }
 
@@ -753,6 +765,16 @@ impl<'a> Terminal<'a> {
         let mut t = SynchronizedUpdate::begin(self);
         let result = f(t.inner.as_deref_mut().unwrap());
         result.and(t.finish())
+    }
+
+    pub(crate) fn set_input_stream(
+        &mut self,
+        stream: BoxStream<'static, io::Result<TerminalEvent>>,
+    ) -> io::Result<()> {
+        self.inner.set_raw_mode_enabled(true)?;
+        self.event_stream = Some(stream);
+        self.caller_input_stream = true;
+        Ok(())
     }
 
     pub fn start_event_stream(&mut self) -> io::Result<()> {
@@ -987,11 +1009,13 @@ impl<'a> Terminal<'a> {
 }
 
 impl Terminal<'static> {
-    pub fn mock(config: MockTerminalConfig) -> (Self, MockTerminalOutputStream) {
+    pub fn mock(mut config: MockTerminalConfig) -> (Self, MockTerminalOutputStream) {
         let ignore_ctrl_c = config.ignore_ctrl_c;
         let suspend_on_ctrl_z = config.suspend_on_ctrl_z;
         let canvas_diff_planning = config.canvas_diff_planning;
         let input_backend = config.input_backend;
+        let input_stream = config.input_stream.take();
+        let caller_input_stream = input_stream.is_some();
         let (term, output_stream) = MockTerminal::new(config);
         let base_fullscreen = term.fullscreen;
         (
@@ -999,7 +1023,8 @@ impl Terminal<'static> {
                 inner: Box::new(term),
                 output: Output::Stdout,
                 base_fullscreen,
-                event_stream: None,
+                event_stream: input_stream,
+                caller_input_stream,
                 pending_event: None,
                 event_stream_wake: Arc::new(EventStreamWake::default()),
                 subscribers: Vec::new(),

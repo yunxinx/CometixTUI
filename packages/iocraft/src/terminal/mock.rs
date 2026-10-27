@@ -32,6 +32,7 @@ pub struct MockTerminalConfig {
     pub canvas_diff_planning: TerminalDiffPlanning,
     /// Opt-in input backend mode for render-loop tests.
     pub input_backend: TerminalInputBackend,
+    pub(crate) input_stream: Option<BoxStream<'static, io::Result<TerminalEvent>>>,
     /// Receives every terminal title the mock is asked to set, in order.
     pub(crate) title_sink: Option<mpsc::UnboundedSender<String>>,
     /// Receives every raw control sequence written on the side band, in order.
@@ -49,9 +50,19 @@ impl MockTerminalConfig {
             suspend_on_ctrl_z: false,
             canvas_diff_planning: TerminalDiffPlanning::Baseline,
             input_backend: TerminalInputBackend::Crossterm,
+            input_stream: None,
             title_sink: None,
             control_sink: None,
         }
+    }
+
+    /// Supplies fallible caller-owned input, as [`crate::RenderLoopFuture::input_stream`] does.
+    pub fn with_input_stream<S>(mut self, stream: S) -> Self
+    where
+        S: Stream<Item = io::Result<TerminalEvent>> + Send + 'static,
+    {
+        self.input_stream = Some(stream.boxed());
+        self
     }
 
     /// Delays each event so tests that inspect painted frames keep distinct input batches.
@@ -134,6 +145,7 @@ impl Default for MockTerminalConfig {
             suspend_on_ctrl_z: false,
             canvas_diff_planning: TerminalDiffPlanning::Baseline,
             input_backend: TerminalInputBackend::Crossterm,
+            input_stream: None,
             title_sink: None,
             control_sink: None,
         }

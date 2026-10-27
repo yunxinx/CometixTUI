@@ -1004,6 +1004,23 @@ mod tests {
     }
 
     #[apply(test!)]
+    async fn test_caller_input_stream_preserves_utf8_paste_and_key_order() {
+        let input = "hi早\x1b[200~粘贴\x1b[201~\x1b[D!\rx";
+        let bytes: Vec<_> = input
+            .as_bytes()
+            .iter()
+            .map(|byte| Ok(vec![*byte]))
+            .collect();
+        let stream = TerminalRawInputFallibleEventStream::new_utf8(stream::iter(bytes))
+            .chain(stream::iter([Ok(TerminalEvent::Resize(80, 24))]));
+        let frames: Vec<_> = element!(ControlledInput)
+            .mock_terminal_render_loop(MockTerminalConfig::default().with_input_stream(stream))
+            .collect()
+            .await;
+        assert_eq!(frames.last().unwrap().to_string(), "sent=hi早粘!贴\nx\n");
+    }
+
+    #[apply(test!)]
     async fn test_controlled_input_commits_between_batched_keys() {
         let events = [
             KeyCode::Char('h'),

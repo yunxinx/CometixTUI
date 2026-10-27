@@ -677,6 +677,44 @@ pub struct TerminalRawInputFallibleEventStream {
 }
 
 impl TerminalRawInputFallibleEventStream {
+    /// Creates a UTF-8 byte stream, preserving characters split across reads.
+    ///
+    /// Malformed bytes are replaced as UTF-8 rather than interpreted as legacy
+    /// high-bit Meta keys. Escape sequences and bracketed pastes keep their parser
+    /// state across chunks, including bytes prepended by a startup terminal probe.
+    pub fn new_utf8<S>(source: S) -> Self
+    where
+        S: Stream<Item = io::Result<Vec<u8>>> + Send + 'static,
+    {
+        let source = futures::stream::unfold(
+            (source.boxed(), Vec::new(), false),
+            |(mut source, mut buffered, finished)| async move {
+                if finished {
+                    return None;
+                }
+                loop {
+                    match source.next().await {
+                        Some(Ok(bytes)) => {
+                            buffered.extend(bytes);
+                            let decoded = complete_utf8(&mut buffered);
+                            if !decoded.is_empty() {
+                                return Some((Ok(decoded), (source, buffered, false)));
+                            }
+                        }
+                        Some(Err(error)) => return Some((Err(error), (source, buffered, true))),
+                        None => {
+                            let decoded =
+                                String::from_utf8_lossy(&buffered).into_owned().into_bytes();
+                            return (!decoded.is_empty())
+                                .then_some((Ok(decoded), (source, Vec::new(), true)));
+                        }
+                    }
+                }
+            },
+        );
+        Self::new(source)
+    }
+
     /// Creates a fallible event stream with stdin-oriented X10 mouse parsing enabled.
     pub fn new<S>(source: S) -> Self
     where
@@ -754,6 +792,30 @@ impl TerminalRawInputFallibleEventStream {
     fn arm_flush_delay(&mut self, timeout: Option<Duration>) {
         self.flush_delay = timeout.map(|duration| Box::pin(Delay::new(duration)));
     }
+}
+
+fn complete_utf8(buffered: &mut Vec<u8>) -> Vec<u8> {
+    let mut complete = 0;
+    while complete < buffered.len() {
+        match std::str::from_utf8(&buffered[complete..]) {
+            Ok(_) => {
+                complete = buffered.len();
+                break;
+            }
+            Err(error) => {
+                complete += error.valid_up_to();
+                match error.error_len() {
+                    Some(length) => complete += length,
+                    None => break,
+                }
+            }
+        }
+    }
+    let decoded = String::from_utf8_lossy(&buffered[..complete])
+        .into_owned()
+        .into_bytes();
+    buffered.drain(..complete);
+    decoded
 }
 
 impl Stream for TerminalRawInputFallibleEventStream {

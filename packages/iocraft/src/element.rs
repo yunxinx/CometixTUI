@@ -1,6 +1,7 @@
 use crate::{
     Canvas, FrameProfileCallback, MockTerminalConfig, RenderFrameProfile, Terminal,
-    TerminalDiffPlanning, TerminalInputBackend, TerminalRawInputSessionOptions, TextMatchPosition,
+    TerminalDiffPlanning, TerminalEvent, TerminalInputBackend, TerminalRawInputSessionOptions,
+    TextMatchPosition,
     any_key::AnyKey,
     component::{Component, ComponentHelper, ComponentHelperExt},
     mock_terminal_render_loop, mock_terminal_render_loop_with_profile,
@@ -8,7 +9,7 @@ use crate::{
     render, terminal_render_loop,
 };
 use crossterm::terminal;
-use futures::Stream;
+use futures::{Stream, StreamExt, stream::BoxStream};
 use std::{
     fmt::Debug,
     future::Future,
@@ -370,6 +371,7 @@ enum RenderLoopFutureState<'a, E: ElementExt> {
         frame_profile: Option<FrameProfileCallback<'a>>,
         terminal_diff_planning: TerminalDiffPlanning,
         input_backend: TerminalInputBackend,
+        input_stream: Option<(BoxStream<'static, io::Result<TerminalEvent>>, bool)>,
         element: &'a mut E,
     },
     Running(Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>),
@@ -405,6 +407,7 @@ impl<'a, E: ElementExt + 'a> RenderLoopFuture<'a, E> {
                 frame_profile: None,
                 terminal_diff_planning: TerminalDiffPlanning::Baseline,
                 input_backend: TerminalInputBackend::Crossterm,
+                input_stream: None,
                 element,
             },
         }
@@ -494,6 +497,27 @@ impl<'a, E: ElementExt + 'a> RenderLoopFuture<'a, E> {
                 *b = input_backend;
             }
             _ => panic!("input_backend() must be called before polling the future"),
+        }
+        self
+    }
+
+    /// Supplies the input events for this render loop, replacing the selected input backend.
+    ///
+    /// The stream must read input only when polled. The render loop enables and restores
+    /// terminal modes, pauses polling during terminal handoffs, and retains the stream's
+    /// buffered events until polling resumes. Dropping the render loop drops the stream.
+    /// Pass keyboard protocol support from the caller's probe, since the default synchronous
+    /// keyboard query consumes stdin. No crossterm input reader is started for this stream.
+    /// This permits a startup probe to prepend bytes to the same parser that reads live input.
+    pub fn input_stream<S>(mut self, stream: S, supports_keyboard_enhancement: bool) -> Self
+    where
+        S: Stream<Item = io::Result<TerminalEvent>> + Send + 'static,
+    {
+        match &mut self.state {
+            RenderLoopFutureState::Init { input_stream, .. } => {
+                *input_stream = Some((stream.boxed(), supports_keyboard_enhancement));
+            }
+            _ => panic!("input_stream() must be called before polling the future"),
         }
         self
     }
@@ -661,6 +685,7 @@ impl<'a, E: ElementExt + Send + 'a> Future for RenderLoopFuture<'a, E> {
                         frame_profile,
                         terminal_diff_planning,
                         input_backend,
+                        input_stream,
                         element,
                     ) = match std::mem::replace(&mut self.state, RenderLoopFutureState::Empty) {
                         RenderLoopFutureState::Init {
@@ -675,6 +700,7 @@ impl<'a, E: ElementExt + Send + 'a> Future for RenderLoopFuture<'a, E> {
                             frame_profile,
                             terminal_diff_planning,
                             input_backend,
+                            input_stream,
                             element,
                         } => (
                             fullscreen,
@@ -688,6 +714,7 @@ impl<'a, E: ElementExt + Send + 'a> Future for RenderLoopFuture<'a, E> {
                             frame_profile,
                             terminal_diff_planning,
                             input_backend,
+                            input_stream,
                             element,
                         ),
                         _ => unreachable!(),
@@ -704,6 +731,7 @@ impl<'a, E: ElementExt + Send + 'a> Future for RenderLoopFuture<'a, E> {
                         output,
                         fullscreen,
                         effective_mouse_capture,
+                        input_stream.as_ref().map(|(_, supported)| *supported),
                     ) {
                         Ok(t) => t,
                         Err(e) => return std::task::Poll::Ready(Err(e)),
@@ -722,6 +750,11 @@ impl<'a, E: ElementExt + Send + 'a> Future for RenderLoopFuture<'a, E> {
                     }
                     terminal.set_canvas_diff_planning(terminal_diff_planning);
                     terminal.set_input_backend(input_backend);
+                    if let Some((stream, _)) = input_stream
+                        && let Err(error) = terminal.set_input_stream(stream)
+                    {
+                        return std::task::Poll::Ready(Err(error));
+                    }
                     let fut = Box::pin(terminal_render_loop(
                         element,
                         terminal,

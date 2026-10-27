@@ -1218,6 +1218,7 @@ impl<'a> StdTerminal<'a> {
         alt: Box<dyn Write + Send + 'a>,
         fullscreen: bool,
         mouse_capture: bool,
+        keyboard_support: Option<bool>,
     ) -> io::Result<Self> {
         let input_is_terminal = stdin().is_terminal();
         // The probe blocks on a query response, and some terminals (e.g. WezTerm)
@@ -1225,7 +1226,8 @@ impl<'a> StdTerminal<'a> {
         // from within a render would stall until the query times out.
         let supports_keyboard_enhancement = input_is_terminal
             && supports_extended_keys()
-            && terminal::supports_keyboard_enhancement().unwrap_or(false);
+            && keyboard_support
+                .unwrap_or_else(|| terminal::supports_keyboard_enhancement().unwrap_or(false));
         let mut term = Self {
             dest: TerminalWriter::new(dest),
             alt,
