@@ -8,7 +8,7 @@ use crate::{
     element::Output,
 };
 use crossterm::{
-    ExecutableCommand, QueueableCommand, cursor,
+    QueueableCommand, cursor,
     event::{self, Event, EventStream},
     terminal,
 };
@@ -47,13 +47,15 @@ mod log_update;
 mod mock;
 mod query;
 mod scroll_hint;
+mod synchronized;
+use synchronized::{OutputContext, OutputWriter, SynchronizedOutput};
 
 #[cfg(test)]
 use backend::{
     PANIC_RESTORE_STATE, clear_canvas_inline, register_terminal_for_panic_restore,
     unregister_terminal_for_panic_restore,
 };
-use backend::{StdTerminal, TerminalImpl};
+use backend::{ScreenTransition, ScreenTransitionPlan, StdTerminal, TerminalImpl};
 pub use capability::*;
 #[cfg(test)]
 use capability::{
@@ -291,9 +293,7 @@ pub(crate) struct Terminal<'a> {
     canvas_diff_planning: TerminalDiffPlanning,
     input_backend: TerminalInputBackend,
     raw_input_session_request: Option<TerminalRawInputSessionOptions>,
-    synchronized_update_depth: usize,
-    synchronized_update_started: bool,
-    synchronized_update_supported: bool,
+    synchronized_output: SynchronizedOutput,
 }
 
 // Crossterm keeps the first Pending poll's waker in its background reader.
@@ -358,9 +358,7 @@ impl<'a> Terminal<'a> {
             canvas_diff_planning: TerminalDiffPlanning::Baseline,
             input_backend: TerminalInputBackend::Crossterm,
             raw_input_session_request: None,
-            synchronized_update_depth: 0,
-            synchronized_update_started: false,
-            synchronized_update_supported: is_synchronized_output_supported(),
+            synchronized_output: SynchronizedOutput::new(is_synchronized_output_supported()),
         })
     }
 
@@ -437,7 +435,11 @@ impl<'a> Terminal<'a> {
         if self.base_fullscreen {
             return Ok(false);
         }
-        self.inner.set_dynamic_alternate_screen(request)
+        let plan = self.inner.plan_screen_transition(request);
+        if plan.writes_output {
+            self.ensure_synchronized_update_started()?;
+        }
+        self.inner.apply_screen_transition(plan)
     }
 
     pub fn refresh_size(&mut self) {
@@ -474,9 +476,8 @@ impl<'a> Terminal<'a> {
         if self.inner.write_canvas_would_write(prev, canvas) {
             self.ensure_synchronized_update_started()?;
         }
-        let decstbm_safe = self.synchronized_update_supported && self.synchronized_update_started;
-        self.inner.set_decstbm_safe(decstbm_safe);
-        self.inner.write_canvas(prev, canvas)
+        self.inner
+            .write_canvas(prev, canvas, self.synchronized_output.context())
     }
 
     pub(crate) fn set_scrollback_replay(&mut self, replay: Option<ScrollbackReplay>) {
@@ -505,9 +506,8 @@ impl<'a> Terminal<'a> {
         // running the terminal backend's preflight row scan only to repeat the
         // same retained-canvas scan inside write_canvas().
         self.ensure_synchronized_update_started()?;
-        let decstbm_safe = self.synchronized_update_supported && self.synchronized_update_started;
-        self.inner.set_decstbm_safe(decstbm_safe);
-        self.inner.write_canvas(prev, canvas)
+        self.inner
+            .write_canvas(prev, canvas, self.synchronized_output.context())
     }
 
     /// Updates the retained screen-buffer metadata used to annotate mouse events
@@ -710,50 +710,37 @@ impl<'a> Terminal<'a> {
         self.start_event_stream()
     }
 
-    /// Returns a mutable reference to the stdout handle.
-    pub fn stdout(&mut self) -> &mut dyn Write {
-        let _ = self.ensure_synchronized_update_started();
-        match self.output {
-            Output::Stdout => self.inner.dest(),
-            Output::Stderr => self.inner.alt(),
-        }
+    /// Borrows stdout, starting synchronization only when bytes are written.
+    pub fn stdout(&mut self) -> impl Write + '_ {
+        let render_destination = matches!(self.output, Output::Stdout);
+        self.output_writer(render_destination)
     }
 
-    /// Returns a mutable reference to the stderr handle.
-    pub fn stderr(&mut self) -> &mut dyn Write {
-        let _ = self.ensure_synchronized_update_started();
-        match self.output {
-            Output::Stdout => self.inner.alt(),
-            Output::Stderr => self.inner.dest(),
-        }
+    /// Borrows stderr, starting synchronization only when bytes are written.
+    pub fn stderr(&mut self) -> impl Write + '_ {
+        let render_destination = matches!(self.output, Output::Stderr);
+        self.output_writer(render_destination)
     }
 
-    /// Returns a mutable reference to the render output handle (stdout or stderr based on output setting).
-    pub fn render_output(&mut self) -> &mut dyn Write {
-        let _ = self.ensure_synchronized_update_started();
-        self.inner.dest()
+    /// Borrows the configured render destination.
+    pub fn render_output(&mut self) -> impl Write + '_ {
+        self.output_writer(true)
+    }
+
+    fn output_writer(&mut self, render_destination: bool) -> OutputWriter<'_> {
+        OutputWriter {
+            synchronization: &mut self.synchronized_output,
+            backend: self.inner.as_mut(),
+            render_destination,
+        }
     }
 
     fn ensure_synchronized_update_started(&mut self) -> io::Result<()> {
-        if self.synchronized_update_supported
-            && self.synchronized_update_depth > 0
-            && !self.synchronized_update_started
-        {
-            self.inner
-                .dest()
-                .execute(terminal::BeginSynchronizedUpdate)?;
-            self.synchronized_update_started = true;
-        }
-        Ok(())
+        self.synchronized_output.start(self.inner.dest())
     }
 
     fn end_synchronized_update(&mut self) -> io::Result<()> {
-        self.synchronized_update_depth = self.synchronized_update_depth.saturating_sub(1);
-        if self.synchronized_update_depth == 0 && self.synchronized_update_started {
-            self.synchronized_update_started = false;
-            self.inner.dest().execute(terminal::EndSynchronizedUpdate)?;
-        }
-        Ok(())
+        self.synchronized_output.leave(self.inner.dest())
     }
 
     /// Wraps a series of terminal updates in a synchronized update block, making sure to end the
@@ -763,7 +750,10 @@ impl<'a> Terminal<'a> {
         F: FnOnce(&mut Self) -> io::Result<()>,
     {
         let mut t = SynchronizedUpdate::begin(self);
-        let result = f(t.inner.as_deref_mut().unwrap());
+        let result = f(t
+            .inner
+            .as_deref_mut()
+            .expect("unfinished synchronized scope owns its terminal"));
         result.and(t.finish())
     }
 
@@ -1041,9 +1031,7 @@ impl Terminal<'static> {
                 canvas_diff_planning,
                 input_backend,
                 raw_input_session_request: None,
-                synchronized_update_depth: 0,
-                synchronized_update_started: false,
-                synchronized_update_supported: true,
+                synchronized_output: SynchronizedOutput::new(true),
             },
             output_stream,
         )
@@ -1059,7 +1047,9 @@ impl Terminal<'static> {
 
 impl Write for Terminal<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.ensure_synchronized_update_started()?;
+        if !buf.is_empty() {
+            self.ensure_synchronized_update_started()?;
+        }
         self.inner.write(buf)
     }
 
@@ -1076,14 +1066,17 @@ pub(crate) struct SynchronizedUpdate<'a, 'b> {
 
 impl<'a, 'b> SynchronizedUpdate<'a, 'b> {
     pub fn begin(terminal: &'a mut Terminal<'b>) -> Self {
-        terminal.synchronized_update_depth += 1;
+        terminal.synchronized_output.enter();
         Self {
             inner: Some(terminal),
         }
     }
 
     fn finish(mut self) -> io::Result<()> {
-        self.inner.take().unwrap().end_synchronized_update()
+        self.inner
+            .take()
+            .expect("unfinished synchronized scope owns its terminal")
+            .end_synchronized_update()
     }
 }
 

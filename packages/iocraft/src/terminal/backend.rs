@@ -1,5 +1,18 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) enum ScreenTransition {
+    Keep,
+    ConfigureInput { mouse_tracking: bool },
+    Enter { mouse_tracking: bool },
+    Leave,
+}
+
+pub(super) struct ScreenTransitionPlan {
+    pub(super) transition: ScreenTransition,
+    pub(super) writes_output: bool,
+}
+
 pub(super) trait TerminalImpl: Write + Send {
     fn refresh_size(&mut self) {}
     fn size(&self) -> Option<(u16, u16)> {
@@ -142,13 +155,18 @@ pub(super) trait TerminalImpl: Write + Send {
     fn is_fullscreen(&self) -> bool {
         false
     }
-    fn set_dynamic_alternate_screen(
-        &mut self,
+    fn plan_screen_transition(
+        &self,
         _request: Option<crate::context::AlternateScreenRequest>,
-    ) -> io::Result<bool> {
+    ) -> ScreenTransitionPlan {
+        ScreenTransitionPlan {
+            transition: ScreenTransition::Keep,
+            writes_output: false,
+        }
+    }
+    fn apply_screen_transition(&mut self, _plan: ScreenTransitionPlan) -> io::Result<bool> {
         Ok(false)
     }
-    fn set_decstbm_safe(&mut self, _safe: bool) {}
     fn set_scrollback_replay(&mut self, _replay: Option<crate::context::ScrollbackReplay>) {}
     fn clear_canvas_would_write(&self) -> bool {
         true
@@ -173,7 +191,12 @@ pub(super) trait TerminalImpl: Write + Send {
     fn write_canvas_would_write(&self, _prev: Option<&Canvas>, _canvas: &Canvas) -> bool {
         true
     }
-    fn write_canvas(&mut self, prev: Option<&Canvas>, canvas: &Canvas) -> io::Result<()>;
+    fn write_canvas(
+        &mut self,
+        prev: Option<&Canvas>,
+        canvas: &Canvas,
+        output: OutputContext,
+    ) -> io::Result<()>;
     fn event_stream(&mut self) -> io::Result<BoxStream<'static, io::Result<TerminalEvent>>>;
     fn dest(&mut self) -> &mut dyn Write;
     fn alt(&mut self) -> &mut dyn Write;
@@ -432,11 +455,6 @@ pub(super) struct StdTerminal<'a> {
     /// printable byte; before relative cursor movement we resolve that pending state
     /// with CR, mirroring Ink/log-update's cursor model.
     pub(super) inline_pending_wrap: bool,
-    /// Whether it is safe to emit a DECSTBM scroll patch before the row diff. CC
-    /// only enables this optimization when the whole scroll+diff sequence is
-    /// atomic (DEC 2026 synchronized update); otherwise users can see the region
-    /// jump before edge rows are repainted.
-    pub(super) decstbm_safe: bool,
     /// The first inline diff after a fresh initial frame is treated as
     /// contaminated and repainted in full. This mirrors Ink's contaminated-frame
     /// guard: after process startup/re-entry we do not fully control what rows
@@ -667,22 +685,45 @@ impl TerminalImpl for StdTerminal<'_> {
         self.fullscreen
     }
 
-    fn set_dynamic_alternate_screen(
-        &mut self,
+    fn plan_screen_transition(
+        &self,
         request: Option<crate::context::AlternateScreenRequest>,
-    ) -> io::Result<bool> {
-        match (self.fullscreen, request) {
-            (false, Some(request)) => {
+    ) -> ScreenTransitionPlan {
+        let (transition, writes_output) = match (self.fullscreen, request) {
+            (false, Some(request)) => (
+                ScreenTransition::Enter {
+                    mouse_tracking: request.mouse_tracking,
+                },
+                true,
+            ),
+            (true, Some(request)) if self.mouse_capture != request.mouse_tracking => (
+                ScreenTransition::ConfigureInput {
+                    mouse_tracking: request.mouse_tracking,
+                },
+                self.raw_mode_enabled,
+            ),
+            (true, None) => (ScreenTransition::Leave, true),
+            _ => (ScreenTransition::Keep, false),
+        };
+        ScreenTransitionPlan {
+            transition,
+            writes_output,
+        }
+    }
+
+    fn apply_screen_transition(&mut self, plan: ScreenTransitionPlan) -> io::Result<bool> {
+        match plan.transition {
+            ScreenTransition::Keep => Ok(false),
+            ScreenTransition::ConfigureInput { mouse_tracking } => {
+                self.set_mouse_capture(mouse_tracking)?;
+                Ok(false)
+            }
+            ScreenTransition::Enter { mouse_tracking } => {
                 self.restore_cursor_baseline()?;
                 if self.cursor_visible {
                     self.dest.queue(cursor::Hide)?;
                     self.cursor_visible = false;
                 }
-                self.dest
-                    .queue(terminal::EnterAlternateScreen)?
-                    .queue(terminal::Clear(terminal::ClearType::All))?
-                    .queue(cursor::MoveTo(0, 0))?;
-                self.fullscreen = true;
                 self.dynamic_alternate_saved_main_screen = Some(SavedMainScreen {
                     mouse_capture: self.mouse_capture,
                     prev_canvas_height: self.prev_canvas_height,
@@ -690,22 +731,25 @@ impl TerminalImpl for StdTerminal<'_> {
                     inline_bottom_gap: self.inline_bottom_gap,
                     inline_force_full_rewrite_next_diff: self.inline_force_full_rewrite_next_diff,
                 });
+                // Cleanup owns the alternate screen before an enter command can be partially written.
+                self.fullscreen = true;
                 register_fullscreen_mode_for_panic_restore();
-                self.set_mouse_capture(request.mouse_tracking)?;
+                self.dest
+                    .queue(terminal::EnterAlternateScreen)?
+                    .queue(terminal::Clear(terminal::ClearType::All))?
+                    .queue(cursor::MoveTo(0, 0))?;
+                self.set_mouse_capture(mouse_tracking)?;
                 self.reset_retained_output_state();
                 self.dest.flush()?;
                 Ok(true)
             }
-            (true, Some(request)) => {
-                self.set_mouse_capture(request.mouse_tracking)?;
-                Ok(false)
-            }
-            (true, None) => {
+            ScreenTransition::Leave => {
                 self.restore_cursor_baseline()?;
-                let saved = self.dynamic_alternate_saved_main_screen.take();
+                let saved = self.dynamic_alternate_saved_main_screen;
                 self.set_mouse_capture(saved.is_some_and(|saved| saved.mouse_capture))?;
                 self.dest.queue(terminal::LeaveAlternateScreen)?;
                 self.fullscreen = false;
+                self.dynamic_alternate_saved_main_screen = None;
                 unregister_fullscreen_mode_for_panic_restore();
                 self.reset_retained_output_state();
                 if let Some(saved) = saved {
@@ -718,16 +762,11 @@ impl TerminalImpl for StdTerminal<'_> {
                 self.dest.flush()?;
                 Ok(true)
             }
-            (false, None) => Ok(false),
         }
     }
 
     fn set_scrollback_replay(&mut self, replay: Option<crate::context::ScrollbackReplay>) {
         self.scrollback_replay = replay;
-    }
-
-    fn set_decstbm_safe(&mut self, safe: bool) {
-        self.decstbm_safe = safe;
     }
 
     fn position_cursor(
@@ -886,12 +925,6 @@ impl TerminalImpl for StdTerminal<'_> {
             if canvas.should_force_full_repaint() {
                 return prev.height().max(canvas.height()) > 0;
             }
-            if self
-                .fullscreen_scroll_hint_candidate(prev, canvas)
-                .is_some()
-            {
-                return true;
-            }
             let max_height = prev.height().max(canvas.height());
             return (0..max_height).any(|y| prev.row_change_start(canvas, y).is_some());
         }
@@ -919,7 +952,12 @@ impl TerminalImpl for StdTerminal<'_> {
         })
     }
 
-    fn write_canvas(&mut self, prev: Option<&Canvas>, canvas: &Canvas) -> io::Result<()> {
+    fn write_canvas(
+        &mut self,
+        prev: Option<&Canvas>,
+        canvas: &Canvas,
+        output: OutputContext,
+    ) -> io::Result<()> {
         if self.inline_full_rewrite_deferred(prev, canvas) {
             return Ok(());
         }
@@ -966,7 +1004,10 @@ impl TerminalImpl for StdTerminal<'_> {
             let scroll_hint = if force_full_repaint {
                 None
             } else {
-                self.fullscreen_scroll_hint(prev, canvas)
+                output
+                    .atomic
+                    .then(|| self.fullscreen_scroll_hint_candidate(prev, canvas))
+                    .flatten()
             };
             let shifted_prev_storage = if let Some(hint) = scroll_hint {
                 self.write_fullscreen_scroll_patch(hint)?;
@@ -1247,7 +1288,6 @@ impl<'a> StdTerminal<'a> {
             cursor_displacement_rows: 0,
             inline_bottom_gap: 0,
             inline_pending_wrap: false,
-            decstbm_safe: false,
             inline_force_full_rewrite_next_diff: false,
             scrollback_replay: None,
             // Best-effort: if signal registration fails, the terminal still works —
@@ -1320,23 +1360,20 @@ impl<'a> StdTerminal<'a> {
         Ok(())
     }
 
-    fn fullscreen_scroll_hint(
-        &self,
-        prev: &Canvas,
-        canvas: &Canvas,
-    ) -> Option<crate::canvas::ScrollHint> {
-        if !self.decstbm_safe {
-            return None;
-        }
-        self.fullscreen_scroll_hint_candidate(prev, canvas)
-    }
-
     fn fullscreen_scroll_hint_candidate(
         &self,
         prev: &Canvas,
         canvas: &Canvas,
     ) -> Option<crate::canvas::ScrollHint> {
         if !self.fullscreen || self.prev_canvas_top_row != 0 {
+            return None;
+        }
+        let (columns, rows) = self.size?;
+        if prev.width() != usize::from(columns)
+            || canvas.width() != usize::from(columns)
+            || prev.height() != canvas.height()
+            || canvas.height() > usize::from(rows)
+        {
             return None;
         }
         let hint = canvas.scroll_hint()?;

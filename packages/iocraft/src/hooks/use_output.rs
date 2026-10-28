@@ -9,7 +9,7 @@ use core::{
 };
 use crossterm::{QueueableCommand, cursor};
 use futures::{channel::oneshot, future::BoxFuture};
-use std::io;
+use std::io::{self, Write};
 use std::{
     borrow::Cow,
     sync::{Arc, Mutex},
@@ -220,33 +220,35 @@ struct OutputBatch {
 }
 
 impl OutputBatch {
-    fn exec(&mut self, updater: &mut ComponentUpdater) {
+    fn exec(&mut self, updater: &mut ComponentUpdater) -> io::Result<()> {
         if self.queue.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Check if we have a terminal - if not, messages stay queued
         if updater.terminal_mut().is_none() {
-            return;
+            return Ok(());
         }
 
         let has_visible_output = self.queue.iter().any(Message::affects_visible_output);
         if has_visible_output {
             updater.clear_terminal_output();
         }
-        let terminal = updater.terminal_mut().unwrap();
+        let Some(terminal) = updater.terminal_mut() else {
+            return Ok(());
+        };
         let terminal_width = terminal.size().map(|(width, _)| width as usize);
 
         if has_visible_output {
             if let Some(col) = self.appended_newline {
-                let _ = terminal
+                terminal
                     .render_output()
                     .queue(cursor::MoveUp(1))
-                    .and_then(|w| w.queue(cursor::MoveRight(col)));
+                    .and_then(|w| w.queue(cursor::MoveRight(col)))?;
             }
             // Flush render output to ensure escape sequences are sent before any
             // cross-stream writes (e.g., stdout messages when rendering to stderr).
-            let _ = terminal.render_output().flush();
+            terminal.render_output().flush()?;
         }
 
         // Track the virtual cursor column ourselves instead of querying the
@@ -261,19 +263,19 @@ impl OutputBatch {
                 Message::Stdout(msg) => {
                     let mut formatted = normalize_terminal_newlines(&msg).into_owned();
                     formatted.push_str("\r\n");
-                    let _ = terminal.stdout().write_all(formatted.as_bytes());
+                    terminal.stdout().write_all(formatted.as_bytes())?;
                     output_col = 0;
                 }
                 Message::StdoutNoNewline(msg) => {
                     let formatted = normalize_terminal_newlines(&msg);
-                    let _ = terminal.stdout().write_all(formatted.as_bytes());
+                    terminal.stdout().write_all(formatted.as_bytes())?;
                     output_col = advance_terminal_column(output_col, &msg, terminal_width);
                 }
                 Message::StdoutClipboard(msg, multiplexer) => {
-                    let _ = terminal.set_clipboard_with_multiplexer(&msg, multiplexer);
+                    terminal.set_clipboard_with_multiplexer(&msg, multiplexer)?;
                 }
                 Message::StdoutControl(sequence) => {
-                    let _ = terminal.write_control_sequence(&sequence);
+                    terminal.write_control_sequence(&sequence)?;
                 }
                 Message::StdoutControlAcknowledged(sequence, sender) => {
                     let result = terminal.write_control_sequence(&sequence);
@@ -282,12 +284,12 @@ impl OutputBatch {
                 Message::Stderr(msg) => {
                     let mut formatted = normalize_terminal_newlines(&msg).into_owned();
                     formatted.push_str("\r\n");
-                    let _ = terminal.stderr().write_all(formatted.as_bytes());
+                    terminal.stderr().write_all(formatted.as_bytes())?;
                     output_col = 0;
                 }
                 Message::StderrNoNewline(msg) => {
                     let formatted = normalize_terminal_newlines(&msg);
-                    let _ = terminal.stderr().write_all(formatted.as_bytes());
+                    terminal.stderr().write_all(formatted.as_bytes())?;
                     output_col = advance_terminal_column(output_col, &msg, terminal_width);
                 }
             }
@@ -296,18 +298,19 @@ impl OutputBatch {
         if has_visible_output {
             // Flush stdout and stderr so the terminal processes all written
             // bytes before we append the trailing newline.
-            let _ = terminal.stdout().flush();
-            let _ = terminal.stderr().flush();
+            terminal.stdout().flush()?;
+            terminal.stderr().flush()?;
             if output_col > 0 {
                 self.appended_newline = match terminal_width {
                     Some(width) if output_col as usize >= width => None,
                     _ => Some(output_col),
                 };
-                let _ = terminal.render_output().write_all(b"\r\n");
+                terminal.render_output().write_all(b"\r\n")?;
             } else {
                 self.appended_newline = None;
             }
         }
+        Ok(())
     }
 }
 
@@ -616,7 +619,8 @@ impl Hook for UseOutputImpl {
         }
         // Callbacks enqueue into state.queue for the next pass. Keep partial-line
         // bookkeeping with the output owner across batches.
-        self.pending.exec(updater);
+        let result = self.pending.exec(updater);
+        updater.record_terminal_result(result);
     }
 }
 

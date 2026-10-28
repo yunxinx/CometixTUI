@@ -1150,20 +1150,42 @@ impl Canvas {
         self.blit_region_from_unmarked(src, x, y, width, height);
     }
 
-    /// [`Self::blit_region_from`] without marking the rows written.
-    ///
-    /// The source must be the terminal diff baseline, or the caller must carry
-    /// its unpainted changes with [`Self::inherit_unpainted_changes`] before
-    /// diffing. Otherwise copying unmarked rows could hide real changes.
-    pub(crate) fn blit_region_from_baseline(
+    /// Restores a trusted render baseline without creating or clearing write metadata.
+    /// Uncommitted source changes must be inherited before terminal diffing.
+    /// A rectangle crossing a wide glyph in either canvas is rejected before any write.
+    pub(crate) fn try_blit_region_from_baseline(
         &mut self,
-        src: &Canvas,
+        source: &Canvas,
         x: usize,
         y: usize,
         width: usize,
         height: usize,
-    ) {
-        self.blit_region_from_unmarked(src, x, y, width, height);
+    ) -> bool {
+        let Some(right) = x.checked_add(width) else {
+            return false;
+        };
+        let Some(bottom) = y.checked_add(height) else {
+            return false;
+        };
+        if width == 0
+            || height == 0
+            || right > self.width
+            || right > source.width
+            || bottom > self.height()
+            || bottom > source.height()
+        {
+            return false;
+        }
+        for canvas in [&*self, source] {
+            if (y..bottom).any(|row| {
+                canvas.cells[row][x].cell_width == CellWidth::WidthTail
+                    || canvas.cells[row][right - 1].cell_width == CellWidth::Wide
+            }) {
+                return false;
+            }
+        }
+        self.copy_region_cells(source, x, y, right, bottom);
+        true
     }
 
     fn blit_region_from_unmarked(
@@ -1186,23 +1208,7 @@ impl Canvas {
             return;
         }
 
-        let full_row = x == 0 && max_x >= self.width && max_x >= src.width;
-        for row in y..max_y {
-            if full_row {
-                // Full-width copies share the source rows instead of deep-
-                // cloning cell-by-cell (CanvasCell carries heap fields); a
-                // row is copied for real only if something later writes it.
-                self.cells[row] = std::sync::Arc::clone(&src.cells[row]);
-                self.overlays[row] = std::sync::Arc::clone(&src.overlays[row]);
-                self.no_select[row] = std::sync::Arc::clone(&src.no_select[row]);
-            } else {
-                self.cells_row_mut(row)[x..max_x].clone_from_slice(&src.cells[row][x..max_x]);
-                self.overlays_row_mut(row)[x..max_x].clone_from_slice(&src.overlays[row][x..max_x]);
-                self.no_select_row_mut(row)[x..max_x]
-                    .clone_from_slice(&src.no_select[row][x..max_x]);
-            }
-            self.soft_wrap[row] = src.soft_wrap[row];
-        }
+        self.copy_region_cells(src, x, y, max_x, max_y);
 
         let mut damage_width = max_x - x;
         if max_x < self.width && max_x < src.width {
@@ -1228,6 +1234,34 @@ impl Canvas {
             width: damage_width,
             height: max_y - y,
         });
+    }
+
+    fn copy_region_cells(
+        &mut self,
+        source: &Canvas,
+        x: usize,
+        y: usize,
+        max_x: usize,
+        max_y: usize,
+    ) {
+        let full_row = x == 0 && max_x >= self.width && max_x >= source.width;
+        for row in y..max_y {
+            if full_row {
+                // Full-width copies share the source rows instead of deep-
+                // cloning cell-by-cell (CanvasCell carries heap fields); a
+                // row is copied for real only if something later writes it.
+                self.cells[row] = std::sync::Arc::clone(&source.cells[row]);
+                self.overlays[row] = std::sync::Arc::clone(&source.overlays[row]);
+                self.no_select[row] = std::sync::Arc::clone(&source.no_select[row]);
+            } else {
+                self.cells_row_mut(row)[x..max_x].clone_from_slice(&source.cells[row][x..max_x]);
+                self.overlays_row_mut(row)[x..max_x]
+                    .clone_from_slice(&source.overlays[row][x..max_x]);
+                self.no_select_row_mut(row)[x..max_x]
+                    .clone_from_slice(&source.no_select[row][x..max_x]);
+            }
+            self.soft_wrap[row] = source.soft_wrap[row];
+        }
     }
 
     /// Copies a rectangular region while skipping rows covered by absolute clears.

@@ -6,18 +6,25 @@ use std::{
 pub(super) fn is_synchronized_output_supported_with_env(
     mut env_lookup: impl FnMut(&str) -> Option<String>,
 ) -> bool {
-    // Mirrors Claude Code's Ink fork: tmux proxies the bytes but does not make
-    // DEC 2026 atomic, so skip BSU/ESU there to avoid parser work and false
-    // safety. Known modern terminals opt in via TERM_PROGRAM/TERM/env hints.
-    if env_lookup("TMUX").is_some() {
+    // Multiplexers can retain an outer terminal's hints without preserving its
+    // atomic presentation. This evidence gates scroll patches, never marker emission.
+    if env_lookup("TMUX").is_some() || env_lookup("STY").is_some() {
         return false;
     }
 
-    let term_program = env_lookup("TERM_PROGRAM").unwrap_or_default();
-    matches!(
-        term_program.as_str(),
-        "iTerm.app" | "WezTerm" | "WarpTerminal" | "ghostty" | "contour" | "vscode" | "alacritty"
-    ) || env_lookup("TERM").is_some_and(|term| {
+    if let Some(term_program) = env_lookup("TERM_PROGRAM").filter(|name| !name.is_empty()) {
+        return matches!(
+            term_program.as_str(),
+            "iTerm.app"
+                | "WezTerm"
+                | "WarpTerminal"
+                | "ghostty"
+                | "contour"
+                | "vscode"
+                | "alacritty"
+        );
+    }
+    env_lookup("TERM").is_some_and(|term| {
         term.contains("kitty")
             || term == "xterm-ghostty"
             || term.starts_with("foot")
@@ -30,13 +37,11 @@ pub(super) fn is_synchronized_output_supported_with_env(
             .is_some_and(|v| v >= 6800)
 }
 
-/// Returns whether the current terminal should use DEC 2026 synchronized output.
+/// Returns whether environment evidence supports atomic DEC 2026 presentation.
 ///
-/// This is the Rust counterpart to CC Ink's
-/// `isSynchronizedOutputSupported()` / `SYNC_OUTPUT_SUPPORTED` gate. Tmux is
-/// explicitly disabled because it proxies BSU/ESU bytes without preserving
-/// atomicity; known modern terminals opt in via `TERM_PROGRAM`, `TERM`, or
-/// terminal-specific environment hints.
+/// A false result means atomicity is unverified, not that the protocol is unsupported.
+/// Terminal frames attempt synchronized-update markers independently of this evidence.
+/// Protected scroll patches additionally require a successfully started transaction.
 pub fn is_synchronized_output_supported() -> bool {
     is_synchronized_output_supported_with_env(|key| env::var(key).ok())
 }

@@ -214,12 +214,14 @@ mod tests {
 
     #[component]
     fn BlitProbeApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
-        let mut system = hooks.use_context_mut::<SystemContext>();
         let mut tick = hooks.use_state(|| 0u8);
-        if tick.get() < 3 {
-            tick += 1;
-        } else {
-            system.exit();
+        hooks.use_terminal_events(move |event| {
+            if matches!(event, TerminalEvent::Key(_)) {
+                tick += 1;
+            }
+        });
+        if tick.get() >= 3 {
+            hooks.use_context_mut::<SystemContext>().exit();
         }
 
         element! {
@@ -241,7 +243,11 @@ mod tests {
         BLIT_PROBE_DRAWS.store(0, Ordering::SeqCst);
         let canvases: Vec<_> = smol::block_on(
             element!(BlitProbeApp)
-                .mock_terminal_render_loop(MockTerminalConfig::default())
+                .mock_terminal_render_loop(MockTerminalConfig::with_events(futures::stream::iter(
+                    (0..3).map(|_| {
+                        TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char('t')))
+                    }),
+                )))
                 .collect(),
         );
         crate::render::set_retained_blit_for_tests(None);
@@ -572,5 +578,129 @@ mod tests {
             rendered.starts_with("pulse=3"),
             "child hook polling should still update through a stable memo key: {rendered:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod wide_boundary_tests {
+    use super::*;
+    use crate::prelude::*;
+    use futures::StreamExt;
+
+    struct BoundaryGlyph {
+        source_boundary: bool,
+        tick: usize,
+    }
+
+    impl BoundaryGlyph {
+        fn paint(drawer: &mut crate::ComponentDrawer) {
+            let canvas = drawer.root_canvas_mut();
+            canvas.subview_mut(0, 0, 0, 0, 8, 2).set_text(
+                0,
+                0,
+                "界",
+                CanvasTextStyle {
+                    color: Some(Color::Blue),
+                    ..Default::default()
+                },
+            );
+            canvas.set_overlay(2, 0, StyleOverlay::inverse());
+        }
+    }
+
+    impl crate::Hook for BoundaryGlyph {
+        fn pre_component_draw(&mut self, drawer: &mut crate::ComponentDrawer) {
+            if !self.source_boundary && self.tick > 0 {
+                Self::paint(drawer);
+            }
+        }
+        fn post_component_draw(&mut self, drawer: &mut crate::ComponentDrawer) {
+            if self.source_boundary && self.tick == 0 {
+                Self::paint(drawer);
+            }
+        }
+    }
+
+    #[derive(Default, Props)]
+    struct BoundarySceneProps {
+        source_boundary: bool,
+    }
+
+    #[component]
+    fn BoundaryScene(
+        mut hooks: Hooks,
+        props: &BoundarySceneProps,
+    ) -> impl Into<AnyElement<'static>> {
+        let mut tick = hooks.use_state(|| 0usize);
+        hooks.use_terminal_events(move |event| {
+            if matches!(event, TerminalEvent::Key(_)) {
+                tick += 1;
+            }
+        });
+        hooks
+            .use_hook(|| BoundaryGlyph {
+                source_boundary: props.source_boundary,
+                tick: 0,
+            })
+            .tick = tick.get();
+        element! {
+            View(width: 8, flex_direction: FlexDirection::Column) {
+                Memo(memo_key: "stable".to_string(), compare: memo_key_eq as MemoComparator) {
+                    View(margin_left: 1, width: 3, height: 1) {
+                        Text(content: "abc", color: Color::Red)
+                    }
+                }
+                Text(content: format!("tick {}", tick.get()))
+            }
+        }
+    }
+
+    fn draw_boundary_scene(source_boundary: bool, retained: bool) -> Vec<Canvas> {
+        crate::render::set_retained_blit_for_tests(Some(retained));
+        let frames = smol::block_on(async {
+            let (sender, events) = futures::channel::mpsc::unbounded();
+            let mut scene = element!(BoundaryScene(source_boundary));
+            let mut rendering =
+                Box::pin(scene.mock_terminal_render_loop(MockTerminalConfig::with_events(events)));
+            let first = rendering.next().await.unwrap();
+            sender
+                .unbounded_send(TerminalEvent::Key(KeyEvent::new(
+                    KeyEventKind::Press,
+                    KeyCode::Char('t'),
+                )))
+                .unwrap();
+            let second = rendering.next().await.unwrap();
+            vec![first, second]
+        });
+        crate::render::set_retained_blit_for_tests(None);
+        frames
+    }
+
+    #[test]
+    fn wide_boundary_fallback_matches_normal_subtree_drawing() {
+        for source_boundary in [true, false] {
+            let restored = draw_boundary_scene(source_boundary, true);
+            let drawn = draw_boundary_scene(source_boundary, false);
+            for (restored, drawn) in restored.iter().zip(&drawn) {
+                assert_eq!(restored.to_string(), drawn.to_string());
+                for row in 0..2 {
+                    for column in 0..8 {
+                        assert_eq!(
+                            restored.resolved_text_style(column, row),
+                            drawn.resolved_text_style(column, row)
+                        );
+                    }
+                }
+            }
+            assert!(restored[1].to_string().starts_with(" abc"));
+            assert_eq!(
+                restored[1].resolved_text_style(1, 0).unwrap().color,
+                Some(Color::Red)
+            );
+            assert_eq!(
+                restored[1].resolved_text_style(2, 0).unwrap().invert,
+                !source_boundary
+            );
+        }
     }
 }

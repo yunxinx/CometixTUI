@@ -4,6 +4,112 @@ use crate::prelude::*;
 use crossterm::csi;
 
 #[test]
+fn test_baseline_restore_preserves_only_existing_damage() {
+    let mut baseline = Canvas::new(8, 2);
+    baseline
+        .subview_mut(0, 0, 0, 0, 8, 2)
+        .set_text(0, 0, "stable", CanvasTextStyle::default());
+    baseline.clear_damage();
+    let mut restored = Canvas::new(8, 2);
+    restored.mark_damage(DamageRegion {
+        x: 7,
+        y: 1,
+        width: 1,
+        height: 1,
+    });
+    assert!(restored.try_blit_region_from_baseline(&baseline, 0, 0, 8, 2));
+    assert_eq!(baseline.row_change_start(&restored, 0), None);
+    assert_eq!(baseline.row_change_start(&restored, 1), Some(7));
+    assert!(std::sync::Arc::ptr_eq(
+        &baseline.cells[0],
+        &restored.cells[0]
+    ));
+}
+
+#[test]
+fn test_baseline_restore_rejects_wide_boundaries_before_copying_any_row() {
+    for source_has_boundary in [false, true] {
+        for glyph_column in [0, 3] {
+            let mut source = Canvas::new(6, 2);
+            let mut target = Canvas::new(6, 2);
+            source.subview_mut(0, 0, 0, 0, 6, 2).set_text(
+                0,
+                0,
+                "source",
+                CanvasTextStyle::default(),
+            );
+            target.subview_mut(0, 0, 0, 0, 6, 2).set_text(
+                0,
+                0,
+                "target",
+                CanvasTextStyle::default(),
+            );
+            let wide = if source_has_boundary {
+                &mut source
+            } else {
+                &mut target
+            };
+            wide.subview_mut(0, 0, 0, 0, 6, 2).set_text(
+                glyph_column,
+                1,
+                "界",
+                CanvasTextStyle {
+                    color: Some(Color::Red),
+                    ..Default::default()
+                },
+            );
+            target.set_overlay(2, 0, StyleOverlay::inverse());
+            let before = target.clone();
+            assert!(!target.try_blit_region_from_baseline(&source, 1, 0, 3, 2));
+            assert_eq!(target.to_string(), before.to_string());
+            assert_eq!(target.damage_region(), before.damage_region());
+            assert_eq!(target.dirty_rows, before.dirty_rows);
+            for row in 0..2 {
+                assert!(std::sync::Arc::ptr_eq(
+                    &target.cells[row],
+                    &before.cells[row]
+                ));
+                assert!(std::sync::Arc::ptr_eq(
+                    &target.overlays[row],
+                    &before.overlays[row]
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn test_baseline_partial_restore_preserves_styles_and_unpainted_changes() {
+    let mut source = Canvas::new(8, 2);
+    source.subview_mut(0, 0, 0, 0, 8, 2).set_text(
+        2,
+        0,
+        "界a",
+        CanvasTextStyle {
+            color: Some(Color::Red),
+            ..Default::default()
+        },
+    );
+    source.mark_no_select_region(2, 0, 2, 1);
+    source.set_overlay(4, 0, StyleOverlay::inverse());
+    source.mark_soft_wrap_continuation(1, 5);
+    let mut restored = Canvas::new(8, 2);
+    let untouched = restored.clone();
+    assert!(restored.try_blit_region_from_baseline(&source, 2, 0, 3, 2));
+    assert_eq!(restored.dirty_rows, untouched.dirty_rows);
+    assert_eq!(restored.damage_region(), None);
+    assert_eq!(
+        restored.resolved_text_style(2, 0).unwrap().color,
+        Some(Color::Red)
+    );
+    assert!(restored.resolved_text_style(4, 0).unwrap().invert);
+    assert!(restored.is_no_select(2, 0));
+    assert_eq!(restored.soft_wrap_continuation(1), 5);
+    restored.inherit_unpainted_changes(&source);
+    assert_eq!(untouched.row_change_start(&restored, 0), Some(2));
+}
+
+#[test]
 fn test_canvas_diff_ignores_damage_only_metadata_like_cc_screen_diff_each() {
     let prev = Canvas::new(3, 1);
     let mut next = prev.clone();

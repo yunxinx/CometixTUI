@@ -1,4 +1,5 @@
 use super::*;
+mod synchronized;
 use crate::prelude::*;
 use std::sync::{
     Arc, Mutex,
@@ -522,7 +523,12 @@ impl TerminalImpl for ResizeReassertTerminal {
         Ok(())
     }
 
-    fn write_canvas(&mut self, _prev: Option<&Canvas>, _canvas: &Canvas) -> io::Result<()> {
+    fn write_canvas(
+        &mut self,
+        _prev: Option<&Canvas>,
+        _canvas: &Canvas,
+        _output: OutputContext,
+    ) -> io::Result<()> {
         Ok(())
     }
 
@@ -705,7 +711,8 @@ fn test_fullscreen_diff_preserves_origin() {
 
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_fullscreen_term(dest, 1, prev.height() as _);
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let mut setup = Vec::new();
     write!(setup, "log\r\n").unwrap();
@@ -756,8 +763,8 @@ fn test_fullscreen_decstbm_scroll_hint_shifts_prev_before_diff() {
     let mut term = new_fullscreen_term(dest, 0, prev.height() as _);
     term.size = Some((10, 5));
     term.prev_size_on_write = Some((10, 5));
-    term.decstbm_safe = true;
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext { atomic: true })
+        .unwrap();
 
     let diff = diff_buf.lock().unwrap().clone();
     let diff_str = String::from_utf8_lossy(&diff);
@@ -820,8 +827,8 @@ fn test_fullscreen_damage_preserves_decstbm_scroll_hint() {
     let mut term = new_fullscreen_term(dest, 0, prev.height() as _);
     term.size = Some((10, 5));
     term.prev_size_on_write = Some((10, 5));
-    term.decstbm_safe = true;
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext { atomic: true })
+        .unwrap();
 
     let diff = String::from_utf8_lossy(&diff_buf.lock().unwrap().clone()).to_string();
     assert!(
@@ -861,8 +868,8 @@ fn test_fullscreen_decstbm_scroll_hint_requires_atomic_update() {
     let mut term = new_fullscreen_term(dest, 0, prev.height() as _);
     term.size = Some((10, 3));
     term.prev_size_on_write = Some((10, 3));
-    term.decstbm_safe = false;
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let diff_str = String::from_utf8_lossy(&diff_buf.lock().unwrap().clone()).to_string();
     assert!(
@@ -897,7 +904,8 @@ fn test_fullscreen_initial_write_parks_cursor_at_terminal_bottom_when_size_known
     let (dest, buf) = new_test_writer();
     let mut term = new_fullscreen_term(dest, 0, 0);
     term.size = Some((10, 5));
-    term.write_canvas(None, &canvas).unwrap();
+    term.write_canvas(None, &canvas, OutputContext::default())
+        .unwrap();
 
     let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     assert!(
@@ -935,7 +943,8 @@ fn test_fullscreen_resize_full_clears_and_reanchors() {
     let mut term = new_fullscreen_term(dest, 1, prev.height() as _);
     term.prev_size_on_write = Some((12, 4));
     term.size = Some((10, 4));
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
     assert_eq!(term.prev_canvas_top_row, 0);
 
     let diff = buf.lock().unwrap().clone();
@@ -1015,7 +1024,6 @@ fn new_fullscreen_term(
         cursor_displacement_rows: 0,
         inline_bottom_gap: 0,
         inline_pending_wrap: false,
-        decstbm_safe: false,
         inline_force_full_rewrite_next_diff: false,
         scrollback_replay: None,
         #[cfg(unix)]
@@ -1051,7 +1059,6 @@ fn new_inline_term_with_size(
         cursor_displacement_rows: 0,
         inline_bottom_gap: 0,
         inline_pending_wrap: false,
-        decstbm_safe: false,
         inline_force_full_rewrite_next_diff: false,
         scrollback_replay: None,
         #[cfg(unix)]
@@ -1065,7 +1072,8 @@ fn inline_diff_vt(prev: &Canvas, next: &Canvas, term_size: (u16, u16)) -> (Vec<u
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term_with_size(dest, prev.height() as _, term_size);
     term.prev_size_on_write = term.size;
-    term.write_canvas(Some(prev), next).unwrap();
+    term.write_canvas(Some(prev), next, OutputContext::default())
+        .unwrap();
 
     let diff = diff_buf.lock().unwrap().clone();
     let mut setup = Vec::new();
@@ -1104,12 +1112,14 @@ fn test_inline_pending_wrap_resolved_before_next_frame_relative_move() {
 
     let (dest, buf) = new_test_writer();
     let mut term = new_inline_term_with_size(dest, 0, (10, 5));
-    term.write_canvas(None, &prev).unwrap();
+    term.write_canvas(None, &prev, OutputContext::default())
+        .unwrap();
     assert!(term.inline_pending_wrap);
 
     let first_frame = buf.lock().unwrap().clone();
     buf.lock().unwrap().clear();
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let diff = buf.lock().unwrap().clone();
     let diff_str = String::from_utf8_lossy(&diff);
@@ -1166,7 +1176,8 @@ fn test_inline_pending_wrap_tracks_actual_rendered_width() {
     short
         .subview_mut(0, 0, 0, 0, 10, 2)
         .set_text(0, 1, "bbb", style);
-    term.write_canvas(None, &short).unwrap();
+    term.write_canvas(None, &short, OutputContext::default())
+        .unwrap();
     assert!(
         !term.inline_pending_wrap,
         "full-width canvas should not imply pending-wrap when the actual last row is short"
@@ -1176,7 +1187,8 @@ fn test_inline_pending_wrap_tracks_actual_rendered_width() {
     full.subview_mut(0, 0, 0, 0, 10, 2)
         .set_text(0, 1, "cccccccccc", style);
     buf.lock().unwrap().clear();
-    term.write_canvas(Some(&short), &full).unwrap();
+    term.write_canvas(Some(&short), &full, OutputContext::default())
+        .unwrap();
     assert!(
         term.inline_pending_wrap,
         "a row write that reaches the right margin should enter pending-wrap"
@@ -2844,9 +2856,7 @@ fn test_resize_event_triggers_terminal_mode_reassertion() {
         canvas_diff_planning: TerminalDiffPlanning::Baseline,
         input_backend: TerminalInputBackend::Crossterm,
         raw_input_session_request: None,
-        synchronized_update_depth: 0,
-        synchronized_update_started: false,
-        synchronized_update_supported: false,
+        synchronized_output: SynchronizedOutput::new(false),
     };
 
     term.start_event_stream().unwrap();
@@ -2897,9 +2907,7 @@ fn test_stdin_gap_reasserts_terminal_modes_like_cc_ink() {
         canvas_diff_planning: TerminalDiffPlanning::Baseline,
         input_backend: TerminalInputBackend::Crossterm,
         raw_input_session_request: None,
-        synchronized_update_depth: 0,
-        synchronized_update_started: false,
-        synchronized_update_supported: false,
+        synchronized_output: SynchronizedOutput::new(false),
     };
 
     term.start_event_stream().unwrap();
@@ -2953,9 +2961,7 @@ fn test_same_size_resize_event_is_ignored() {
         canvas_diff_planning: TerminalDiffPlanning::Baseline,
         input_backend: TerminalInputBackend::Crossterm,
         raw_input_session_request: None,
-        synchronized_update_depth: 0,
-        synchronized_update_started: false,
-        synchronized_update_supported: false,
+        synchronized_output: SynchronizedOutput::new(false),
     };
 
     term.start_event_stream().unwrap();
@@ -2999,18 +3005,18 @@ fn test_end_of_synchronized_update_reports_errors() {
         None,
     )
     .unwrap();
-    terminal.synchronized_update_supported = true;
+    terminal.synchronized_output.atomic_capability = true;
 
     let result = terminal.synchronized_update(|terminal| terminal.write_all(b"frame"));
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
-    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
 
     let result = terminal.synchronized_update(|terminal| {
         terminal.write_all(b"frame")?;
         Err(io::Error::from(io::ErrorKind::InvalidData))
     });
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(attempts.load(Ordering::SeqCst), 4);
 }
 
 #[test]
@@ -3025,7 +3031,7 @@ fn test_synchronized_update_is_lazy() {
         None,
     )
     .unwrap();
-    term.synchronized_update_supported = true;
+    term.synchronized_output.atomic_capability = true;
 
     // StdTerminal::new hides the cursor; discard setup bytes.
     buf.lock().unwrap().clear();
@@ -3068,7 +3074,7 @@ fn test_synchronized_update_stays_lazy_for_noop_cursor_positioning() {
         None,
     )
     .unwrap();
-    term.synchronized_update_supported = true;
+    term.synchronized_output.atomic_capability = true;
 
     // StdTerminal::new hides the cursor; discard setup bytes.
     buf.lock().unwrap().clear();
@@ -3093,7 +3099,7 @@ fn test_synchronized_update_stays_lazy_for_noop_clear_canvas() {
         None,
     )
     .unwrap();
-    term.synchronized_update_supported = true;
+    term.synchronized_output.atomic_capability = true;
 
     // StdTerminal::new hides the cursor; discard setup bytes.
     buf.lock().unwrap().clear();
@@ -3132,9 +3138,7 @@ fn test_synchronized_update_wraps_clear_canvas_when_it_writes() {
         canvas_diff_planning: TerminalDiffPlanning::Baseline,
         input_backend: TerminalInputBackend::Crossterm,
         raw_input_session_request: None,
-        synchronized_update_depth: 0,
-        synchronized_update_started: false,
-        synchronized_update_supported: true,
+        synchronized_output: SynchronizedOutput::new(true),
     };
 
     term.synchronized_update(|term| term.clear_canvas())
@@ -3186,9 +3190,7 @@ fn test_synchronized_update_stays_lazy_for_identical_canvas_write() {
         canvas_diff_planning: TerminalDiffPlanning::Baseline,
         input_backend: TerminalInputBackend::Crossterm,
         raw_input_session_request: None,
-        synchronized_update_depth: 0,
-        synchronized_update_started: false,
-        synchronized_update_supported: true,
+        synchronized_output: SynchronizedOutput::new(true),
     };
 
     term.synchronized_update(|term| term.write_canvas(Some(&canvas), &canvas))
@@ -3237,9 +3239,7 @@ fn test_synchronized_update_wraps_current_damage_canvas_write() {
         canvas_diff_planning: TerminalDiffPlanning::Baseline,
         input_backend: TerminalInputBackend::Crossterm,
         raw_input_session_request: None,
-        synchronized_update_depth: 0,
-        synchronized_update_started: false,
-        synchronized_update_supported: true,
+        synchronized_output: SynchronizedOutput::new(true),
     };
 
     term.synchronized_update(|term| term.write_canvas(Some(&prev), &next))
@@ -3299,9 +3299,7 @@ fn test_synchronized_update_wraps_previous_damage_canvas_write() {
         canvas_diff_planning: TerminalDiffPlanning::Baseline,
         input_backend: TerminalInputBackend::Crossterm,
         raw_input_session_request: None,
-        synchronized_update_depth: 0,
-        synchronized_update_started: false,
-        synchronized_update_supported: true,
+        synchronized_output: SynchronizedOutput::new(true),
     };
 
     term.synchronized_update(|term| term.write_canvas(Some(&prev), &next))
@@ -3358,9 +3356,7 @@ fn test_synchronized_update_stays_lazy_for_identical_fullscreen_canvas_write() {
         canvas_diff_planning: TerminalDiffPlanning::Baseline,
         input_backend: TerminalInputBackend::Crossterm,
         raw_input_session_request: None,
-        synchronized_update_depth: 0,
-        synchronized_update_started: false,
-        synchronized_update_supported: true,
+        synchronized_output: SynchronizedOutput::new(true),
     };
 
     term.synchronized_update(|term| term.write_canvas(Some(&canvas), &canvas))
@@ -3384,7 +3380,7 @@ fn test_synchronized_update_wraps_cursor_positioning_when_it_writes() {
         None,
     )
     .unwrap();
-    term.synchronized_update_supported = true;
+    term.synchronized_output.atomic_capability = true;
 
     // StdTerminal::new hides the cursor; discard setup bytes.
     buf.lock().unwrap().clear();
@@ -3439,9 +3435,7 @@ fn test_synchronized_update_wraps_pending_wrap_resolution() {
         canvas_diff_planning: TerminalDiffPlanning::Baseline,
         input_backend: TerminalInputBackend::Crossterm,
         raw_input_session_request: None,
-        synchronized_update_depth: 0,
-        synchronized_update_started: false,
-        synchronized_update_supported: true,
+        synchronized_output: SynchronizedOutput::new(true),
     };
 
     term.synchronized_update(|term| term.position_cursor(None))
@@ -3463,7 +3457,7 @@ fn test_synchronized_update_wraps_pending_wrap_resolution() {
 }
 
 #[test]
-fn test_synchronized_update_skips_markers_when_unsupported() {
+fn test_synchronized_update_skips_markers_when_disabled() {
     let (dest, buf) = new_test_writer();
     let mut term = Terminal::new(
         Box::new(dest),
@@ -3474,7 +3468,7 @@ fn test_synchronized_update_skips_markers_when_unsupported() {
         None,
     )
     .unwrap();
-    term.synchronized_update_supported = false;
+    term.synchronized_output.emit_markers = false;
 
     // StdTerminal::new hides the cursor; discard setup bytes.
     buf.lock().unwrap().clear();
@@ -3487,7 +3481,7 @@ fn test_synchronized_update_skips_markers_when_unsupported() {
     let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     assert_eq!(
         output, "hello",
-        "unsupported terminals should receive payload without BSU/ESU"
+        "disabled marker policy should emit only the payload"
     );
 }
 
@@ -3649,19 +3643,19 @@ impl TerminalImpl for ScriptedTerminal {
         self.inner.is_fullscreen()
     }
 
-    fn set_dynamic_alternate_screen(
-        &mut self,
+    fn plan_screen_transition(
+        &self,
         request: Option<crate::context::AlternateScreenRequest>,
-    ) -> io::Result<bool> {
-        self.inner.set_dynamic_alternate_screen(request)
+    ) -> ScreenTransitionPlan {
+        self.inner.plan_screen_transition(request)
+    }
+
+    fn apply_screen_transition(&mut self, plan: ScreenTransitionPlan) -> io::Result<bool> {
+        self.inner.apply_screen_transition(plan)
     }
 
     fn set_scrollback_replay(&mut self, replay: Option<crate::context::ScrollbackReplay>) {
         self.inner.set_scrollback_replay(replay);
-    }
-
-    fn set_decstbm_safe(&mut self, safe: bool) {
-        self.inner.set_decstbm_safe(safe);
     }
 
     fn position_cursor(
@@ -3706,8 +3700,13 @@ impl TerminalImpl for ScriptedTerminal {
         self.inner.write_canvas_would_write(prev, canvas)
     }
 
-    fn write_canvas(&mut self, prev: Option<&Canvas>, canvas: &Canvas) -> io::Result<()> {
-        self.inner.write_canvas(prev, canvas)
+    fn write_canvas(
+        &mut self,
+        prev: Option<&Canvas>,
+        canvas: &Canvas,
+        output: OutputContext,
+    ) -> io::Result<()> {
+        self.inner.write_canvas(prev, canvas, output)
     }
 
     fn event_stream(&mut self) -> io::Result<BoxStream<'static, io::Result<TerminalEvent>>> {
@@ -3950,7 +3949,8 @@ fn test_inline_diff_unchanged_row_skipped() {
 
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term(dest, prev.height() as _);
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     // Build vt: render prev, then apply diff output.
     let mut setup = Vec::new();
@@ -4009,14 +4009,16 @@ fn test_inline_first_diff_after_initial_write_full_rewrites_once() {
 
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term_with_size(dest, 0, (10, 6));
-    term.write_canvas(None, &first).unwrap();
+    term.write_canvas(None, &first, OutputContext::default())
+        .unwrap();
     assert!(
         term.inline_force_full_rewrite_next_diff,
         "first inline frame should mark the next diff as contaminated"
     );
 
     diff_buf.lock().unwrap().clear();
-    term.write_canvas(Some(&first), &second).unwrap();
+    term.write_canvas(Some(&first), &second, OutputContext::default())
+        .unwrap();
     let first_diff = String::from_utf8(diff_buf.lock().unwrap().clone()).unwrap();
     assert!(
         first_diff.contains("\x1b[J"),
@@ -4040,7 +4042,8 @@ fn test_inline_first_diff_after_initial_write_full_rewrites_once() {
         .set_text(0, 1, "third", style);
 
     diff_buf.lock().unwrap().clear();
-    term.write_canvas(Some(&second), &third).unwrap();
+    term.write_canvas(Some(&second), &third, OutputContext::default())
+        .unwrap();
     let second_diff = String::from_utf8(diff_buf.lock().unwrap().clone()).unwrap();
     assert!(
         !second_diff.contains("\x1b[J"),
@@ -4071,7 +4074,8 @@ fn test_inline_diff_shrinking() {
 
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term(dest, prev.height() as _);
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let mut setup = Vec::new();
     prev.write_ansi_without_final_newline(&mut setup).unwrap();
@@ -4108,7 +4112,8 @@ fn test_inline_diff_growing() {
 
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term(dest, prev.height() as _);
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let mut setup = Vec::new();
     prev.write_ansi_without_final_newline(&mut setup).unwrap();
@@ -4177,7 +4182,8 @@ fn test_inline_diff_growing_at_bottom_of_screen() {
 
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term(dest, prev.height() as _);
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     // Fill the VT so the canvas starts on the last row, then apply the diff.
     let mut setup = Vec::new();
@@ -4214,7 +4220,8 @@ fn test_inline_diff_identical_canvas_is_noop() {
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term(dest, canvas.height() as _);
     term.prev_size_on_write = term.size;
-    term.write_canvas(Some(&canvas), &canvas).unwrap();
+    term.write_canvas(Some(&canvas), &canvas, OutputContext::default())
+        .unwrap();
 
     assert!(
         diff_buf.lock().unwrap().is_empty(),
@@ -4247,7 +4254,7 @@ fn test_inline_prev_damage_region_rewrites_identical_reachable_row() {
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term_with_size(dest, prev.height() as _, (10, 5));
     term.prev_size_on_write = term.size;
-    term.write_canvas(Some(&prev), &next_without_damage)
+    term.write_canvas(Some(&prev), &next_without_damage, OutputContext::default())
         .unwrap();
 
     let diff = String::from_utf8_lossy(&diff_buf.lock().unwrap().clone()).to_string();
@@ -4284,7 +4291,8 @@ fn test_inline_damage_region_rewrites_identical_reachable_row() {
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term_with_size(dest, prev.height() as _, (10, 5));
     term.prev_size_on_write = term.size;
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let diff = String::from_utf8_lossy(&diff_buf.lock().unwrap().clone()).to_string();
     assert!(
@@ -4311,7 +4319,8 @@ fn test_inline_force_full_repaint_rewrites_identical_canvas() {
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term_with_size(dest, prev.height() as _, (10, 5));
     term.prev_size_on_write = term.size;
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let diff = String::from_utf8_lossy(&diff_buf.lock().unwrap().clone()).to_string();
     assert!(
@@ -4351,7 +4360,8 @@ fn test_inline_force_full_repaint_rewrites_reachable_rows_without_scrollback_cle
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term_with_size(dest, prev.height() as _, (10, 5));
     term.prev_size_on_write = term.size;
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let diff = String::from_utf8_lossy(&diff_buf.lock().unwrap().clone()).to_string();
     assert!(
@@ -4388,7 +4398,8 @@ fn test_inline_force_full_repaint_growing_rewrites_without_clear() {
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term_with_size(dest, prev.height() as _, (10, 5));
     term.prev_size_on_write = term.size;
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let diff = String::from_utf8_lossy(&diff_buf.lock().unwrap().clone()).to_string();
     assert!(
@@ -4421,7 +4432,8 @@ fn test_inline_resize_forces_full_rewrite_even_when_canvas_identical() {
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term_with_size(dest, canvas.height() as _, (10, 5));
     term.prev_size_on_write = Some((12, 5));
-    term.write_canvas(Some(&canvas), &canvas).unwrap();
+    term.write_canvas(Some(&canvas), &canvas, OutputContext::default())
+        .unwrap();
 
     let raw_diff = diff_buf.lock().unwrap().clone();
     assert_inline_full_reset(&raw_diff, "resize rewrite");
@@ -4452,7 +4464,8 @@ fn test_inline_width_resize_replays_scrollback_between_purge_and_canvas() {
         );
         vec![history]
     }));
-    term.write_canvas(Some(&canvas), &canvas).unwrap();
+    term.write_canvas(Some(&canvas), &canvas, OutputContext::default())
+        .unwrap();
 
     let diff = String::from_utf8_lossy(&diff_buf.lock().unwrap()).to_string();
     let purge = diff
@@ -4475,7 +4488,8 @@ fn test_inline_height_only_resize_keeps_scrollback() {
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term_with_size(dest, canvas.height() as _, (10, 4));
     term.prev_size_on_write = Some((10, 6));
-    term.write_canvas(Some(&canvas), &canvas).unwrap();
+    term.write_canvas(Some(&canvas), &canvas, OutputContext::default())
+        .unwrap();
 
     let diff = String::from_utf8_lossy(&diff_buf.lock().unwrap()).to_string();
     assert!(!diff.contains("\x1b[3J"), "{diff:?}");
@@ -4523,7 +4537,8 @@ fn test_inline_height_shrink_restores_rows_below_cursor() {
             vt.resize(10, next_rows as usize);
             term.set_size_from_resize_event(10, next_rows);
             assert!(term.write_canvas_would_write(Some(&canvas), &canvas) || cursor_row == 5);
-            term.write_canvas(Some(&canvas), &canvas).unwrap();
+            term.write_canvas(Some(&canvas), &canvas, OutputContext::default())
+                .unwrap();
             term.position_cursor(declaration).unwrap();
             let bytes = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
             vt.feed_str(&bytes);
@@ -4566,7 +4581,8 @@ fn test_inline_height_shrink_restores_rows_below_cursor() {
                 "updated",
                 CanvasTextStyle::default(),
             );
-            term.write_canvas(Some(&canvas), &next).unwrap();
+            term.write_canvas(Some(&canvas), &next, OutputContext::default())
+                .unwrap();
             term.position_cursor(declaration).unwrap();
             vt.feed_str(&String::from_utf8(buf.lock().unwrap().clone()).unwrap());
             assert_eq!(vt.line(next_rows as usize - 1).text().trim_end(), "updated");
@@ -4590,7 +4606,8 @@ fn test_fullscreen_diff_identical_canvas_is_noop() {
 
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_fullscreen_term(dest, 0, canvas.height() as _);
-    term.write_canvas(Some(&canvas), &canvas).unwrap();
+    term.write_canvas(Some(&canvas), &canvas, OutputContext::default())
+        .unwrap();
 
     let buf = diff_buf.lock().unwrap();
     assert!(
@@ -4622,7 +4639,8 @@ fn test_fullscreen_prev_damage_region_rewrites_identical_rows() {
 
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_fullscreen_term(dest, 0, prev.height() as _);
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let diff = String::from_utf8_lossy(&diff_buf.lock().unwrap().clone()).to_string();
     assert!(
@@ -4657,7 +4675,8 @@ fn test_fullscreen_damage_region_rewrites_identical_rows() {
 
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_fullscreen_term(dest, 0, prev.height() as _);
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let diff = String::from_utf8_lossy(&diff_buf.lock().unwrap().clone()).to_string();
     assert!(
@@ -4683,7 +4702,8 @@ fn test_fullscreen_force_full_repaint_rewrites_identical_rows() {
 
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_fullscreen_term(dest, 0, prev.height() as _);
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let diff = String::from_utf8_lossy(&diff_buf.lock().unwrap().clone()).to_string();
     assert!(
@@ -4714,7 +4734,8 @@ fn test_inline_diff_styled_text_preserved() {
 
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term(dest, prev.height() as _);
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let mut setup = Vec::new();
     prev.write_ansi_without_final_newline(&mut setup).unwrap();
@@ -4758,7 +4779,8 @@ fn test_fullscreen_diff_styled_text_preserved() {
 
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_fullscreen_term(dest, 0, prev.height() as _);
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let mut setup = Vec::new();
     prev.write_ansi_without_final_newline(&mut setup).unwrap();
@@ -4971,11 +4993,13 @@ fn test_inline_automatic_full_rewrites_restore_geometry_for_follow_up_resets() {
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term_with_size(dest, first.height() as _, (10, 5));
     term.prev_size_on_write = term.size;
-    term.write_canvas(Some(&first), &second).unwrap();
+    term.write_canvas(Some(&first), &second, OutputContext::default())
+        .unwrap();
     assert_eq!(term.prev_size_on_write, term.size);
 
     diff_buf.lock().unwrap().clear();
-    term.write_canvas(Some(&second), &third).unwrap();
+    term.write_canvas(Some(&second), &third, OutputContext::default())
+        .unwrap();
     let second_reset = diff_buf.lock().unwrap().clone();
     assert_inline_full_reset(&second_reset, "follow-up offscreen rewrite");
     assert_eq!(term.prev_size_on_write, term.size);
@@ -4996,11 +5020,13 @@ fn test_inline_automatic_full_rewrites_restore_geometry_for_follow_up_resets() {
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term_with_size(dest, tall.height() as _, (10, 5));
     term.prev_size_on_write = term.size;
-    term.write_canvas(Some(&tall), &fit).unwrap();
+    term.write_canvas(Some(&tall), &fit, OutputContext::default())
+        .unwrap();
     assert_eq!(term.prev_size_on_write, term.size);
 
     diff_buf.lock().unwrap().clear();
-    term.write_canvas(Some(&fit), &fit_changed).unwrap();
+    term.write_canvas(Some(&fit), &fit_changed, OutputContext::default())
+        .unwrap();
     let second_reset = diff_buf.lock().unwrap().clone();
     assert_inline_full_reset(&second_reset, "post-shrink full-viewport rewrite");
     assert_eq!(term.prev_size_on_write, term.size);
@@ -5034,9 +5060,11 @@ fn test_inline_diff_sequential_updates() {
     let mut term = new_inline_term(dest, c1.height() as _);
 
     // First diff: c1 -> c2
-    term.write_canvas(Some(&c1), &c2).unwrap();
+    term.write_canvas(Some(&c1), &c2, OutputContext::default())
+        .unwrap();
     // Second diff: c2 -> c3
-    term.write_canvas(Some(&c2), &c3).unwrap();
+    term.write_canvas(Some(&c2), &c3, OutputContext::default())
+        .unwrap();
 
     let mut setup = Vec::new();
     c1.write_ansi_without_final_newline(&mut setup).unwrap();
@@ -5078,8 +5106,10 @@ fn test_fullscreen_diff_sequential_updates() {
     let (dest, buf) = new_test_writer();
     let mut term = new_fullscreen_term(dest, 0, c1.height() as _);
 
-    term.write_canvas(Some(&c1), &c2).unwrap();
-    term.write_canvas(Some(&c2), &c3).unwrap();
+    term.write_canvas(Some(&c1), &c2, OutputContext::default())
+        .unwrap();
+    term.write_canvas(Some(&c2), &c3, OutputContext::default())
+        .unwrap();
 
     let mut setup = Vec::new();
     c1.write_ansi_without_final_newline(&mut setup).unwrap();
@@ -5108,7 +5138,8 @@ fn test_fullscreen_diff_rewrites_from_first_changed_column() {
     let mut term = new_fullscreen_term(dest, 0, prev.height() as _);
     term.size = Some((12, 5));
     term.prev_size_on_write = Some((12, 5));
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let diff = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     assert!(
@@ -5189,7 +5220,8 @@ fn test_fullscreen_diff_zero_top_row_renders_correctly() {
 
     let (dest, buf) = new_test_writer();
     let mut term = new_fullscreen_term(dest, 0, height as _);
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     // Replay: write prev canvas as the baseline already on screen,
     // then apply the diff on top.
@@ -5228,7 +5260,8 @@ fn test_fullscreen_diff_nonzero_top_row_offsets_changed_rows() {
     // changed row 1 writes to terminal position 2+1 = 3 instead of 1.
     let (dest, buf) = new_test_writer();
     let mut term = new_fullscreen_term(dest, 2, height as _);
-    term.write_canvas(Some(&prev), &next).unwrap();
+    term.write_canvas(Some(&prev), &next, OutputContext::default())
+        .unwrap();
 
     let mut setup = Vec::new();
     prev.write_ansi_without_final_newline(&mut setup).unwrap();
@@ -5267,14 +5300,16 @@ fn test_fullscreen_initial_write_sets_zero_top_row() {
 
     // The initial write must set prev_canvas_top_row = 0 (the fix).
     // Without the fix, this panics due to cursor::position() timeout.
-    term.write_canvas(None, &initial).unwrap();
+    term.write_canvas(None, &initial, OutputContext::default())
+        .unwrap();
     assert_eq!(
         term.prev_canvas_top_row, 0,
         "initial fullscreen write must anchor prev_canvas_top_row at 0"
     );
 
     // Subsequent diff should render correctly with top_row = 0.
-    term.write_canvas(Some(&initial), &next).unwrap();
+    term.write_canvas(Some(&initial), &next, OutputContext::default())
+        .unwrap();
 
     let mut vt = avt::Vt::new(width, height + 2);
     vt.feed_str(&String::from_utf8(buf.lock().unwrap().clone()).unwrap());
@@ -5327,7 +5362,8 @@ fn test_inline_shrink_then_diff_has_no_stale_rows() {
     let mut prev = first;
     for next in frames {
         buf.lock().unwrap().clear();
-        term.write_canvas(Some(&prev), &next).unwrap();
+        term.write_canvas(Some(&prev), &next, OutputContext::default())
+            .unwrap();
         feed.extend_from_slice(&buf.lock().unwrap());
         prev = next;
     }
@@ -5359,14 +5395,16 @@ fn test_inline_bottom_gap_bookkeeping() {
 
     let tall = prompt_box_canvas(8);
     let shorter = prompt_box_canvas(7);
-    term.write_canvas(Some(&tall), &shorter).unwrap();
+    term.write_canvas(Some(&tall), &shorter, OutputContext::default())
+        .unwrap();
     assert_eq!(term.inline_bottom_gap, 1);
     // 7 canvas rows + 1 blank gap row still fill the 5-row viewport.
     assert_eq!(term.inline_unreachable_rows_for_diff(7), 4);
 
     // A grow re-occupies the blank row without scrolling.
     let taller = prompt_box_canvas(8);
-    term.write_canvas(Some(&shorter), &taller).unwrap();
+    term.write_canvas(Some(&shorter), &taller, OutputContext::default())
+        .unwrap();
     assert_eq!(term.inline_bottom_gap, 0);
 
     // A shrink whose cleared span plus the standing gap reaches the viewport

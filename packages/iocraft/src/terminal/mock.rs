@@ -230,14 +230,29 @@ impl TerminalImpl for MockTerminal {
         self.fullscreen
     }
 
-    fn set_dynamic_alternate_screen(
-        &mut self,
+    fn plan_screen_transition(
+        &self,
         request: Option<crate::context::AlternateScreenRequest>,
-    ) -> io::Result<bool> {
-        let next = request.is_some();
-        let changed = self.fullscreen != next;
-        self.fullscreen = next;
-        Ok(changed)
+    ) -> ScreenTransitionPlan {
+        ScreenTransitionPlan {
+            transition: match (self.fullscreen, request) {
+                (false, Some(request)) => ScreenTransition::Enter {
+                    mouse_tracking: request.mouse_tracking,
+                },
+                (true, None) => ScreenTransition::Leave,
+                _ => ScreenTransition::Keep,
+            },
+            writes_output: false,
+        }
+    }
+
+    fn apply_screen_transition(&mut self, plan: ScreenTransitionPlan) -> io::Result<bool> {
+        match plan.transition {
+            ScreenTransition::Enter { .. } => self.fullscreen = true,
+            ScreenTransition::Leave => self.fullscreen = false,
+            _ => return Ok(false),
+        }
+        Ok(true)
     }
 
     fn set_title(&mut self, title: &str) -> io::Result<()> {
@@ -266,7 +281,12 @@ impl TerminalImpl for MockTerminal {
         Ok(())
     }
 
-    fn write_canvas(&mut self, _prev: Option<&Canvas>, canvas: &Canvas) -> io::Result<()> {
+    fn write_canvas(
+        &mut self,
+        _prev: Option<&Canvas>,
+        canvas: &Canvas,
+        _output: OutputContext,
+    ) -> io::Result<()> {
         let _ = self.output.unbounded_send(canvas.clone());
         Ok(())
     }

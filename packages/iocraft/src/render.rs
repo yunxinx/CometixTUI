@@ -36,6 +36,7 @@ use taffy::{
 };
 
 pub(crate) struct UpdateContext<'a, 'w> {
+    terminal_error: Option<io::Error>,
     terminal: Option<&'a mut Terminal<'w>>,
     layout_engine: &'a mut LayoutEngine,
     did_clear_terminal_output: bool,
@@ -474,7 +475,8 @@ impl<'a, 'b, 'c, 'w> ComponentUpdater<'a, 'b, 'c, 'w> {
     pub fn clear_terminal_output(&mut self) {
         if !self.context.did_clear_terminal_output {
             if let Some(terminal) = self.context.terminal.as_mut() {
-                terminal.clear_canvas().unwrap();
+                let result = terminal.clear_canvas();
+                self.record_terminal_result(result);
             }
             self.context.did_clear_terminal_output = true;
         }
@@ -486,7 +488,8 @@ impl<'a, 'b, 'c, 'w> ComponentUpdater<'a, 'b, 'c, 'w> {
     pub fn clear_screen(&mut self) {
         if !self.context.did_clear_terminal_output {
             if let Some(terminal) = self.context.terminal.as_mut() {
-                terminal.clear_screen().unwrap();
+                let result = terminal.clear_screen();
+                self.record_terminal_result(result);
             }
             self.context.did_clear_terminal_output = true;
         }
@@ -497,7 +500,8 @@ impl<'a, 'b, 'c, 'w> ComponentUpdater<'a, 'b, 'c, 'w> {
     pub fn clear_terminal(&mut self) {
         if !self.context.did_clear_terminal_output {
             if let Some(terminal) = self.context.terminal.as_mut() {
-                terminal.clear_terminal().unwrap();
+                let result = terminal.clear_terminal();
+                self.record_terminal_result(result);
             }
             self.context.did_clear_terminal_output = true;
         }
@@ -522,7 +526,16 @@ impl<'a, 'b, 'c, 'w> ComponentUpdater<'a, 'b, 'c, 'w> {
 
     /// Returns a mutable reference to the terminal, if we're in a terminal render loop.
     pub(crate) fn terminal_mut(&mut self) -> Option<&mut Terminal<'w>> {
+        if self.context.terminal_error.is_some() {
+            return None;
+        }
         self.context.terminal.as_deref_mut()
+    }
+
+    pub(crate) fn record_terminal_result(&mut self, result: io::Result<()>) {
+        if self.context.terminal_error.is_none() {
+            self.context.terminal_error = result.err();
+        }
     }
 
     #[doc(hidden)]
@@ -837,7 +850,7 @@ fn rects_intersect(a: CanvasRect, b: CanvasRect) -> bool {
 fn retained_blit_enabled() -> bool {
     #[cfg(test)]
     {
-        match RETAINED_BLIT_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        match RETAINED_BLIT_TEST_OVERRIDE.get() {
             1 => return false,
             2 => return true,
             _ => {}
@@ -846,23 +859,19 @@ fn retained_blit_enabled() -> bool {
     !crate::debug_env::disabled().retained_blit
 }
 
-/// 0 = no override, 1 = forced off, 2 = forced on. Tests cannot rely on the
-/// process-wide OnceLock: whichever parallel test touches the gate first
-/// would freeze it for the rest.
+// Each rendering thread owns its test override; comparisons must not change concurrent tests.
 #[cfg(test)]
-static RETAINED_BLIT_TEST_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
+thread_local! {
+    static RETAINED_BLIT_TEST_OVERRIDE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn set_retained_blit_for_tests(enabled: Option<bool>) {
-    RETAINED_BLIT_TEST_OVERRIDE.store(
-        match enabled {
-            None => 0,
-            Some(false) => 1,
-            Some(true) => 2,
-        },
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    RETAINED_BLIT_TEST_OVERRIDE.set(match enabled {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    });
 }
 
 /// Provides information and operations that low level component implementations may need to
@@ -986,8 +995,7 @@ impl ComponentDrawer<'_> {
         // its whole canvas.
         self.context
             .canvas
-            .blit_region_from_baseline(prev, x, y, width, height);
-        true
+            .try_blit_region_from_baseline(prev, x, y, width, height)
     }
 
     /// Gets the calculated layout of the current node.
@@ -1796,7 +1804,7 @@ impl<'a> Tree<'a> {
         mut terminal: Option<&mut Terminal<'_>>,
         profile_enabled: bool,
         prev_canvas: Option<&Canvas>,
-    ) -> RenderOutput {
+    ) -> io::Result<RenderOutput> {
         let prev_overlays = std::mem::take(&mut self.overlays);
         let mut first = self.render_pass(
             max_width,
@@ -1804,7 +1812,7 @@ impl<'a> Tree<'a> {
             profile_enabled,
             prev_canvas,
             &prev_overlays,
-        );
+        )?;
         // Layout effects: a component that lays itself out at the size it was drawn at
         // (`TextInput` wraps its value to its width) requests another pass when that size
         // changed, and the frame is rendered again before anything is written, as React
@@ -1817,7 +1825,7 @@ impl<'a> Tree<'a> {
             || !self.root_component.settle_render_phase()
         {
             self.overlays = std::mem::take(&mut first.overlays);
-            return first;
+            return Ok(first);
         }
         let mut output = self.render_pass(
             max_width,
@@ -1825,7 +1833,7 @@ impl<'a> Tree<'a> {
             profile_enabled,
             Some(&first.canvas),
             &first.overlays,
-        );
+        )?;
         self.overlays = std::mem::take(&mut output.overlays);
         output.did_clear_terminal_output |= first.did_clear_terminal_output;
         output.alternate_screen_changed |= first.alternate_screen_changed;
@@ -1846,7 +1854,7 @@ impl<'a> Tree<'a> {
         profile.layout_measures += first_profile.layout_measures;
         profile.canvas_alloc += first_profile.canvas_alloc;
         profile.settle_rounds += first_profile.settle_rounds;
-        output
+        Ok(output)
     }
 
     fn render_pass(
@@ -1856,7 +1864,7 @@ impl<'a> Tree<'a> {
         profile_enabled: bool,
         prev_canvas: Option<&Canvas>,
         prev_overlays: &[CanvasRect],
-    ) -> RenderOutput {
+    ) -> io::Result<RenderOutput> {
         self.system_context.begin_render_frame();
         let update_start = profile_enabled.then(std::time::Instant::now);
         let exit_on_ctrl_c = terminal
@@ -1893,6 +1901,7 @@ impl<'a> Tree<'a> {
             wrapper_child_node_ids.truncate(1);
             let (did_clear, force_full, invalidate, removed, invalidations) = {
                 let mut context = UpdateContext {
+                    terminal_error: None,
                     terminal: terminal.as_deref_mut(),
                     layout_engine: &mut self.layout_engine,
                     did_clear_terminal_output: false,
@@ -1930,6 +1939,9 @@ impl<'a> Tree<'a> {
                         );
                     },
                 );
+                if let Some(error) = context.terminal_error {
+                    return Err(error);
+                }
                 (
                     context.did_clear_terminal_output,
                     context.force_full_repaint,
@@ -1973,8 +1985,8 @@ impl<'a> Tree<'a> {
             .as_deref_mut()
             .map(|term| {
                 term.set_dynamic_alternate_screen(self.system_context.alternate_screen_request())
-                    .unwrap()
             })
+            .transpose()?
             .unwrap_or(false);
         let terminal_layout_height = terminal
             .as_ref()
@@ -2222,7 +2234,7 @@ impl<'a> Tree<'a> {
             });
         }
         let draw_duration = draw_start.map_or(Duration::ZERO, |start| start.elapsed());
-        RenderOutput {
+        Ok(RenderOutput {
             canvas,
             overlays,
             did_clear_terminal_output,
@@ -2236,7 +2248,7 @@ impl<'a> Tree<'a> {
                 canvas_alloc,
                 settle_rounds: settle_rounds_taken,
             },
-        }
+        })
     }
 
     async fn terminal_render_loop(
@@ -2347,7 +2359,7 @@ impl<'a> Tree<'a> {
                     } else {
                         unpainted_canvas.as_ref().or(prev_canvas.as_ref())
                     },
-                );
+                )?;
                 if !terminal_size_changed
                     && let Some(unpainted) = unpainted_canvas.as_ref()
                 {
@@ -2377,7 +2389,7 @@ impl<'a> Tree<'a> {
                         Some(&mut term),
                         profile_enabled,
                         Some(&output.canvas),
-                    );
+                    )?;
                     next.canvas.inherit_unpainted_changes(&output.canvas);
                     next.phase_profile.update += output.phase_profile.update;
                     next.phase_profile.layout += output.phase_profile.layout;
@@ -2874,7 +2886,9 @@ fn debug_repaint_reason_from_terminal_plan(
 pub(crate) fn render<E: ElementExt>(mut e: E, max_width: Option<usize>) -> Canvas {
     let h = e.helper();
     let mut tree = Tree::new(e.props_mut(), h);
-    tree.render(max_width, None, false, None).canvas
+    tree.render(max_width, None, false, None)
+        .expect("canvas-only rendering performs no terminal I/O")
+        .canvas
 }
 
 pub(crate) async fn terminal_render_loop<E>(
