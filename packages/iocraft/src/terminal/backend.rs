@@ -1763,13 +1763,36 @@ impl<'a> StdTerminal<'a> {
     }
 
     fn apply_raw_mode_enabled(&mut self, raw_mode_enabled: bool) -> io::Result<()> {
-        if raw_mode_enabled != self.raw_mode_enabled {
-            if raw_mode_enabled {
+        self.apply_raw_mode_enabled_with(raw_mode_enabled, |enabled| {
+            if enabled {
+                terminal::enable_raw_mode()
+            } else {
+                terminal::disable_raw_mode()
+            }
+        })
+    }
+
+    // Keep OS mode changes injectable so failure tests never alter the host terminal.
+    pub(super) fn apply_raw_mode_enabled_with(
+        &mut self,
+        raw_mode_enabled: bool,
+        mut set_os_raw_mode: impl FnMut(bool) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if raw_mode_enabled == self.raw_mode_enabled {
+            return Ok(());
+        }
+        if raw_mode_enabled {
+            // Fail before emitting input-mode commands if there is no usable OS terminal.
+            set_os_raw_mode(true)?;
+            // From here on, even a partial initialization owns cleanup.
+            self.raw_mode_enabled = true;
+            let result = (|| {
                 if self.supports_keyboard_enhancement {
+                    // A command can reach the terminal before its write/flush reports failure.
+                    self.enabled_keyboard_enhancement = true;
                     self.dest.execute(event::PushKeyboardEnhancementFlags(
                         self.keyboard_enhancement_flags,
                     ))?;
-                    self.enabled_keyboard_enhancement = true;
                 }
                 if self.mouse_capture {
                     self.dest.execute(event::EnableMouseCapture)?;
@@ -1781,21 +1804,36 @@ impl<'a> StdTerminal<'a> {
                 // Event::Paste instead of a burst of key events. Terminals that don't
                 // support it simply ignore the sequence.
                 self.dest.execute(event::EnableBracketedPaste)?;
-                terminal::enable_raw_mode()?;
-            } else {
-                terminal::disable_raw_mode()?;
-                self.dest.execute(event::DisableBracketedPaste)?;
-                self.dest.execute(event::DisableFocusChange)?;
-                if self.mouse_capture {
-                    self.dest.execute(event::DisableMouseCapture)?;
-                }
-                if self.enabled_keyboard_enhancement {
-                    self.dest.execute(event::PopKeyboardEnhancementFlags)?;
-                }
+                Ok(())
+            })();
+            if result.is_err() {
+                // Preserve the initialization error; incomplete cleanup remains retryable on drop.
+                let _ = self.apply_raw_mode_enabled_with(false, set_os_raw_mode);
             }
-            self.raw_mode_enabled = raw_mode_enabled;
+            result
+        } else {
+            // Attempt every restore even if an earlier step failed, returning the first error.
+            let mut result = set_os_raw_mode(false);
+            result = result.and(self.dest.execute(event::DisableBracketedPaste).map(|_| ()));
+            result = result.and(self.dest.execute(event::DisableFocusChange).map(|_| ()));
+            if self.mouse_capture {
+                result = result.and(self.dest.execute(event::DisableMouseCapture).map(|_| ()));
+            }
+            if self.enabled_keyboard_enhancement {
+                let pop = self
+                    .dest
+                    .execute(event::PopKeyboardEnhancementFlags)
+                    .map(|_| ());
+                if pop.is_ok() {
+                    self.enabled_keyboard_enhancement = false;
+                }
+                result = result.and(pop);
+            }
+            if result.is_ok() {
+                self.raw_mode_enabled = false;
+            }
+            result
         }
-        Ok(())
     }
 }
 

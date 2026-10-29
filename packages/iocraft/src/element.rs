@@ -509,6 +509,32 @@ impl<'a, E: ElementExt + 'a> RenderLoopFuture<'a, E> {
     /// Pass keyboard protocol support from the caller's probe, since the default synchronous
     /// keyboard query consumes stdin. No crossterm input reader is started for this stream.
     /// This permits a startup probe to prepend bytes to the same parser that reads live input.
+    ///
+    /// The local terminal must support crossterm's OS raw mode even if the stream reads from
+    /// another source. Failure to enable it returns an I/O error before enabling input reporting.
+    ///
+    /// The caller also supplies window-size changes as [`TerminalEvent::Resize`] events.
+    /// A byte parser such as [`crate::TerminalRawInputFallibleEventStream::new_utf8`] does not
+    /// generate OS resize notifications; without them an idle interface will not repaint on
+    /// resize until another event or component update wakes it. Merge a separate window-size
+    /// notification source into the stream, without starting a competing crossterm stdin reader:
+    ///
+    /// ```
+    /// # use futures::{stream, Stream, StreamExt};
+    /// # use iocraft::prelude::*;
+    /// # use std::io;
+    /// # fn example(
+    /// #     input: impl Stream<Item = io::Result<TerminalEvent>> + Send + 'static,
+    /// #     sizes: impl Stream<Item = io::Result<(u16, u16)>> + Send + 'static,
+    /// # ) {
+    /// let resize_events = sizes.map(|size| {
+    ///     size.map(|(width, height)| TerminalEvent::Resize(width, height))
+    /// });
+    /// let events = stream::select(input, resize_events);
+    /// let mut app = element!(Text(content: "Ready"));
+    /// let render_loop = app.render_loop().input_stream(events, false);
+    /// # }
+    /// ```
     pub fn input_stream<S>(mut self, stream: S, supports_keyboard_enhancement: bool) -> Self
     where
         S: Stream<Item = io::Result<TerminalEvent>> + Send + 'static,

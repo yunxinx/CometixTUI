@@ -1,4 +1,5 @@
 use super::*;
+mod raw_mode;
 mod synchronized;
 use crate::prelude::*;
 use std::sync::{
@@ -40,6 +41,24 @@ fn test_caller_input_stream_survives_terminal_handoff() {
             ..
         }))))
     ));
+}
+
+#[test]
+fn test_input_stream_eof_after_peek_returns_unexpected_eof() {
+    for configured_in_mock in [false, true] {
+        let stream = stream::unfold((), |_| async { None::<(io::Result<TerminalEvent>, ())> });
+        let (mut terminal, _) = if configured_in_mock {
+            Terminal::mock(MockTerminalConfig::default().with_input_stream(stream))
+        } else {
+            let (mut terminal, output) = Terminal::mock(MockTerminalConfig::default());
+            terminal.set_input_stream(stream.boxed()).unwrap();
+            (terminal, output)
+        };
+        terminal.start_event_stream().unwrap();
+        assert!(!terminal.has_pending_input());
+        let error = smol::block_on(terminal.wait()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
 }
 
 #[test]

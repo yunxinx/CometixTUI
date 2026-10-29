@@ -1021,6 +1021,30 @@ mod tests {
     }
 
     #[apply(test!)]
+    async fn test_caller_input_stream_paints_last_key_before_eof() {
+        // Unlike stream::iter, unfold panics if polled after returning None.
+        let stream = stream::unfold(false, |sent| async move {
+            if sent {
+                None
+            } else {
+                Some((
+                    Ok(TerminalEvent::Key(KeyEvent::new(
+                        KeyEventKind::Press,
+                        KeyCode::Char('a'),
+                    ))),
+                    true,
+                ))
+            }
+        });
+        let frames: Vec<_> = element!(ControlledInput)
+            .mock_terminal_render_loop(MockTerminalConfig::default().with_input_stream(stream))
+            .map(|canvas| canvas.to_string())
+            .collect()
+            .await;
+        assert_eq!(frames, ["sent=\n\n", "sent=\na\n"]);
+    }
+
+    #[apply(test!)]
     async fn test_controlled_input_commits_between_batched_keys() {
         let events = [
             KeyCode::Char('h'),

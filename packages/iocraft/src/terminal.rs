@@ -275,7 +275,8 @@ pub(crate) struct Terminal<'a> {
     inner: Box<dyn TerminalImpl + 'a>,
     output: Output,
     base_fullscreen: bool,
-    event_stream: Option<BoxStream<'static, io::Result<TerminalEvent>>>,
+    // Input batching can observe EOF before wait() reports it to the render loop.
+    event_stream: Option<stream::Fuse<BoxStream<'static, io::Result<TerminalEvent>>>>,
     caller_input_stream: bool,
     pending_event: Option<io::Result<TerminalEvent>>,
     event_stream_wake: Arc<EventStreamWake>,
@@ -762,7 +763,7 @@ impl<'a> Terminal<'a> {
         stream: BoxStream<'static, io::Result<TerminalEvent>>,
     ) -> io::Result<()> {
         self.inner.set_raw_mode_enabled(true)?;
-        self.event_stream = Some(stream);
+        self.event_stream = Some(stream.fuse());
         self.caller_input_stream = true;
         Ok(())
     }
@@ -771,11 +772,11 @@ impl<'a> Terminal<'a> {
         if self.event_stream.is_none() {
             match self.input_backend {
                 TerminalInputBackend::Crossterm => {
-                    self.event_stream = Some(self.inner.event_stream()?);
+                    self.event_stream = Some(self.inner.event_stream()?.fuse());
                 }
                 TerminalInputBackend::RawInput(options) => {
                     self.raw_input_session_request = Some(options);
-                    self.event_stream = Some(stream::pending().boxed());
+                    self.event_stream = Some(stream::pending().boxed().fuse());
                 }
             }
         }
@@ -827,7 +828,7 @@ impl<'a> Terminal<'a> {
         };
         let stream_waker = Waker::from(self.event_stream_wake.clone());
         let mut context = Context::from_waker(&stream_waker);
-        event_stream.as_mut().poll_next(&mut context)
+        event_stream.poll_next_unpin(&mut context)
     }
 
     pub async fn wait(&mut self) -> io::Result<()> {
@@ -851,7 +852,7 @@ impl<'a> Terminal<'a> {
                 let next_event = poll_fn(move |cx| {
                     event_stream_wake.waker.register(cx.waker());
                     let mut stream_context = Context::from_waker(&stream_waker);
-                    event_stream.as_mut().poll_next(&mut stream_context)
+                    event_stream.poll_next_unpin(&mut stream_context)
                 });
                 match select(next_event, poll_fn(|cx| inner.poll_resumed(cx))).await {
                     Either::Left((next, _)) => next,
@@ -1013,7 +1014,7 @@ impl Terminal<'static> {
                 inner: Box::new(term),
                 output: Output::Stdout,
                 base_fullscreen,
-                event_stream: input_stream,
+                event_stream: input_stream.map(StreamExt::fuse),
                 caller_input_stream,
                 pending_event: None,
                 event_stream_wake: Arc::new(EventStreamWake::default()),
@@ -1040,7 +1041,7 @@ impl Terminal<'static> {
     #[cfg(test)]
     pub(crate) fn mock_with_event_error(error: io::Error) -> Self {
         let (mut terminal, _output) = Self::mock(MockTerminalConfig::default());
-        terminal.event_stream = Some(stream::once(async move { Err(error) }).boxed());
+        terminal.event_stream = Some(stream::once(async move { Err(error) }).boxed().fuse());
         terminal
     }
 }
