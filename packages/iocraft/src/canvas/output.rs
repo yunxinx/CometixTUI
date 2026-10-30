@@ -282,6 +282,34 @@ impl CanvasSubviewMut<'_> {
         self.canvas.set_overlay(x, y, overlay);
     }
 
+    pub(crate) fn overlay_text(
+        &mut self,
+        y: isize,
+        text: &str,
+        mut style_at: impl FnMut(usize) -> Option<StyleOverlay>,
+    ) {
+        let clip = self.clip_bounds();
+        let row = self.y as i128 + y as i128;
+        if row < clip.top || row >= clip.bottom {
+            return;
+        }
+        for (offset, grapheme, columns) in measure_text::positioned_graphemes(text, self.x) {
+            if grapheme != "\t"
+                && ((columns.start as i128) < clip.left || (columns.end as i128) > clip.right)
+            {
+                continue;
+            }
+            if let Some(style) = style_at(offset) {
+                let start = (columns.start as i128).clamp(clip.left, clip.right);
+                let end = (columns.end as i128).clamp(start, clip.right);
+                for column in start..end {
+                    self.canvas
+                        .set_overlay(column as usize, row as usize, style);
+                }
+            }
+        }
+    }
+
     /// Writes text to the region.
     pub fn set_text(&mut self, x: isize, y: isize, text: &str, style: CanvasTextStyle) {
         self.set_text_with_link(x, y, text, style, None);

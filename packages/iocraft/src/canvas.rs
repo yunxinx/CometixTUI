@@ -25,7 +25,7 @@ pub use measure_text::{
 };
 pub(crate) use measure_text::{
     grapheme_width, grapheme_width_varies_by_terminal, handles_vs16_incorrectly, single_ascii_byte,
-    skip_escape_sequence_graphemes, string_display_width, string_display_width_from_col,
+    string_display_width, string_display_width_from_col,
 };
 pub use output::*;
 pub use packed_screen::*;

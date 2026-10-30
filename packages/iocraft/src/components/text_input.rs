@@ -11,7 +11,7 @@ use core::{
     pin::Pin,
     task::{Poll, Waker},
 };
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 use unicode_segmentation::UnicodeSegmentation;
 
 trait UseCursorOverlay {
@@ -130,6 +130,19 @@ impl TextInputHandle {
     }
 }
 
+/// Style overrides for a UTF-8 byte range in a [`TextInput`]'s current value.
+///
+/// Ranges must be nonempty, ordered, nonoverlapping, and bounded by extended grapheme
+/// clusters in the current value. Invalid ranges panic. Styles affect drawing only;
+/// wrapping, scrolling, editing, and cursor placement use the unchanged value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextInputStyleRange {
+    /// The byte range to style, including any whitespace within it.
+    pub range: Range<usize>,
+    /// Overrides applied to the input's base style, beneath its cursor overlay.
+    pub style: StyleOverlay,
+}
+
 /// The props which can be passed to the [`TextInput`] component.
 #[non_exhaustive]
 #[derive(Default, Props)]
@@ -151,6 +164,10 @@ pub struct TextInputProps {
 
     /// The current value.
     pub value: String,
+
+    /// Style ranges derived from [`Self::value`]. Supply updated ranges with every value
+    /// change; offsets are not tracked across edits. See [`TextInputStyleRange`].
+    pub style_ranges: Vec<TextInputStyleRange>,
 
     /// True if the input has focus and should process keyboard input.
     pub has_focus: bool,
@@ -302,14 +319,6 @@ impl TextBuffer {
         (self.rows.len(), self.rows.last().map_or(0, |r| r.width))
     }
 
-    fn lines(&self) -> impl Iterator<Item = &str> {
-        self.rows.iter().map(move |row| {
-            let start = row.offset;
-            let end = start + row.len;
-            &self.text[start..end]
-        })
-    }
-
     fn left_of_offset(&self, offset: usize) -> usize {
         if offset == 0 {
             0
@@ -387,12 +396,14 @@ struct TextBufferViewProps {
     invert: bool,
     auto_grow: bool,
     buffer: Arc<TextBuffer>,
+    style_ranges: Vec<TextInputStyleRange>,
 }
 
 #[derive(Default)]
 struct TextBufferView {
     text_style: CanvasTextStyle,
     buffer: Arc<TextBuffer>,
+    style_ranges: Vec<TextInputStyleRange>,
 }
 
 impl Component for TextBufferView {
@@ -417,6 +428,35 @@ impl Component for TextBufferView {
             ..Default::default()
         };
         self.buffer = props.buffer.clone();
+        self.style_ranges = std::mem::take(&mut props.style_ranges);
+        let mut boundaries = self
+            .buffer
+            .text
+            .grapheme_indices(true)
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(self.buffer.text.len()));
+        let mut boundary = 0;
+        let mut previous_end = 0;
+        for styled in &self.style_ranges {
+            assert!(
+                styled.range.start >= previous_end
+                    && styled.range.start < styled.range.end
+                    && styled.range.end <= self.buffer.text.len(),
+                "TextInput style ranges must be ordered, nonempty, nonoverlapping, and within the current value"
+            );
+            for offset in [styled.range.start, styled.range.end] {
+                while boundary < offset {
+                    boundary = boundaries
+                        .next()
+                        .expect("the value ends at a grapheme boundary");
+                }
+                assert_eq!(
+                    boundary, offset,
+                    "TextInput style ranges must align to grapheme boundaries"
+                );
+            }
+            previous_end = styled.range.end;
+        }
         if props.auto_grow {
             // Auto-grow: explicit height (row count) and full parent width
             // instead of absolute positioning, so taffy's flex layout derives
@@ -448,8 +488,58 @@ impl Component for TextBufferView {
         if drawer.zero_height_sibling_shares_y() {
             return;
         }
-        let mut drawer = TextDrawer::new(drawer, 0, false);
-        drawer.append_lines(self.buffer.lines(), self.text_style);
+        TextDrawer::new(drawer, 0, false).append_lines(
+            self.buffer
+                .rows
+                .iter()
+                .map(|row| &self.buffer.text[row.offset..row.offset + row.len]),
+            self.text_style,
+        );
+        for (row_index, row) in self.buffer.rows.iter().enumerate() {
+            let first = self
+                .style_ranges
+                .partition_point(|styled| styled.range.end <= row.offset);
+            let ranges = &self.style_ranges[first..];
+            if ranges
+                .first()
+                .is_none_or(|styled| styled.range.start >= row.offset + row.len)
+            {
+                continue;
+            }
+            let line = &self.buffer.text[row.offset..row.offset + row.len];
+            let style_at = |offset| {
+                let offset = row.offset + offset;
+                let index = ranges.partition_point(|styled| styled.range.end <= offset);
+                ranges
+                    .get(index)
+                    .filter(|styled| styled.range.contains(&offset))
+                    .map(|styled| styled.style)
+            };
+            let mut canvas = drawer.canvas();
+            if crate::bidi::needs_software_bidi() {
+                let graphemes = line
+                    .grapheme_indices(true)
+                    .map(|(offset, text)| crate::bidi::BidiGrapheme {
+                        text: text.to_string(),
+                        metadata: offset,
+                    })
+                    .collect();
+                let mut visual = String::with_capacity(line.len());
+                let mut offsets = Vec::new();
+                for grapheme in crate::bidi::reorder_bidi_graphemes(graphemes, true) {
+                    offsets.push((visual.len(), grapheme.metadata));
+                    visual.push_str(&grapheme.text);
+                }
+                canvas.overlay_text(row_index as isize, &visual, |offset| {
+                    let index = offsets
+                        .binary_search_by_key(&offset, |&(visual, _)| visual)
+                        .expect("painted graphemes have source offsets");
+                    style_at(offsets[index].1)
+                });
+            } else {
+                canvas.overlay_text(row_index as isize, line, style_at);
+            }
+        }
     }
 }
 
@@ -810,6 +900,7 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
             View(position: Position::Absolute, top: -i32::try_from(scroll_offset_row.get()).unwrap_or(i32::MAX), left: -i32::try_from(scroll_offset_col.get()).unwrap_or(i32::MAX)) {
                 TextBufferView(
                     buffer,
+                    style_ranges: props.style_ranges.clone(),
                     color: props.color,
                     weight: props.weight,
                     underline: props.decoration == TextDecoration::Underline,
@@ -876,6 +967,271 @@ mod tests {
     use macro_rules_attribute::apply;
     use smol_macros::test;
 
+    #[apply(test!)]
+    async fn test_input_style_ranges_preserve_wrapping_and_cursor() {
+        let value = "ab e\u{301}中 xyz";
+        let render = |styled| {
+            element! {
+                CursorProbe(
+                    initial_value: value,
+                    width: 7,
+                    height: 2,
+                    multiline: true,
+                    physical_cursor: true,
+                    weight: Weight::Bold,
+                    style_ranges: if styled {
+                        vec![TextInputStyleRange {
+                            range: 3..9,
+                            style: StyleOverlay {
+                                color: Some(Some(Color::Cyan)),
+                                ..Default::default()
+                            },
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                )
+            }
+        };
+        let events = || {
+            MockTerminalConfig::with_delayed_events([
+                TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Right)),
+                TerminalEvent::Resize(80, 24),
+            ])
+        };
+        let plain: Vec<_> = render(false)
+            .mock_terminal_render_loop(events())
+            .collect()
+            .await;
+        let styled: Vec<_> = render(true)
+            .mock_terminal_render_loop(events())
+            .collect()
+            .await;
+        let plain = plain.last().unwrap();
+        let styled = styled.last().unwrap();
+        assert_eq!(styled.to_string(), plain.to_string());
+        assert_eq!(styled.cursor_declaration(), plain.cursor_declaration());
+        assert_eq!(styled.to_string(), "ab e\u{301}中\nxyz\n");
+        for column in [3, 4] {
+            let style = styled.resolved_text_style(column, 0).unwrap();
+            assert_eq!(style.color, Some(Color::Cyan));
+            assert_eq!(style.weight, Weight::Bold);
+        }
+        assert_eq!(styled.resolved_text_style(0, 1).unwrap().color, None);
+    }
+
+    #[test]
+    fn test_input_style_ranges_preserve_bidirectional_text() {
+        let render = |styled| {
+            element! {
+                View(width: 20, height: 1, background_color: Color::Red) {
+                    TextInput(
+                        value: "אבגabc",
+                        has_focus: true,
+                        physical_cursor: true,
+                        style_ranges: if styled {
+                            vec![TextInputStyleRange {
+                                range: 0..2,
+                                style: StyleOverlay {
+                                    color: Some(Some(Color::Cyan)),
+                                    background_color: Some(None),
+                                    ..Default::default()
+                                },
+                            }]
+                        } else { Vec::new() },
+                    )
+                }
+            }
+            .render(None)
+        };
+        let plain = render(false);
+        let styled = render(true);
+        assert_eq!(styled.to_string(), plain.to_string());
+        assert_eq!(styled.cursor_declaration(), plain.cursor_declaration());
+        for column in 0..6 {
+            let cell = styled.cell(column, 0).unwrap();
+            assert_eq!(
+                styled.resolved_text_style(column, 0).unwrap().color,
+                if cell.text() == Some("א") {
+                    Some(Color::Cyan)
+                } else {
+                    None
+                }
+            );
+        }
+        let changes = plain.diff(&styled);
+        let styled_cell = changes
+            .iter()
+            .find_map(|change| {
+                change
+                    .added
+                    .as_ref()
+                    .filter(|cell| cell.cell.text() == Some("א"))
+            })
+            .expect("styled cell changes");
+        assert_eq!(
+            styled_cell.overlay.expect("range overlay").background_color,
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn test_input_style_ranges_follow_canvas_tab_stops_and_control_sequences() {
+        for (value, end, last_column, expected) in [
+            ("a\tb tail", 3, 8, "  a     b tail\n"),
+            ("a\x1b[31mb tail", 7, 3, "  ab tail\n"),
+        ] {
+            let canvas = element! {
+                View(width: 20, height: 1, padding_left: 2) {
+                    TextInput(value, style_ranges: vec![TextInputStyleRange {
+                        range: 0..end,
+                        style: StyleOverlay { color: Some(Some(Color::Cyan)), ..Default::default() },
+                    }])
+                }
+            }.render(None);
+            assert_eq!(canvas.to_string(), expected);
+            for column in 2..=last_column {
+                assert_eq!(
+                    canvas.resolved_text_style(column, 0).unwrap().color,
+                    Some(Color::Cyan)
+                );
+            }
+            for column in last_column + 1..last_column + 6 {
+                assert_eq!(canvas.resolved_text_style(column, 0).unwrap().color, None);
+            }
+        }
+    }
+
+    #[derive(Default, Props)]
+    struct StyledEditorProbeProps {
+        styled: bool,
+        physical_cursor: bool,
+    }
+
+    #[component]
+    fn StyledEditorProbe(
+        mut hooks: Hooks,
+        props: &StyledEditorProbeProps,
+    ) -> impl Into<AnyElement<'static>> {
+        let mut value = hooks.use_state(String::new);
+        let mut color = hooks.use_state(|| Color::Cyan);
+        let mut exit = hooks.use_state(|| false);
+        let mut system = hooks.use_context_mut::<SystemContext>();
+        let (width, _) = hooks.use_terminal_size();
+        hooks.use_terminal_events(move |event| {
+            if let TerminalEvent::Key(key) = event {
+                match key.code {
+                    KeyCode::F(2) => color.set(Color::Magenta),
+                    KeyCode::F(3) => value.set("e\u{301}中".to_string()),
+                    KeyCode::Esc => exit.set(true),
+                    _ => {}
+                }
+            }
+        });
+        if exit.get() {
+            system.exit();
+        }
+        let style_ranges = if props.styled && !value.read().is_empty() {
+            vec![TextInputStyleRange {
+                range: 0..value.read().len(),
+                style: StyleOverlay {
+                    color: Some(Some(color.get())),
+                    ..Default::default()
+                },
+            }]
+        } else {
+            Vec::new()
+        };
+        element! {
+            View(width) {
+                TextInput(
+                    value: value.to_string(),
+                    style_ranges,
+                    on_change: move |text| value.set(text),
+                    has_focus: true,
+                    physical_cursor: props.physical_cursor,
+                    multiline: true,
+                    auto_grow: true,
+                    max_height: Some(2),
+                )
+            }
+        }
+    }
+
+    #[apply(test!)]
+    async fn test_input_style_ranges_follow_edits_restore_resize_and_scroll() {
+        let key = |code| TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, code));
+        let events = || {
+            MockTerminalConfig::with_delayed_events([
+                TerminalEvent::Paste("ab e\u{301}中\nsecond line\nlast".to_string()),
+                key(KeyCode::Left),
+                key(KeyCode::Backspace),
+                key(KeyCode::Home),
+                key(KeyCode::Delete),
+                key(KeyCode::Up),
+                key(KeyCode::Up),
+                TerminalEvent::Resize(12, 5),
+                key(KeyCode::F(2)),
+                key(KeyCode::F(3)),
+                key(KeyCode::Home),
+                key(KeyCode::Right),
+                key(KeyCode::Backspace),
+                key(KeyCode::Delete),
+                key(KeyCode::Esc),
+            ])
+            .with_size(7, 5)
+        };
+        for physical_cursor in [false, true] {
+            let plain: Vec<_> = element!(StyledEditorProbe(styled: false, physical_cursor))
+                .mock_terminal_render_loop(events())
+                .collect()
+                .await;
+            let styled: Vec<_> = element!(StyledEditorProbe(styled: true, physical_cursor))
+                .mock_terminal_render_loop(events())
+                .collect()
+                .await;
+            let observations = |canvases: &[Canvas]| {
+                let mut observations: Vec<_> = canvases
+                    .iter()
+                    .map(|canvas| (canvas.to_string(), canvas.cursor_declaration()))
+                    .collect();
+                observations.dedup();
+                observations
+            };
+            assert_eq!(observations(&styled), observations(&plain));
+            let restored = styled
+                .iter()
+                .find(|canvas| canvas.to_string() == "e\u{301}中\n")
+                .expect("restored value scrolls back into view");
+            for column in [0, 1] {
+                assert_eq!(
+                    restored.resolved_text_style(column, 0).unwrap().color,
+                    Some(Color::Magenta)
+                );
+            }
+            assert!(styled.iter().any(|canvas| canvas.to_string() == "中\n"));
+            assert!(styled.last().unwrap().to_string().trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_input_style_ranges_reject_invalid_current_value_boundaries() {
+        for range in [1..3, 0..2, 0..7, 3..3] {
+            let result = std::panic::catch_unwind(|| {
+                element! {
+                    View(width: 10, height: 1) {
+                        TextInput(value: "e\u{301}中", style_ranges: vec![TextInputStyleRange {
+                            range,
+                            style: StyleOverlay::default(),
+                        }])
+                    }
+                }
+                .render(None);
+            });
+            assert!(result.is_err(), "invalid ranges must fail before drawing");
+        }
+    }
+
     #[derive(Default, Props)]
     struct MyComponentProps {
         initial_value: String,
@@ -924,6 +1280,8 @@ mod tests {
 
     #[derive(Default, Props)]
     struct CursorProbeProps {
+        style_ranges: Vec<TextInputStyleRange>,
+        weight: Weight,
         initial_value: String,
         width: Size,
         height: Size,
@@ -949,6 +1307,8 @@ mod tests {
                 TextInput(
                     has_focus: true,
                     value: props.initial_value.clone(),
+                    style_ranges: props.style_ranges.clone(),
+                    weight: props.weight,
                     on_change: |_| {},
                     multiline: props.multiline,
                     physical_cursor: props.physical_cursor,

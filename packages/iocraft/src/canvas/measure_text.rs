@@ -11,6 +11,46 @@ pub(crate) fn string_display_width(s: &str) -> usize {
     string_display_width_from_col(s, 0)
 }
 
+/// Source byte offsets and absolute terminal columns for the graphemes the canvas paints.
+/// Escape sequences and zero-width controls consume source bytes without occupying cells.
+pub(super) fn positioned_graphemes(
+    text: &str,
+    start_column: isize,
+) -> impl Iterator<Item = (usize, &str, std::ops::Range<isize>)> {
+    let graphemes: Vec<_> = text.graphemes(true).collect();
+    let mut index = 0;
+    let mut offset = 0;
+    let mut column = start_column;
+    std::iter::from_fn(move || {
+        while index < graphemes.len() {
+            let grapheme = graphemes[index];
+            let source_offset = offset;
+            let next = if grapheme == "\x1b" {
+                skip_escape_sequence_graphemes(&graphemes, index)
+            } else {
+                index + 1
+            };
+            offset += graphemes[index..next]
+                .iter()
+                .map(|text| text.len())
+                .sum::<usize>();
+            index = next;
+            let width = if grapheme == "\t" {
+                8 - column.rem_euclid(8) as usize
+            } else {
+                grapheme_width(grapheme)
+            };
+            if width == 0 {
+                continue;
+            }
+            let start = column;
+            column += width as isize;
+            return Some((source_offset, grapheme, start..column));
+        }
+        None
+    })
+}
+
 /// Compute terminal display width starting at a specific terminal column.
 ///
 /// Tabs expand to the next 8-column tab stop, matching CC Ink's output layer

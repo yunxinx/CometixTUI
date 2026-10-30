@@ -1771,7 +1771,7 @@ impl Canvas {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn set_text_row_str_clipped(
         &mut self,
-        mut x: isize,
+        x: isize,
         y: usize,
         min_x: isize,
         max_x: isize,
@@ -1790,61 +1790,26 @@ impl Canvas {
             return;
         }
 
-        let graphemes = text.graphemes(true).collect::<Vec<_>>();
-        let mut grapheme_idx = 0;
-        while grapheme_idx < graphemes.len() {
-            let grapheme = graphemes[grapheme_idx];
-            if let Some(code) = single_ascii_byte(grapheme).filter(|code| *code <= 0x1f) {
-                if code == b'\t' {
-                    // POSIX/terminal tab stops are fixed at 8 columns. CC Ink's
-                    // output layer expands tabs into blank cells at write time
-                    // rather than letting a literal TAB move the physical cursor.
-                    let spaces = 8 - x.rem_euclid(8) as usize;
-                    for _ in 0..spaces {
-                        if x >= min_x && x <= max_x {
-                            Self::write_grapheme_to_row(
-                                row,
-                                x as usize,
-                                " ",
-                                1,
-                                CanvasTextStyle::default(),
-                                None,
-                            );
-                        }
-                        x += 1;
+        for (_, grapheme, columns) in measure_text::positioned_graphemes(text, x) {
+            let x = columns.start;
+            let end_x = columns.end;
+            let width = (end_x - x) as usize;
+            if grapheme == "\t" {
+                for column in columns {
+                    if column >= min_x && column <= max_x {
+                        Self::write_grapheme_to_row(
+                            row,
+                            column as usize,
+                            " ",
+                            1,
+                            CanvasTextStyle::default(),
+                            None,
+                        );
                     }
-                    grapheme_idx += 1;
-                    continue;
                 }
-
-                // Mirror CC Ink output.ts: C0 controls must never enter the
-                // retained buffer because terminals may move the cursor for
-                // them while our virtual cursor treats them as zero-width.
-                // ESC starts a control sequence; skip the whole sequence when
-                // possible so raw cursor movement/title/string controls do not
-                // leak visible bytes into the UI.
-                grapheme_idx = if code == 0x1b {
-                    skip_escape_sequence_graphemes(&graphemes, grapheme_idx)
-                } else {
-                    grapheme_idx + 1
-                };
                 continue;
             }
-
-            let width = grapheme_width(grapheme);
-            if width == 0 {
-                // Zero-width graphemes (standalone combining marks, DEL/C1
-                // controls, ZWJ/ZWS, etc.) must not occupy or mutate retained
-                // cells. Base+combining clusters arrive as one grapheme with
-                // width 1, so composed accents are still preserved.
-                grapheme_idx += 1;
-                continue;
-            }
-
-            let end_x = x + width as isize;
             if end_x <= min_x {
-                x = end_x;
-                grapheme_idx += 1;
                 continue;
             }
             if x > max_x {
@@ -1852,8 +1817,6 @@ impl Canvas {
             }
             if x < min_x {
                 // Do not render partial graphemes clipped at the left edge.
-                x = end_x;
-                grapheme_idx += 1;
                 continue;
             }
             if end_x - 1 > max_x {
@@ -1876,8 +1839,6 @@ impl Canvas {
             }
 
             Self::write_grapheme_to_row(row, x as usize, grapheme, width, style, hyperlink);
-            x = end_x;
-            grapheme_idx += 1;
         }
     }
 
