@@ -4,7 +4,7 @@ use crate::{
     Props, Size, StyleOverlay, TerminalEvent, Weight, component,
     components::{TextDecoration, TextDrawer, TextWrap, View},
     element,
-    hooks::{Ref, State, UseMemo, UseState, UseTerminalEvents},
+    hooks::{Ref, State, UseMemo, UseRef, UseState, UseTerminalEvents},
     segmented_string::SegmentedString,
 };
 use core::{
@@ -13,6 +13,11 @@ use core::{
 };
 use std::{ops::Range, sync::Arc};
 use unicode_segmentation::UnicodeSegmentation;
+
+mod word_boundaries;
+
+#[cfg(test)]
+mod keyboard_tests;
 
 trait UseCursorOverlay {
     fn use_cursor_overlay(&mut self) -> &mut CursorOverlayState;
@@ -60,6 +65,9 @@ impl Hook for CursorOverlayState {
 
 /// A handle which can be used for imperative control of a [`TextInput`] component.
 ///
+/// The handle retains the most recent nonempty line or word deletion for Ctrl+Y. Keep it in
+/// a parent component to preserve that text across input unmounts and value replacements.
+///
 /// # Example
 ///
 /// ```
@@ -95,6 +103,7 @@ pub struct TextInputHandle {
     inner: Option<TextInputHandleInner>,
     /// An offset set while no input was mounted, applied by the next one to mount.
     pending_cursor_offset: Option<usize>,
+    deleted_text: String,
 }
 
 struct TextInputHandleInner {
@@ -375,15 +384,29 @@ impl TextBuffer {
         self.offset_for_closest_column_in_row(row + 1, col_preference.unwrap_or(col))
     }
 
-    fn row_start_offset(&self, offset: usize) -> usize {
-        let (row, _) = self.row_column_for_offset(offset);
-        self.rows[row].offset
+    fn line_start_offset(&self, offset: usize) -> usize {
+        self.text[..offset].rfind('\n').map_or(0, |index| index + 1)
     }
 
-    fn row_end_offset(&self, offset: usize) -> usize {
-        let (row, _) = self.row_column_for_offset(offset);
-        let r = &self.rows[row];
-        r.offset + r.len
+    fn line_end_offset(&self, offset: usize) -> usize {
+        let end = self.text[offset..]
+            .find('\n')
+            .map_or(self.text.len(), |index| offset + index);
+        clamp_to_grapheme_boundary(&self.text, end)
+    }
+
+    fn previous_word_offset(&self, offset: usize) -> usize {
+        word_boundaries::ranges(&self.text[..offset])
+            .rev()
+            .find(|range| !self.text[range.clone()].starts_with(char::is_whitespace))
+            .map_or(0, |range| range.start)
+    }
+
+    fn next_word_offset(&self, offset: usize) -> usize {
+        let suffix = &self.text[offset..];
+        word_boundaries::ranges(suffix)
+            .find(|range| !suffix[range.clone()].starts_with(char::is_whitespace))
+            .map_or(self.text.len(), |range| offset + range.end)
     }
 }
 
@@ -548,6 +571,19 @@ impl Component for TextBufferView {
 /// It will fill the available width and display the current value. Typically, you will want to
 /// render it in a [`View`](crate::components::View) component of the desired text field size.
 ///
+/// Home/End and Ctrl+A/E move to logical line boundaries, independent of wrapping. Ctrl+U/K
+/// delete to those boundaries, or the adjacent newline when already at a boundary. Alt+B/F,
+/// Alt+Left/Right and Ctrl+Left/Right move by Unicode words, subdividing ASCII punctuation
+/// except underscores and grouping adjacent separators. Ctrl+W, Alt+Backspace and
+/// Ctrl+Backspace delete backward by a word; Alt+D, Alt+Delete and Ctrl+Delete delete forward.
+/// These deletions include intervening whitespace and always preserve extended graphemes.
+///
+/// Ctrl+Y repeatedly inserts the most recent nonempty line or word deletion. Backspace,
+/// Delete and Ctrl+D delete one grapheme without changing the saved text. Saved text belongs
+/// to the [`TextInputHandle`], or to the component when no handle is supplied. Replacing the
+/// value preserves it; retaining a handle in the caller also preserves it across unmounts.
+/// All editing keys require [`TextInputProps::has_focus`].
+///
 /// # Example
 ///
 /// ```
@@ -600,17 +636,16 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
     let (width, height) = hooks.use_size(!auto_grow);
     let (width, height) = (usize::from(width), usize::from(height));
 
-    let mut pending_cursor_offset = None;
-    if let Some(handle_ref) = props.handle.as_mut() {
-        pending_cursor_offset = handle_ref.write().pending_cursor_offset.take();
-        handle_ref.set(TextInputHandle {
-            inner: Some(TextInputHandleInner {
-                cursor_offset,
-                requested_cursor_offset,
-            }),
-            pending_cursor_offset: None,
+    let local_handle = hooks.use_ref_default::<TextInputHandle>();
+    let mut handle = props.handle.unwrap_or(local_handle);
+    let pending_cursor_offset = {
+        let mut handle = handle.write();
+        handle.inner = Some(TextInputHandleInner {
+            cursor_offset,
+            requested_cursor_offset,
         });
-    }
+        handle.pending_cursor_offset.take()
+    };
 
     let max_text_width = if wrap == TextWrap::Wrap {
         // Reserve the last column for the cursor.
@@ -734,6 +769,8 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
             let cursor = clamp_to_grapheme_boundary(&value, cursor_offset.get());
             // The cursor after an edit of `value`.
             let mut edited = None;
+            let mut deleted_range = None;
+            let mut save_deleted_text = false;
             let mut handled = false;
 
             match event {
@@ -772,18 +809,75 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
                     modifiers,
                     ..
                 }) if kind != KeyEventKind::Release
-                    && modifiers.contains(KeyModifiers::CONTROL)
+                    && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                     && !is_altgr_char(code, modifiers) =>
                 {
+                    let control = modifiers.contains(KeyModifiers::CONTROL);
+                    let alt = modifiers.contains(KeyModifiers::ALT);
                     match code {
-                        KeyCode::Char('a') => {
-                            cursor_offset.set(buffer.row_start_offset(cursor));
+                        KeyCode::Char('a') if control => {
+                            cursor_offset.set(buffer.line_start_offset(cursor));
                             vertical_movement_col_preference.set(None);
                             handled = true;
                         }
-                        KeyCode::Char('e') => {
-                            cursor_offset.set(buffer.row_end_offset(cursor));
+                        KeyCode::Char('e') if control => {
+                            cursor_offset.set(buffer.line_end_offset(cursor));
                             vertical_movement_col_preference.set(None);
+                            handled = true;
+                        }
+                        KeyCode::Char('u') if control => {
+                            save_deleted_text = true;
+                            let start = buffer.line_start_offset(cursor);
+                            deleted_range = Some(if start == cursor {
+                                buffer.left_of_offset(cursor)..cursor
+                            } else {
+                                start..cursor
+                            });
+                            handled = true;
+                        }
+                        KeyCode::Char('k') if control => {
+                            save_deleted_text = true;
+                            let end = buffer.line_end_offset(cursor);
+                            deleted_range = Some(if end == cursor {
+                                cursor..buffer.right_of_offset(cursor)
+                            } else {
+                                cursor..end
+                            });
+                            handled = true;
+                        }
+                        KeyCode::Char('y') if control => {
+                            let handle = handle.read();
+                            if !handle.deleted_text.is_empty() {
+                                value.insert_str(cursor, &handle.deleted_text);
+                                edited = Some(cursor + handle.deleted_text.len());
+                            }
+                            vertical_movement_col_preference.set(None);
+                            handled = true;
+                        }
+                        KeyCode::Left | KeyCode::Char('b') if code == KeyCode::Left || alt => {
+                            cursor_offset.set(buffer.previous_word_offset(cursor));
+                            vertical_movement_col_preference.set(None);
+                            handled = true;
+                        }
+                        KeyCode::Right | KeyCode::Char('f') if code == KeyCode::Right || alt => {
+                            cursor_offset.set(buffer.next_word_offset(cursor));
+                            vertical_movement_col_preference.set(None);
+                            handled = true;
+                        }
+                        KeyCode::Backspace | KeyCode::Char('w')
+                            if code == KeyCode::Backspace || control =>
+                        {
+                            deleted_range = Some(buffer.previous_word_offset(cursor)..cursor);
+                            save_deleted_text = true;
+                            handled = true;
+                        }
+                        KeyCode::Delete | KeyCode::Char('d') if code == KeyCode::Delete || alt => {
+                            deleted_range = Some(cursor..buffer.next_word_offset(cursor));
+                            save_deleted_text = true;
+                            handled = true;
+                        }
+                        KeyCode::Char('d') if control => {
+                            deleted_range = Some(cursor..buffer.right_of_offset(cursor));
                             handled = true;
                         }
                         _ => {}
@@ -806,20 +900,12 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
                             edited = Some(cursor + c.len_utf8());
                             handled = true;
                         }
-                        KeyCode::Backspace => {
-                            if cursor > 0 {
-                                let start = buffer.left_of_offset(cursor);
-                                value.replace_range(start..cursor, "");
-                                edited = Some(start);
-                            }
-                            handled = true;
-                        }
-                        KeyCode::Delete => {
-                            if cursor < value.len() {
-                                let end = buffer.right_of_offset(cursor);
-                                value.replace_range(cursor..end, "");
-                                edited = Some(cursor);
-                            }
+                        KeyCode::Backspace | KeyCode::Delete => {
+                            deleted_range = Some(if code == KeyCode::Backspace {
+                                buffer.left_of_offset(cursor)..cursor
+                            } else {
+                                cursor..buffer.right_of_offset(cursor)
+                            });
                             handled = true;
                         }
                         KeyCode::Enter if multiline => {
@@ -858,11 +944,11 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
                             handled = true;
                         }
                         KeyCode::Home => {
-                            cursor_offset.set(buffer.row_start_offset(cursor));
+                            cursor_offset.set(buffer.line_start_offset(cursor));
                             handled = true;
                         }
                         KeyCode::End => {
-                            cursor_offset.set(buffer.row_end_offset(cursor));
+                            cursor_offset.set(buffer.line_end_offset(cursor));
                             handled = true;
                         }
                         _ => {
@@ -875,6 +961,16 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
                     }
                 }
                 _ => {}
+            }
+            if let Some(range) = deleted_range {
+                if !range.is_empty() {
+                    if save_deleted_text {
+                        handle.write().deleted_text = value[range.clone()].to_string();
+                    }
+                    edited = Some(range.start);
+                    value.replace_range(range, "");
+                }
+                vertical_movement_col_preference.set(None);
             }
             // An edit can join adjacent graphemes, so publish its cursor at a boundary in
             // the resulting value, together with the value it belongs to.
