@@ -248,7 +248,13 @@ pub(super) fn parse_numeric_params(params: &str) -> Option<Vec<u32>> {
     }
     params
         .split(';')
-        .map(|param| param.parse::<u32>().ok())
+        .map(|param| {
+            if param.is_empty() {
+                Some(0)
+            } else {
+                param.parse::<u32>().ok()
+            }
+        })
         .collect()
 }
 

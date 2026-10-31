@@ -1,4 +1,5 @@
 use super::*;
+mod input_protocol;
 mod raw_mode;
 mod synchronized;
 use crate::prelude::*;
@@ -1898,7 +1899,7 @@ fn test_terminal_input_parser_matches_cc_ink_parse_multiple_keypresses() {
     assert!(incomplete.feed("\x1b[?").is_empty());
     assert!(matches!(
         incomplete.flush().as_slice(),
-        [TerminalParsedInput::Key(event)] if event.input == "[?"
+        [TerminalParsedInput::Key(event)] if event.input.is_empty()
     ));
 }
 

@@ -37,8 +37,10 @@ pub struct TerminalParsedMouse {
 /// frontends: printable keys use their literal sequence, named/special keys set
 /// [`Self::name`], CSI-u / modifyOtherKeys modifiers are decoded, and raw mouse
 /// wheel sequences become `wheelup` / `wheeldown` keys.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalParsedKey {
+    /// Press, repeat, or release reported by the keyboard protocol.
+    pub kind: KeyEventKind,
     /// CC Ink-style key name (`"return"`, `"left"`, `"space"`, `"f1"`, etc.).
     /// `None` means the sequence is ordinary text or an unmapped function key.
     pub name: Option<String>,
@@ -64,6 +66,25 @@ pub struct TerminalParsedKey {
     /// always returns `false`; paste grouping is represented by
     /// [`TerminalParsedInput::Paste`].
     pub is_pasted: bool,
+}
+
+impl Default for TerminalParsedKey {
+    fn default() -> Self {
+        Self {
+            kind: KeyEventKind::Press,
+            name: None,
+            ctrl: false,
+            meta: false,
+            shift: false,
+            option: false,
+            super_key: false,
+            fn_key: false,
+            sequence: None,
+            raw: None,
+            code: None,
+            is_pasted: false,
+        }
+    }
 }
 
 impl TerminalParsedKey {
@@ -376,24 +397,28 @@ fn parsed_input_event_to_terminal_events(event: TerminalParsedInputEvent) -> Vec
         return vec![TerminalEvent::Key(KeyEvent {
             code,
             modifiers,
-            kind: KeyEventKind::Press,
+            kind: event.keypress.kind,
         })];
     }
 
-    text_to_key_events_with_modifiers(&event.input, modifiers)
+    text_to_key_events_with_modifiers(&event.input, modifiers, event.keypress.kind)
 }
 
 fn text_to_key_events(text: &str) -> Vec<TerminalEvent> {
-    text_to_key_events_with_modifiers(text, KeyModifiers::empty())
+    text_to_key_events_with_modifiers(text, KeyModifiers::empty(), KeyEventKind::Press)
 }
 
-fn text_to_key_events_with_modifiers(text: &str, modifiers: KeyModifiers) -> Vec<TerminalEvent> {
+fn text_to_key_events_with_modifiers(
+    text: &str,
+    modifiers: KeyModifiers,
+    kind: KeyEventKind,
+) -> Vec<TerminalEvent> {
     text.chars()
         .map(|ch| {
             TerminalEvent::Key(KeyEvent {
                 code: KeyCode::Char(ch),
                 modifiers,
-                kind: KeyEventKind::Press,
+                kind,
             })
         })
         .collect()
@@ -689,12 +714,13 @@ fn parse_sgr_mouse_parts(sequence: &str) -> Option<(u16, u16, u16, TerminalParse
     Some((button, column, row, action))
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct ParsedModifierFlags {
     shift: bool,
     meta: bool,
     ctrl: bool,
     super_key: bool,
+    kind: KeyEventKind,
 }
 
 fn terminal_parsed_key_to_input_event(keypress: &TerminalParsedKey) -> TerminalParsedInputEvent {
@@ -732,6 +758,16 @@ fn terminal_parsed_key_to_input_event(keypress: &TerminalParsedKey) -> TerminalP
         input = " ".to_string();
     }
     if keypress.code.is_some() && keypress.name.is_none() {
+        input.clear();
+    }
+    // Unrecognized control packets still belong to the terminal protocol.
+    // Keep their raw sequence for response consumers without inserting it as text.
+    if keypress.name.is_none()
+        && input.len() > 2
+        && ["\x1b[", "\x1b]", "\x1bP", "\x1b_", "\x1b^", "\x1bX"]
+            .iter()
+            .any(|prefix| input.starts_with(prefix))
+    {
         input.clear();
     }
     if keypress.name.is_none() && is_orphan_sgr_mouse_tail(&input) {
@@ -908,14 +944,11 @@ fn parse_csi_u_key(sequence: &str) -> Option<(Option<String>, ParsedModifierFlag
     }
     let mut parts = body.split(';');
     let codepoint = parts.next()?.parse::<u32>().ok()?;
-    let modifier = parts
-        .next()
-        .map(|part| part.parse::<u16>().ok())
-        .unwrap_or(Some(1))?;
+    let flags = parse_key_modifier(parts.next().unwrap_or("1"))?;
     if parts.next().is_some() {
         return None;
     }
-    Some((keycode_to_name(codepoint), decode_key_modifier(modifier)))
+    Some((keycode_to_name(codepoint), flags))
 }
 
 fn parse_modify_other_keys(sequence: &str) -> Option<(Option<String>, ParsedModifierFlags)> {
@@ -936,7 +969,24 @@ fn decode_key_modifier(modifier: u16) -> ParsedModifierFlags {
         meta: modifier & 2 != 0,
         ctrl: modifier & 4 != 0,
         super_key: modifier & 8 != 0,
+        kind: KeyEventKind::Press,
     }
+}
+
+fn parse_key_modifier(parameter: &str) -> Option<ParsedModifierFlags> {
+    let mut fields = parameter.split(':');
+    let modifier = match fields.next()? {
+        "" => 1,
+        value => value.parse::<u16>().ok()?,
+    };
+    let mut flags = decode_key_modifier(modifier);
+    flags.kind = match fields.next() {
+        None | Some("" | "1") => KeyEventKind::Press,
+        Some("2") => KeyEventKind::Repeat,
+        Some("3") => KeyEventKind::Release,
+        Some(_) => return None,
+    };
+    fields.next().is_none().then_some(flags)
 }
 
 fn key_with_name_and_flags(
@@ -946,6 +996,7 @@ fn key_with_name_and_flags(
     code: Option<String>,
 ) -> TerminalParsedKey {
     TerminalParsedKey {
+        kind: flags.kind,
         fn_key: name.as_deref().is_some_and(is_function_key_name),
         name,
         ctrl: flags.ctrl,
@@ -1028,15 +1079,14 @@ fn parse_meta_alnum(sequence: &str) -> Option<(bool, char)> {
 
 struct FunctionKeyParse {
     code: String,
-    modifier: u16,
+    flags: ParsedModifierFlags,
     option: bool,
 }
 
 fn parse_function_key_sequence(sequence: &str) -> Option<TerminalParsedKey> {
     let parsed = parse_function_key_code(sequence)?;
-    let flags = decode_key_modifier(parsed.modifier);
     let name = key_name_for_code(&parsed.code).map(str::to_string);
-    let mut key = key_with_name_and_flags(sequence, name, flags, Some(parsed.code.clone()));
+    let mut key = key_with_name_and_flags(sequence, name, parsed.flags, Some(parsed.code.clone()));
     key.option = parsed.option;
     if is_shift_key_code(&parsed.code) {
         key.shift = true;
@@ -1069,7 +1119,7 @@ fn parse_function_key_code(sequence: &str) -> Option<FunctionKeyParse> {
         if chars.next().is_none() && final_ch.is_ascii_alphabetic() {
             return Some(FunctionKeyParse {
                 code: format!("{prefix}{final_ch}"),
-                modifier: 1,
+                flags: decode_key_modifier(1),
                 option,
             });
         }
@@ -1094,36 +1144,32 @@ fn parse_bracket_function_body(rest: &str, option: bool) -> Option<FunctionKeyPa
     }
 
     if final_ch.is_ascii_alphabetic() {
-        let mut modifier = 1u16;
-        if !params.is_empty() {
-            let nums = parse_semicolon_u16(params)?;
-            modifier = *nums.last().unwrap_or(&1);
+        let mut parameters = params.rsplit(';');
+        let flags = parse_key_modifier(parameters.next().unwrap_or("1"))?;
+        for parameter in parameters {
+            parameter.parse::<u16>().ok()?;
         }
         return Some(FunctionKeyParse {
             code: format!("{prefix}{final_ch}"),
-            modifier,
+            flags,
             option,
         });
     }
 
-    let nums = parse_semicolon_u16(params)?;
-    let first = nums.first().copied().unwrap_or(1);
-    let modifier = nums.get(1).copied().unwrap_or(1);
+    let mut parameters = params.split(';');
+    let first = match parameters.next()? {
+        "" => 1,
+        parameter => parameter.parse::<u16>().ok()?,
+    };
+    let flags = parse_key_modifier(parameters.next().unwrap_or("1"))?;
+    if parameters.next().is_some() {
+        return None;
+    }
     Some(FunctionKeyParse {
         code: format!("{prefix}{first}{final_ch}"),
-        modifier,
+        flags,
         option,
     })
-}
-
-fn parse_semicolon_u16(params: &str) -> Option<Vec<u16>> {
-    if params.is_empty() {
-        return Some(Vec::new());
-    }
-    params
-        .split(';')
-        .map(|part| part.parse::<u16>().ok())
-        .collect()
 }
 
 fn key_name_for_code(code: &str) -> Option<&'static str> {
