@@ -47,6 +47,17 @@ pub fn linebreaks(s: &str) -> impl Iterator<Item = (usize, BreakOpportunity)> + 
     linebreaks_iter(s.char_indices(), s.len())
 }
 
+/// Whether this character forces a line boundary; CRLF forms one boundary.
+pub(crate) fn is_hard_line_break(character: char) -> bool {
+    matches!(
+        break_property(character as u32),
+        BreakClass::Mandatory
+            | BreakClass::CarriageReturn
+            | BreakClass::LineFeed
+            | BreakClass::NextLine
+    )
+}
+
 /// Returns an iterator over line breaks opportunities in the specified input iterator
 ///
 /// This is identical to `linebreaks()` but provides the ability to find line breaks

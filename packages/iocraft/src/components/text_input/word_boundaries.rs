@@ -21,7 +21,7 @@ impl WordClass {
     }
 }
 
-pub(super) fn ranges(text: &str) -> impl DoubleEndedIterator<Item = Range<usize>> {
+pub(super) fn ranges(text: &str) -> Vec<Range<usize>> {
     let mut boundaries = text.split_word_bound_indices().peekable();
     let mut ranges: Vec<Range<usize>> = Vec::new();
     let mut previous_class = None;
@@ -43,5 +43,5 @@ pub(super) fn ranges(text: &str) -> impl DoubleEndedIterator<Item = Range<usize>
         }
         previous_class = Some(class);
     }
-    ranges.into_iter()
+    ranges
 }

@@ -282,32 +282,34 @@ impl CanvasSubviewMut<'_> {
         self.canvas.set_overlay(x, y, overlay);
     }
 
-    pub(crate) fn overlay_text(
+    pub(crate) fn row_is_visible(&self, y: isize) -> bool {
+        let clip = self.clip_bounds();
+        let row = self.y as i128 + y as i128;
+        clip.left < clip.right && row >= clip.top && row < clip.bottom
+    }
+
+    pub(crate) fn set_text_row_with_styles(
         &mut self,
         y: isize,
         text: &str,
-        mut style_at: impl FnMut(usize) -> Option<StyleOverlay>,
+        style: CanvasTextStyle,
+        style_at: impl FnMut(usize) -> Option<StyleOverlay>,
     ) {
-        let clip = self.clip_bounds();
-        let row = self.y as i128 + y as i128;
-        if row < clip.top || row >= clip.bottom {
+        if !self.row_is_visible(y) {
             return;
         }
-        for (offset, grapheme, columns) in measure_text::positioned_graphemes(text, self.x) {
-            if grapheme != "\t"
-                && ((columns.start as i128) < clip.left || (columns.end as i128) > clip.right)
-            {
-                continue;
-            }
-            if let Some(style) = style_at(offset) {
-                let start = (columns.start as i128).clamp(clip.left, clip.right);
-                let end = (columns.end as i128).clamp(start, clip.right);
-                for column in start..end {
-                    self.canvas
-                        .set_overlay(column as usize, row as usize, style);
-                }
-            }
-        }
+        let clip = self.clip_bounds();
+        let row = (self.y as i128 + y as i128) as usize;
+        self.canvas.set_text_row_str_clipped(
+            self.x,
+            row,
+            clip.left as isize,
+            (clip.right - 1) as isize,
+            text,
+            style,
+            None,
+            style_at,
+        );
     }
 
     /// Writes text to the region.
@@ -341,8 +343,16 @@ impl CanvasSubviewMut<'_> {
                 break;
             }
             if y >= clip.top {
-                self.canvas
-                    .set_text_row_str_clipped(x, y as usize, min_x, max_x, line, style, hyperlink);
+                self.canvas.set_text_row_str_clipped(
+                    x,
+                    y as usize,
+                    min_x,
+                    max_x,
+                    line,
+                    style,
+                    hyperlink,
+                    |_| None,
+                );
             }
         }
     }

@@ -1778,6 +1778,7 @@ impl Canvas {
         text: &str,
         style: CanvasTextStyle,
         hyperlink: Option<&str>,
+        mut style_at: impl FnMut(usize) -> Option<StyleOverlay>,
     ) {
         self.mark_rows_written(y, y.saturating_add(1));
         let row = std::sync::Arc::make_mut(&mut self.cells[y]);
@@ -1790,11 +1791,12 @@ impl Canvas {
             return;
         }
 
-        for (_, grapheme, columns) in measure_text::positioned_graphemes(text, x) {
+        for (offset, grapheme, columns) in measure_text::positioned_graphemes(text, x) {
             let x = columns.start;
             let end_x = columns.end;
             let width = (end_x - x) as usize;
             if grapheme == "\t" {
+                let range_style = style_at(offset).unwrap_or_default();
                 for column in columns {
                     if column >= min_x && column <= max_x {
                         Self::write_grapheme_to_row(
@@ -1802,9 +1804,12 @@ impl Canvas {
                             column as usize,
                             " ",
                             1,
-                            CanvasTextStyle::default(),
+                            CanvasTextStyle::default().with_overlay(&range_style),
                             None,
                         );
+                        if let Some(background) = range_style.background_color {
+                            row[column as usize].background_color = background;
+                        }
                     }
                 }
                 continue;
@@ -1838,7 +1843,20 @@ impl Canvas {
                 break;
             }
 
-            Self::write_grapheme_to_row(row, x as usize, grapheme, width, style, hyperlink);
+            let range_style = style_at(offset).unwrap_or_default();
+            Self::write_grapheme_to_row(
+                row,
+                x as usize,
+                grapheme,
+                width,
+                style.with_overlay(&range_style),
+                hyperlink,
+            );
+            if let Some(background) = range_style.background_color {
+                for cell in &mut row[x as usize..end_x as usize] {
+                    cell.background_color = background;
+                }
+            }
         }
     }
 

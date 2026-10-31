@@ -88,26 +88,61 @@ pub(crate) fn reorder_bidi_text_for_terminal(text: &str) -> Cow<'_, str> {
 }
 
 pub(crate) fn reorder_bidi_text(text: &str, enabled: bool) -> Cow<'_, str> {
+    let reordered = reorder_bidi_text_with_offsets(text, enabled);
+    if reordered.text == text {
+        Cow::Borrowed(text)
+    } else {
+        reordered.text
+    }
+}
+
+pub(crate) struct ReorderedText<'a> {
+    pub(crate) text: Cow<'a, str>,
+    source_offsets: Vec<(usize, usize)>,
+}
+
+impl ReorderedText<'_> {
+    pub(crate) fn source_offset(&self, visual_offset: usize) -> usize {
+        if self.source_offsets.is_empty() {
+            return visual_offset;
+        }
+        // Reordering can regroup adjacent graphemes. Source byte intervals remain
+        // valid even when a painted grapheme starts inside an original grapheme.
+        let index = self
+            .source_offsets
+            .partition_point(|&(visual_start, _)| visual_start <= visual_offset)
+            .checked_sub(1)
+            .expect("every visual byte belongs to a source grapheme");
+        let (visual_start, source_start) = self.source_offsets[index];
+        source_start + visual_offset - visual_start
+    }
+}
+
+pub(crate) fn reorder_bidi_text_with_offsets(text: &str, enabled: bool) -> ReorderedText<'_> {
     if !enabled || text.is_empty() || !has_rtl_characters(text) {
-        return Cow::Borrowed(text);
+        return ReorderedText {
+            text: Cow::Borrowed(text),
+            source_offsets: Vec::new(),
+        };
     }
 
     let graphemes = text
-        .graphemes(true)
-        .map(|text| BidiGrapheme {
+        .grapheme_indices(true)
+        .map(|(offset, text)| BidiGrapheme {
             text: text.to_string(),
-            metadata: (),
+            metadata: offset,
         })
         .collect::<Vec<_>>();
     let reordered = reorder_bidi_graphemes(graphemes, true);
-    let rendered = reordered
-        .into_iter()
-        .map(|item| item.text)
-        .collect::<String>();
-    if rendered == text {
-        Cow::Borrowed(text)
-    } else {
-        Cow::Owned(rendered)
+    let mut rendered = String::with_capacity(text.len());
+    let mut source_offsets = Vec::with_capacity(reordered.len());
+    for grapheme in reordered {
+        source_offsets.push((rendered.len(), grapheme.metadata));
+        rendered.push_str(&grapheme.text);
+    }
+    ReorderedText {
+        text: Cow::Owned(rendered),
+        source_offsets,
     }
 }
 

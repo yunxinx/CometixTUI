@@ -7,6 +7,64 @@ const CONTROL: KeyModifiers = KeyModifiers::CONTROL;
 const NONE: KeyModifiers = KeyModifiers::NONE;
 const ALT: KeyModifiers = KeyModifiers::ALT;
 
+#[apply(test!)]
+async fn word_edits_keep_context_on_both_sides_of_the_cursor() {
+    for (cursor, event, expected) in [
+        (6, key(KeyCode::Left, CONTROL), ("can’t", 0)),
+        (3, key(KeyCode::Right, CONTROL), ("can’t", 7)),
+        (6, key(KeyCode::Char('w'), CONTROL), ("t", 0)),
+        (3, key(KeyCode::Delete, CONTROL), ("can", 3)),
+    ] {
+        assert_edits("can’t", cursor, [event], &[("can’t", cursor), expected]).await;
+    }
+}
+
+#[apply(test!)]
+async fn hard_line_edits_follow_displayed_line_boundaries() {
+    for separator in [
+        "\r", "\n", "\r\n", "\u{000b}", "\u{000c}", "\u{0085}", "\u{2028}", "\u{2029}",
+    ] {
+        let value = format!("ab{separator}cd");
+        let start = 2 + separator.len();
+        let prefix = format!("ab{separator}d");
+        assert_edits(
+            &value,
+            start + 1,
+            [key(KeyCode::Home, NONE)],
+            &[(&value, start + 1), (&value, start)],
+        )
+        .await;
+        assert_edits(
+            &value,
+            start + 1,
+            [key(KeyCode::Char('u'), CONTROL)],
+            &[(&value, start + 1), (&prefix, start)],
+        )
+        .await;
+        assert_edits(
+            &value,
+            1,
+            [key(KeyCode::End, NONE)],
+            &[(&value, 1), (&value, 2)],
+        )
+        .await;
+        assert_edits(
+            &value,
+            2,
+            [key(KeyCode::Char('k'), CONTROL)],
+            &[(&value, 2), ("abcd", 2)],
+        )
+        .await;
+        assert_edits(
+            &value,
+            start,
+            [key(KeyCode::Char('u'), CONTROL)],
+            &[(&value, start), ("abcd", 2)],
+        )
+        .await;
+    }
+}
+
 #[derive(Default, Props)]
 struct EditingProbeProps {
     value: String,

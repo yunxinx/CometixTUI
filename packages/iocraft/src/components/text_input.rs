@@ -2,7 +2,7 @@ use crate::{
     AnyElement, CanvasTextStyle, Color, Component, ComponentDrawer, ComponentUpdater, HandlerMut,
     Hook, Hooks, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, LayoutStyle, Overflow, Position,
     Props, Size, StyleOverlay, TerminalEvent, Weight, component,
-    components::{TextDecoration, TextDrawer, TextWrap, View},
+    components::{TextDecoration, TextWrap, View},
     element,
     hooks::{Ref, State, UseMemo, UseRef, UseState, UseTerminalEvents},
     segmented_string::SegmentedString,
@@ -11,13 +11,18 @@ use core::{
     pin::Pin,
     task::{Poll, Waker},
 };
-use std::{ops::Range, sync::Arc};
+use std::{
+    ops::Range,
+    sync::{Arc, OnceLock},
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 mod word_boundaries;
 
 #[cfg(test)]
 mod keyboard_tests;
+#[cfg(test)]
+mod style_tests;
 
 trait UseCursorOverlay {
     fn use_cursor_overlay(&mut self) -> &mut CursorOverlayState;
@@ -144,6 +149,8 @@ impl TextInputHandle {
 /// Ranges must be nonempty, ordered, nonoverlapping, and bounded by extended grapheme
 /// clusters in the current value. Invalid ranges panic. Styles affect drawing only;
 /// wrapping, scrolling, editing, and cursor placement use the unchanged value.
+/// If bidi reordering combines source graphemes, the resulting grapheme uses the
+/// style of its first source character.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextInputStyleRange {
     /// The byte range to style, including any whitespace within it.
@@ -285,6 +292,7 @@ struct TextBufferRow {
 struct TextBuffer {
     text: String,
     rows: Vec<TextBufferRow>,
+    word_ranges: OnceLock<Vec<Range<usize>>>,
 }
 
 impl TextBuffer {
@@ -312,7 +320,11 @@ impl TextBuffer {
                 width: line.width,
             });
         }
-        Self { rows, text }
+        Self {
+            rows,
+            text,
+            word_ranges: OnceLock::new(),
+        }
     }
 
     fn row_column_for_offset(&self, offset: usize) -> (usize, usize) {
@@ -385,28 +397,37 @@ impl TextBuffer {
     }
 
     fn line_start_offset(&self, offset: usize) -> usize {
-        self.text[..offset].rfind('\n').map_or(0, |index| index + 1)
+        self.text[..offset]
+            .char_indices()
+            .rfind(|&(_, character)| crate::unicode_linebreak::is_hard_line_break(character))
+            .map_or(0, |(index, character)| index + character.len_utf8())
     }
 
     fn line_end_offset(&self, offset: usize) -> usize {
         let end = self.text[offset..]
-            .find('\n')
+            .find(crate::unicode_linebreak::is_hard_line_break)
             .map_or(self.text.len(), |index| offset + index);
         clamp_to_grapheme_boundary(&self.text, end)
     }
 
     fn previous_word_offset(&self, offset: usize) -> usize {
-        word_boundaries::ranges(&self.text[..offset])
-            .rev()
-            .find(|range| !self.text[range.clone()].starts_with(char::is_whitespace))
-            .map_or(0, |range| range.start)
+        let ranges = self.word_ranges();
+        let end = ranges.partition_point(|range| range.start < offset);
+        ranges[..end].last().map_or(0, |range| range.start)
     }
 
     fn next_word_offset(&self, offset: usize) -> usize {
-        let suffix = &self.text[offset..];
-        word_boundaries::ranges(suffix)
-            .find(|range| !suffix[range.clone()].starts_with(char::is_whitespace))
-            .map_or(self.text.len(), |range| offset + range.end)
+        let ranges = self.word_ranges();
+        let start = ranges.partition_point(|range| range.end <= offset);
+        ranges.get(start).map_or(self.text.len(), |range| range.end)
+    }
+
+    fn word_ranges(&self) -> &[Range<usize>] {
+        self.word_ranges.get_or_init(|| {
+            let mut ranges = word_boundaries::ranges(&self.text);
+            ranges.retain(|range| !self.text[range.clone()].starts_with(char::is_whitespace));
+            ranges
+        })
     }
 }
 
@@ -511,25 +532,20 @@ impl Component for TextBufferView {
         if drawer.zero_height_sibling_shares_y() {
             return;
         }
-        TextDrawer::new(drawer, 0, false).append_lines(
-            self.buffer
-                .rows
-                .iter()
-                .map(|row| &self.buffer.text[row.offset..row.offset + row.len]),
-            self.text_style,
-        );
+        let mut canvas = drawer.canvas();
         for (row_index, row) in self.buffer.rows.iter().enumerate() {
+            if !canvas.row_is_visible(row_index as isize) {
+                continue;
+            }
             let first = self
                 .style_ranges
                 .partition_point(|styled| styled.range.end <= row.offset);
             let ranges = &self.style_ranges[first..];
-            if ranges
-                .first()
-                .is_none_or(|styled| styled.range.start >= row.offset + row.len)
-            {
-                continue;
-            }
             let line = &self.buffer.text[row.offset..row.offset + row.len];
+            let visual = crate::bidi::reorder_bidi_text_with_offsets(
+                line,
+                crate::bidi::needs_software_bidi(),
+            );
             let style_at = |offset| {
                 let offset = row.offset + offset;
                 let index = ranges.partition_point(|styled| styled.range.end <= offset);
@@ -538,30 +554,12 @@ impl Component for TextBufferView {
                     .filter(|styled| styled.range.contains(&offset))
                     .map(|styled| styled.style)
             };
-            let mut canvas = drawer.canvas();
-            if crate::bidi::needs_software_bidi() {
-                let graphemes = line
-                    .grapheme_indices(true)
-                    .map(|(offset, text)| crate::bidi::BidiGrapheme {
-                        text: text.to_string(),
-                        metadata: offset,
-                    })
-                    .collect();
-                let mut visual = String::with_capacity(line.len());
-                let mut offsets = Vec::new();
-                for grapheme in crate::bidi::reorder_bidi_graphemes(graphemes, true) {
-                    offsets.push((visual.len(), grapheme.metadata));
-                    visual.push_str(&grapheme.text);
-                }
-                canvas.overlay_text(row_index as isize, &visual, |offset| {
-                    let index = offsets
-                        .binary_search_by_key(&offset, |&(visual, _)| visual)
-                        .expect("painted graphemes have source offsets");
-                    style_at(offsets[index].1)
-                });
-            } else {
-                canvas.overlay_text(row_index as isize, line, style_at);
-            }
+            canvas.set_text_row_with_styles(
+                row_index as isize,
+                &visual.text,
+                self.text_style,
+                |offset| style_at(visual.source_offset(offset)),
+            );
         }
     }
 }
@@ -1165,10 +1163,8 @@ mod tests {
                     .filter(|cell| cell.cell.text() == Some("א"))
             })
             .expect("styled cell changes");
-        assert_eq!(
-            styled_cell.overlay.expect("range overlay").background_color,
-            Some(None)
-        );
+        assert_eq!(styled_cell.cell.background_color, None);
+        assert_eq!(styled_cell.overlay, None);
     }
 
     #[test]
