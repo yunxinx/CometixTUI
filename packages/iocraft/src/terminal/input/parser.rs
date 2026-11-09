@@ -450,7 +450,7 @@ fn parsed_input_event_key_code(event: &TerminalParsedInputEvent) -> Option<KeyCo
     if key.end {
         return Some(KeyCode::End);
     }
-    if key.return_key || event.keypress.name.as_deref() == Some("enter") {
+    if key.return_key {
         return Some(KeyCode::Enter);
     }
     if key.escape {
@@ -471,6 +471,9 @@ fn parsed_input_event_key_code(event: &TerminalParsedInputEvent) -> Option<KeyCo
     }
     if event.keypress.name.as_deref() == Some("insert") {
         return Some(KeyCode::Insert);
+    }
+    if event.keypress.name.as_deref() == Some("begin") {
+        return Some(KeyCode::KeypadBegin);
     }
     if key.fn_key
         && let Some(number) = event
@@ -839,6 +842,7 @@ fn is_non_alphanumeric_key_name(name: &str) -> bool {
             | "insert"
             | "delete"
             | "clear"
+            | "begin"
             | "tab"
             | "return"
             | "escape"
@@ -866,11 +870,12 @@ fn parse_terminal_key_sequence_impl(sequence: &str) -> TerminalParsedKey {
         ..Default::default()
     };
 
-    if sequence == "\r" {
-        key.raw = None;
+    if sequence == "\r" || sequence == "\x1b\r" {
+        key.meta = sequence.starts_with('\x1b');
+        if !key.meta {
+            key.raw = None;
+        }
         key.name = Some("return".to_string());
-    } else if sequence == "\n" {
-        key.name = Some("enter".to_string());
     } else if sequence == "\t" {
         key.name = Some("tab".to_string());
     } else if sequence == "\x08"
@@ -1035,6 +1040,18 @@ fn keycode_to_name(codepoint: u32) -> Option<String> {
         57413 => "+",
         57414 => "return",
         57415 => "=",
+        57416 => ",",
+        57417 => "left",
+        57418 => "right",
+        57419 => "up",
+        57420 => "down",
+        57421 => "pageup",
+        57422 => "pagedown",
+        57423 => "home",
+        57424 => "end",
+        57425 => "insert",
+        57426 => "delete",
+        57427 => "begin",
         33..=126 => {
             return char::from_u32(codepoint).map(|ch| ch.to_ascii_lowercase().to_string());
         }
@@ -1195,10 +1212,10 @@ fn key_name_for_code(code: &str) -> Option<&'static str> {
         "On" => ".",
         "Oo" => "/",
         "OM" => "return",
-        "[11~" => "f1",
-        "[12~" => "f2",
+        "[11~" | "[P" => "f1",
+        "[12~" | "[Q" => "f2",
         "[13~" => "f3",
-        "[14~" => "f4",
+        "[14~" | "[S" => "f4",
         "[[A" => "f1",
         "[[B" => "f2",
         "[[C" => "f3",

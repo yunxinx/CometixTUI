@@ -357,8 +357,10 @@ fn restore_terminal_for_panic() {
     let _ = stdout.queue(event::DisableFocusChange);
     let _ = stdout.queue(event::DisableMouseCapture);
     if state.fullscreen_terminals > 0 {
+        super::keyboard::restore_keyboard_for_panic(&mut stdout, true);
         let _ = stdout.queue(terminal::LeaveAlternateScreen);
     }
+    super::keyboard::restore_keyboard_for_panic(&mut stdout, false);
     let _ = stdout.queue(cursor::Show);
     let _ = stdout.flush();
 }
@@ -427,9 +429,7 @@ pub(super) struct StdTerminal<'a> {
     pub(super) mouse_capture: bool,
     pub(super) dynamic_alternate_saved_main_screen: Option<SavedMainScreen>,
     pub(super) raw_mode_enabled: bool,
-    pub(super) supports_keyboard_enhancement: bool,
-    pub(super) enabled_keyboard_enhancement: bool,
-    pub(super) keyboard_enhancement_flags: event::KeyboardEnhancementFlags,
+    pub(super) keyboard: KeyboardModes,
     pub(super) prev_canvas_top_row: u16,
     pub(super) prev_canvas_height: u16,
     pub(super) prev_size_on_write: Option<(u16, u16)>,
@@ -556,16 +556,8 @@ impl TerminalImpl for StdTerminal<'_> {
         &mut self,
         flags: event::KeyboardEnhancementFlags,
     ) -> io::Result<()> {
-        if self.keyboard_enhancement_flags != flags {
-            self.keyboard_enhancement_flags = flags;
-            if self.enabled_keyboard_enhancement {
-                // Swap the active flags in place.
-                self.dest.execute(event::PopKeyboardEnhancementFlags)?;
-                self.dest
-                    .execute(event::PushKeyboardEnhancementFlags(flags))?;
-            }
-        }
-        Ok(())
+        self.keyboard
+            .set_flags(flags, &mut self.dest, self.fullscreen)
     }
 
     #[cfg(unix)]
@@ -584,45 +576,7 @@ impl TerminalImpl for StdTerminal<'_> {
     }
 
     fn reinitialize_after_resume(&mut self) -> io::Result<()> {
-        // The shell restored cooked mode while we were stopped, but our bookkeeping
-        // still says raw mode is on. Re-apply every terminal mode unconditionally,
-        // bypassing apply_raw_mode_enabled's change detection.
-        if self.raw_mode_enabled {
-            terminal::enable_raw_mode()?;
-            self.reassert_keyboard_enhancement()?;
-            if self.mouse_capture && !self.fullscreen {
-                self.dest.execute(event::EnableMouseCapture)?;
-            }
-            self.dest.execute(event::EnableFocusChange)?;
-            self.dest.execute(event::EnableBracketedPaste)?;
-        }
-        self.dest.queue(cursor::Hide)?;
-        self.cursor_visible = false;
-        self.cursor_displacement_rows = 0;
-        if self.fullscreen {
-            // Re-entering the alternate screen after SIGCONT/shell handoff must
-            // be destructive, matching CC Ink's reenterAltScreen(): the terminal
-            // may have dropped mode 1049 or preserved stale alt-buffer cells.
-            // Enter alt-screen, erase it, and home the cursor so the next full
-            // write starts from a known blank anchor.
-            self.dest
-                .queue(terminal::EnterAlternateScreen)?
-                .queue(terminal::Clear(terminal::ClearType::All))?
-                .queue(cursor::MoveTo(0, 0))?;
-            if self.mouse_capture {
-                self.dest.execute(event::EnableMouseCapture)?;
-            }
-        }
-        // Anything we previously drew can no longer be trusted: in inline mode the
-        // shell printed over our output; in fullscreen mode we just re-entered the
-        // alternate screen, which starts blank. Treat the next write as a first
-        // write so the canvas is fully re-rendered rather than row-diffed.
-        self.prev_canvas_height = 0;
-        self.prev_canvas_top_row = 0;
-        self.prev_size_on_write = None;
-        self.inline_pending_wrap = false;
-        self.inline_force_full_rewrite_next_diff = false;
-        Ok(())
+        self.reinitialize_after_resume_with(terminal::enable_raw_mode)
     }
 
     fn suspend(&mut self) -> io::Result<()> {
@@ -647,26 +601,7 @@ impl TerminalImpl for StdTerminal<'_> {
     }
 
     fn release_terminal_modes(&mut self) -> io::Result<()> {
-        if !self.input_is_terminal {
-            return Ok(());
-        }
-
-        // Keep bookkeeping intact while physically restoring cooked mode; the
-        // matching reacquire call reasserts exactly the modes that were active.
-        self.restore_cursor_baseline()?;
-        if self.raw_mode_enabled {
-            terminal::disable_raw_mode()?;
-            self.dest.execute(event::DisableBracketedPaste)?;
-            self.dest.execute(event::DisableFocusChange)?;
-            if self.mouse_capture {
-                self.dest.execute(event::DisableMouseCapture)?;
-            }
-            if self.enabled_keyboard_enhancement {
-                self.dest.execute(event::PopKeyboardEnhancementFlags)?;
-            }
-        }
-        self.dest.queue(cursor::Show)?;
-        self.dest.flush()
+        self.release_terminal_modes_with(terminal::disable_raw_mode)
     }
 
     fn is_raw_mode_supported(&self) -> bool {
@@ -731,6 +666,7 @@ impl TerminalImpl for StdTerminal<'_> {
                     inline_bottom_gap: self.inline_bottom_gap,
                     inline_force_full_rewrite_next_diff: self.inline_force_full_rewrite_next_diff,
                 });
+                self.keyboard.disable(&mut self.dest)?;
                 // Cleanup owns the alternate screen before an enter command can be partially written.
                 self.fullscreen = true;
                 register_fullscreen_mode_for_panic_restore();
@@ -738,6 +674,9 @@ impl TerminalImpl for StdTerminal<'_> {
                     .queue(terminal::EnterAlternateScreen)?
                     .queue(terminal::Clear(terminal::ClearType::All))?
                     .queue(cursor::MoveTo(0, 0))?;
+                if self.raw_mode_enabled {
+                    self.keyboard.enable(&mut self.dest, true)?;
+                }
                 self.set_mouse_capture(mouse_tracking)?;
                 self.reset_retained_output_state();
                 self.dest.flush()?;
@@ -747,10 +686,14 @@ impl TerminalImpl for StdTerminal<'_> {
                 self.restore_cursor_baseline()?;
                 let saved = self.dynamic_alternate_saved_main_screen;
                 self.set_mouse_capture(saved.is_some_and(|saved| saved.mouse_capture))?;
+                self.keyboard.disable(&mut self.dest)?;
                 self.dest.queue(terminal::LeaveAlternateScreen)?;
                 self.fullscreen = false;
                 self.dynamic_alternate_saved_main_screen = None;
                 unregister_fullscreen_mode_for_panic_restore();
+                if self.raw_mode_enabled {
+                    self.keyboard.enable(&mut self.dest, false)?;
+                }
                 self.reset_retained_output_state();
                 if let Some(saved) = saved {
                     self.prev_canvas_height = saved.prev_canvas_height;
@@ -1254,6 +1197,90 @@ impl TerminalImpl for StdTerminal<'_> {
 }
 
 impl<'a> StdTerminal<'a> {
+    pub(super) fn reinitialize_after_resume_with(
+        &mut self,
+        enable_os_raw_mode: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        // The shell restored cooked mode while we were stopped, but our bookkeeping
+        // still says raw mode is on. Re-apply every terminal mode unconditionally,
+        // bypassing apply_raw_mode_enabled's change detection.
+        if self.raw_mode_enabled {
+            enable_os_raw_mode()?;
+            if !self.fullscreen {
+                self.reassert_keyboard_enhancement()?;
+            }
+            if self.mouse_capture && !self.fullscreen {
+                self.dest.execute(event::EnableMouseCapture)?;
+            }
+            self.dest.execute(event::EnableFocusChange)?;
+            self.dest.execute(event::EnableBracketedPaste)?;
+        }
+        self.dest.queue(cursor::Hide)?;
+        self.cursor_visible = false;
+        self.cursor_displacement_rows = 0;
+        if self.fullscreen {
+            // Re-entering the alternate screen after SIGCONT/shell handoff must
+            // be destructive, matching CC Ink's reenterAltScreen(): the terminal
+            // may have dropped mode 1049 or preserved stale alt-buffer cells.
+            // Enter alt-screen, erase it, and home the cursor so the next full
+            // write starts from a known blank anchor.
+            self.dest
+                .queue(terminal::EnterAlternateScreen)?
+                .queue(terminal::Clear(terminal::ClearType::All))?
+                .queue(cursor::MoveTo(0, 0))?;
+            if self.raw_mode_enabled {
+                self.reassert_keyboard_enhancement()?;
+            }
+            if self.mouse_capture {
+                self.dest.execute(event::EnableMouseCapture)?;
+            }
+        }
+        // Anything we previously drew can no longer be trusted: in inline mode the
+        // shell printed over our output; in fullscreen mode we just re-entered the
+        // alternate screen, which starts blank. Treat the next write as a first
+        // write so the canvas is fully re-rendered rather than row-diffed.
+        self.prev_canvas_height = 0;
+        self.prev_canvas_top_row = 0;
+        self.prev_size_on_write = None;
+        self.inline_pending_wrap = false;
+        self.inline_force_full_rewrite_next_diff = false;
+        Ok(())
+    }
+
+    pub(super) fn release_terminal_modes_with(
+        &mut self,
+        disable_os_raw_mode: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        if !self.input_is_terminal {
+            return Ok(());
+        }
+
+        // Keep bookkeeping intact while physically restoring cooked mode; the
+        // matching reacquire call reasserts exactly the modes that were active.
+        self.restore_cursor_baseline()?;
+        let mut result = if self.raw_mode_enabled {
+            self.release_input_modes_with(disable_os_raw_mode)
+        } else {
+            Ok(())
+        };
+        result = result.and(self.dest.queue(cursor::Show).map(|_| ()));
+        result.and(self.dest.flush())
+    }
+
+    fn release_input_modes_with(
+        &mut self,
+        disable_os_raw_mode: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        // Attempt every restore even if an earlier step failed, returning the first error.
+        let mut result = disable_os_raw_mode();
+        result = result.and(self.dest.execute(event::DisableBracketedPaste).map(|_| ()));
+        result = result.and(self.dest.execute(event::DisableFocusChange).map(|_| ()));
+        if self.mouse_capture {
+            result = result.and(self.dest.execute(event::DisableMouseCapture).map(|_| ()));
+        }
+        result.and(self.keyboard.disable(&mut self.dest))
+    }
+
     pub(super) fn new(
         dest: Box<dyn Write + Send + 'a>,
         alt: Box<dyn Write + Send + 'a>,
@@ -1266,7 +1293,6 @@ impl<'a> StdTerminal<'a> {
         // don't answer queries while a synchronized update is open — probing lazily
         // from within a render would stall until the query times out.
         let supports_keyboard_enhancement = input_is_terminal
-            && supports_extended_keys()
             && keyboard_support
                 .unwrap_or_else(|| terminal::supports_keyboard_enhancement().unwrap_or(false));
         let mut term = Self {
@@ -1277,9 +1303,7 @@ impl<'a> StdTerminal<'a> {
             mouse_capture,
             dynamic_alternate_saved_main_screen: None,
             raw_mode_enabled: false,
-            supports_keyboard_enhancement,
-            enabled_keyboard_enhancement: false,
-            keyboard_enhancement_flags: event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+            keyboard: KeyboardModes::new(supports_keyboard_enhancement, KeyboardPolicy::detect()),
             prev_canvas_top_row: 0,
             prev_canvas_height: 0,
             size: None,
@@ -1748,18 +1772,7 @@ impl<'a> StdTerminal<'a> {
     }
 
     pub(super) fn reassert_keyboard_enhancement(&mut self) -> io::Result<()> {
-        if self.enabled_keyboard_enhancement {
-            // Match CC Ink's pop-before-push reassertion model for Kitty: if the
-            // terminal preserved the stack, pop the old entry before pushing the
-            // requested flags to avoid accumulating depth on every SIGCONT /
-            // sleep-wake recovery. If the terminal reset the stack,
-            // pop-on-empty is a no-op and the push restores depth 1.
-            self.dest.execute(event::PopKeyboardEnhancementFlags)?;
-            self.dest.execute(event::PushKeyboardEnhancementFlags(
-                self.keyboard_enhancement_flags,
-            ))?;
-        }
-        Ok(())
+        self.keyboard.reassert(&mut self.dest, self.fullscreen)
     }
 
     fn apply_raw_mode_enabled(&mut self, raw_mode_enabled: bool) -> io::Result<()> {
@@ -1787,13 +1800,7 @@ impl<'a> StdTerminal<'a> {
             // From here on, even a partial initialization owns cleanup.
             self.raw_mode_enabled = true;
             let result = (|| {
-                if self.supports_keyboard_enhancement {
-                    // A command can reach the terminal before its write/flush reports failure.
-                    self.enabled_keyboard_enhancement = true;
-                    self.dest.execute(event::PushKeyboardEnhancementFlags(
-                        self.keyboard_enhancement_flags,
-                    ))?;
-                }
+                self.keyboard.enable(&mut self.dest, self.fullscreen)?;
                 if self.mouse_capture {
                     self.dest.execute(event::EnableMouseCapture)?;
                 }
@@ -1812,23 +1819,7 @@ impl<'a> StdTerminal<'a> {
             }
             result
         } else {
-            // Attempt every restore even if an earlier step failed, returning the first error.
-            let mut result = set_os_raw_mode(false);
-            result = result.and(self.dest.execute(event::DisableBracketedPaste).map(|_| ()));
-            result = result.and(self.dest.execute(event::DisableFocusChange).map(|_| ()));
-            if self.mouse_capture {
-                result = result.and(self.dest.execute(event::DisableMouseCapture).map(|_| ()));
-            }
-            if self.enabled_keyboard_enhancement {
-                let pop = self
-                    .dest
-                    .execute(event::PopKeyboardEnhancementFlags)
-                    .map(|_| ());
-                if pop.is_ok() {
-                    self.enabled_keyboard_enhancement = false;
-                }
-                result = result.and(pop);
-            }
+            let result = self.release_input_modes_with(|| set_os_raw_mode(false));
             if result.is_ok() {
                 self.raw_mode_enabled = false;
             }

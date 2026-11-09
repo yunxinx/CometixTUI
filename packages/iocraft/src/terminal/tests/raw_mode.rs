@@ -4,7 +4,7 @@ use super::*;
 fn os_raw_mode_failure_leaves_input_modes_untouched() {
     let output = TestWriter::default();
     let mut terminal = new_inline_term(output.clone(), 0);
-    terminal.supports_keyboard_enhancement = true;
+    terminal.keyboard.supported = true;
     terminal.mouse_capture = true;
 
     let error = terminal
@@ -17,7 +17,7 @@ fn os_raw_mode_failure_leaves_input_modes_untouched() {
     assert_eq!(error.to_string(), "OS raw mode unavailable");
     assert!(output.buf.lock().unwrap().is_empty());
     assert!(!terminal.raw_mode_enabled);
-    assert!(!terminal.enabled_keyboard_enhancement);
+    assert!(!terminal.keyboard.is_active());
 }
 
 struct ModeWriter {
@@ -48,7 +48,7 @@ fn terminal_with_mode_failure(output: TestWriter, fail_flush_at: usize) -> StdTe
         fail_flush_at,
         flushes: 0,
     }));
-    terminal.supports_keyboard_enhancement = true;
+    terminal.keyboard.supported = true;
     terminal.mouse_capture = true;
     terminal
 }
@@ -79,7 +79,7 @@ fn input_mode_output_failures_roll_back_os_and_terminal_modes() {
         assert_eq!(error.to_string(), "mode output failed");
         assert_eq!(os_modes, [true, false]);
         assert!(!terminal.raw_mode_enabled);
-        assert!(!terminal.enabled_keyboard_enhancement);
+        assert!(!terminal.keyboard.is_active());
         let bytes = output.buf.lock().unwrap().clone();
         assert_input_modes_restored(&String::from_utf8(bytes).unwrap());
     }
@@ -117,7 +117,7 @@ fn input_mode_rollback_continues_after_os_cleanup_failure_and_can_retry() {
         })
         .unwrap();
     assert!(!terminal.raw_mode_enabled);
-    assert!(!terminal.enabled_keyboard_enhancement);
+    assert!(!terminal.keyboard.is_active());
     let bytes = output.buf.lock().unwrap().clone();
     assert_eq!(
         String::from_utf8(bytes)

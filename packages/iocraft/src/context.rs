@@ -130,6 +130,9 @@ impl SystemContext {
     /// distinguish key combinations that are conflated in the legacy protocol (such as
     /// `Ctrl+I` vs `Tab`, or `Esc` vs escape sequences). The flags are applied after
     /// the current render pass; terminals without kitty protocol support ignore them.
+    /// Event-type reports are omitted for Ghostty/iTerm2 shortcut compatibility and
+    /// for tmux unless its `extended-keys-format` is confirmed to be `csi-u`.
+    /// Caller-owned input parsers must support every requested report format.
     pub fn set_keyboard_enhancement_flags(&mut self, flags: crate::KeyboardEnhancementFlags) {
         self.keyboard_enhancement_flags = Some(flags);
     }

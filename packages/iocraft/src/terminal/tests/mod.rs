@@ -1033,9 +1033,10 @@ fn new_fullscreen_term(
         mouse_capture: false,
         dynamic_alternate_saved_main_screen: None,
         raw_mode_enabled: false,
-        supports_keyboard_enhancement: false,
-        enabled_keyboard_enhancement: false,
-        keyboard_enhancement_flags: event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+        keyboard: KeyboardModes::new(
+            false,
+            KeyboardPolicy::from_environment(|_| None, None, None),
+        ),
         prev_canvas_top_row,
         prev_canvas_height,
         size: None,
@@ -1068,9 +1069,10 @@ fn new_inline_term_with_size(
         mouse_capture: false,
         dynamic_alternate_saved_main_screen: None,
         raw_mode_enabled: false,
-        supports_keyboard_enhancement: false,
-        enabled_keyboard_enhancement: false,
-        keyboard_enhancement_flags: event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+        keyboard: KeyboardModes::new(
+            false,
+            KeyboardPolicy::from_environment(|_| None, None, None),
+        ),
         prev_canvas_top_row: 0,
         prev_canvas_height,
         size: Some(term_size),
@@ -2724,6 +2726,7 @@ fn test_terminal_query_starts_event_stream_without_input_subscriber() {
 }
 
 mod fullscreen;
+mod keyboard_modes;
 mod log_update;
 
 /// Changing keyboard enhancement flags while enhancement is active must swap the
@@ -2737,11 +2740,15 @@ fn test_set_keyboard_enhancement_flags() {
     let flags = event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         | event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
     term.set_keyboard_enhancement_flags(flags).unwrap();
-    assert_eq!(term.keyboard_enhancement_flags, flags);
+    assert_eq!(term.keyboard.flags, flags);
     assert!(buf.lock().unwrap().is_empty(), "no output while inactive");
 
     // Active: swapping flags emits pop + push.
-    term.enabled_keyboard_enhancement = true;
+    term.keyboard.supported = true;
+    term.keyboard
+        .enable(&mut term.dest, term.fullscreen)
+        .unwrap();
+    buf.lock().unwrap().clear();
     let new_flags = event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
     term.set_keyboard_enhancement_flags(new_flags).unwrap();
     let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
@@ -2764,8 +2771,12 @@ fn test_set_keyboard_enhancement_flags() {
 fn test_keyboard_enhancement_reassertion_pops_before_push() {
     let (dest, buf) = new_test_writer();
     let mut term = new_inline_term(dest, 0);
-    term.enabled_keyboard_enhancement = true;
-    term.keyboard_enhancement_flags = event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
+    term.keyboard.supported = true;
+    term.keyboard
+        .enable(&mut term.dest, term.fullscreen)
+        .unwrap();
+    buf.lock().unwrap().clear();
+    term.keyboard.flags = event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
 
     term.reassert_keyboard_enhancement().unwrap();
 
@@ -2787,7 +2798,11 @@ fn test_stdin_resume_reasserts_keyboard_and_mouse_without_focus_clear() {
     let (dest, buf) = new_test_writer();
     let mut term = new_fullscreen_term(dest, 0, 0);
     term.raw_mode_enabled = true;
-    term.enabled_keyboard_enhancement = true;
+    term.keyboard.supported = true;
+    term.keyboard
+        .enable(&mut term.dest, term.fullscreen)
+        .unwrap();
+    buf.lock().unwrap().clear();
     term.mouse_capture = true;
 
     term.reassert_after_stdin_resume().unwrap();
