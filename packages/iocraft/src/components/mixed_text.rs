@@ -221,14 +221,15 @@ impl MixedText {
             return false;
         };
         if first_segment.offset > 0 {
-            return !contents[first_segment.index].text[..first_segment.offset].ends_with('\n');
+            return !contents[first_segment.index].text[..first_segment.offset]
+                .ends_with(crate::unicode_linebreak::is_hard_line_break);
         }
         for index in (0..first_segment.index).rev() {
             let text = &contents[index].text;
             if text.is_empty() {
                 continue;
             }
-            return !text.ends_with('\n');
+            return !text.ends_with(crate::unicode_linebreak::is_hard_line_break);
         }
         false
     }
@@ -262,7 +263,7 @@ impl MixedText {
 
     fn trim_start_segments(segments: &mut Vec<RenderedMixedTextSegment>) {
         while let Some(first) = segments.first_mut() {
-            let trimmed = first.text.trim_start();
+            let trimmed = crate::segmented_string::trim_start_whitespace(&first.text);
             if trimmed.is_empty() {
                 segments.remove(0);
             } else {
@@ -500,19 +501,16 @@ impl Component for MixedText {
             .map(|line| Self::line_is_soft_continuation(&self.contents, line))
             .collect::<Vec<_>>();
         let source_line_count = lines.len();
+        let mut grapheme_buffer = String::new();
         let mut rendered_lines = lines
             .into_iter()
             .enumerate()
             .map(|(index, line)| {
                 let original_width = line.width;
-                let mut segments = line
-                    .segments
-                    .into_iter()
-                    .map(|segment| RenderedMixedTextSegment {
-                        text: segment.text.to_string(),
-                        index: segment.index,
-                    })
-                    .collect::<Vec<_>>();
+                let mut segments = Vec::new();
+                line.for_each_grapheme_span(&mut grapheme_buffer, |text, index| {
+                    Self::push_rendered_segment(&mut segments, index, text);
+                });
 
                 match self.wrap {
                     TextWrap::Wrap => Self::trim_end_segments(&mut segments),
@@ -592,6 +590,77 @@ mod tests {
     use super::*;
     use crate::prelude::*;
     use futures::StreamExt;
+
+    #[test]
+    fn test_mixed_text_preserves_split_graphemes_and_styles() {
+        for wrap in [TextWrap::Wrap, TextWrap::NoWrap] {
+            for (align, x, expected) in [
+                (TextAlign::Left, 0, "👩‍💻b\n"),
+                (TextAlign::Center, 1, " 👩‍💻b\n"),
+                (TextAlign::Right, 2, "  👩‍💻b\n"),
+            ] {
+                let canvas = element! {
+                    View(width: 5, flex_direction: FlexDirection::Column) {
+                        MixedText(wrap, align, contents: vec![
+                            MixedTextContent::new("👩").color(Color::Red)
+                                .background_color(Color::Yellow).href("https://example.com/emoji"),
+                            MixedTextContent::new("\u{200d}💻b").color(Color::Blue)
+                                .background_color(Color::Green).href("https://example.com/letter"),
+                        ])
+                    }
+                }
+                .render(None);
+                assert_eq!(canvas.to_string(), expected, "{wrap:?} {align:?}");
+                for (column, text, color, background, href) in [
+                    (
+                        x,
+                        "👩‍💻",
+                        Color::Red,
+                        Color::Yellow,
+                        "https://example.com/emoji",
+                    ),
+                    (
+                        x + 2,
+                        "b",
+                        Color::Blue,
+                        Color::Green,
+                        "https://example.com/letter",
+                    ),
+                ] {
+                    let cell = canvas.cell(column, 0).unwrap();
+                    assert_eq!(cell.text(), Some(text));
+                    assert_eq!(cell.text_style().unwrap().color, Some(color));
+                    assert_eq!(cell.background_color, Some(background));
+                    assert_eq!(cell.hyperlink(), Some(href));
+                }
+            }
+        }
+        for align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
+            let mixed = element! {
+                View(width: 1) {
+                    MixedText(align, contents: vec![
+                        MixedTextContent::new("a ").color(Color::Red),
+                        MixedTextContent::new("\u{301}b").color(Color::Blue),
+                    ])
+                }
+            }
+            .render(None);
+            assert_eq!(mixed.to_string(), "a\n \u{301}\nb\n", "{align:?}");
+            assert_eq!(
+                mixed.cell(0, 1).unwrap().text_style().unwrap().color,
+                Some(Color::Red)
+            );
+            assert_eq!(
+                mixed.cell(0, 2).unwrap().text_style().unwrap().color,
+                Some(Color::Blue)
+            );
+            let text = element! {
+                View(width: 1) { Text(align, content: "a \u{301}b") }
+            }
+            .render(None);
+            assert_eq!(text.to_string(), "a\n \u{301}\nb\n", "{align:?}");
+        }
+    }
 
     #[test]
     fn test_mixed_text() {

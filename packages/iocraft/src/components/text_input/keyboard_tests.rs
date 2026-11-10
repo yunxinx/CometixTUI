@@ -8,6 +8,31 @@ const NONE: KeyModifiers = KeyModifiers::NONE;
 const ALT: KeyModifiers = KeyModifiers::ALT;
 
 #[apply(test!)]
+async fn test_text_input_keeps_cursor_after_inserted_or_forward_merged_grapheme() {
+    for event in [
+        key(KeyCode::Char('\u{200d}'), NONE),
+        TerminalEvent::Paste("\u{200d}".to_string()),
+    ] {
+        assert_edits(
+            "👩👩z",
+            4,
+            [event, key(KeyCode::Char('!'), NONE)],
+            &[("👩👩z", 4), ("👩‍👩z", 11), ("👩‍👩!z", 12)],
+        )
+        .await;
+    }
+    for event in [key(KeyCode::Delete, NONE), key(KeyCode::Char('d'), CONTROL)] {
+        assert_edits(
+            "a\n\u{301}",
+            1,
+            [event, key(KeyCode::Char('!'), NONE)],
+            &[("a\n\u{301}", 1), ("a\u{301}", 3), ("a\u{301}!", 4)],
+        )
+        .await;
+    }
+}
+
+#[apply(test!)]
 async fn word_edits_keep_context_on_both_sides_of_the_cursor() {
     for (cursor, event, expected) in [
         (6, key(KeyCode::Left, CONTROL), ("can’t", 0)),

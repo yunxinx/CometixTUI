@@ -13,7 +13,7 @@ pub(crate) fn string_display_width(s: &str) -> usize {
 
 /// Source byte offsets and absolute terminal columns for the graphemes the canvas paints.
 /// Escape sequences and zero-width controls consume source bytes without occupying cells.
-pub(super) fn positioned_graphemes(
+pub(crate) fn positioned_graphemes(
     text: &str,
     start_column: isize,
 ) -> impl Iterator<Item = (usize, &str, std::ops::Range<isize>)> {

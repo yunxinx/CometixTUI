@@ -8,6 +8,7 @@ use crate::{
     strip_ansi::strip_ansi,
 };
 use taffy::{AvailableSpace, Size};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// The text wrapping behavior of a [`Text`] component.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
@@ -211,7 +212,8 @@ impl Text {
         };
         first_segment.index == 0
             && first_segment.offset > 0
-            && !content[..first_segment.offset].ends_with('\n')
+            && !content[..first_segment.offset]
+                .ends_with(crate::unicode_linebreak::is_hard_line_break)
     }
 
     fn truncate_position(text_wrap: TextWrap) -> Option<TruncatePosition> {
@@ -325,7 +327,7 @@ impl Text {
                 let source = if text_wrap == TextWrap::WrapTrim {
                     trimmed_content = content
                         .split('\n')
-                        .map(str::trim)
+                        .map(|line| crate::segmented_string::trim_start_whitespace(line).trim_end())
                         .collect::<Vec<_>>()
                         .join("\n");
                     trimmed_content.as_str()
@@ -346,7 +348,10 @@ impl Text {
                         let preserve_content_end =
                             index + 1 < line_count && soft_continuations[index + 1];
                         let (text, rendered_width) = if text_wrap == TextWrap::WrapTrim {
-                            let text = line.to_string().trim().to_string();
+                            let text =
+                                crate::segmented_string::trim_start_whitespace(&line.to_string())
+                                    .trim_end()
+                                    .to_string();
                             let width = crate::canvas::string_display_width(&text);
                             (text, width)
                         } else {
@@ -522,8 +527,10 @@ impl<'a, 'b> TextDrawer<'a, 'b> {
             }
             if self.skip_leading_whitespace && !self.line_encountered_non_whitespace {
                 let to_skip = line
-                    .char_indices()
-                    .find(|(_, c)| !c.is_whitespace())
+                    .grapheme_indices(true)
+                    .find(|(_, grapheme)| {
+                        !crate::segmented_string::is_whitespace_grapheme(grapheme)
+                    })
                     .map_or(line.len(), |(offset, _)| offset);
                 let (whitespace, remaining) = line.split_at(to_skip);
                 self.x += crate::canvas::string_display_width_from_col(
