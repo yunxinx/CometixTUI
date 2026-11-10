@@ -89,6 +89,7 @@ fn main() {
                 canvas_diff: TerminalFullscreenCanvasDiffOptions {
                     top_row: 0,
                     force_full_repaint: false,
+                    terminal_rows: None,
                 },
                 scroll_patch_ansi: Some(patch.scroll_patch_ansi.clone()),
                 erase_before_paint: false,

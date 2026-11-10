@@ -850,6 +850,9 @@ impl TerminalImpl for StdTerminal<'_> {
     }
 
     fn write_canvas_would_write(&self, prev: Option<&Canvas>, canvas: &Canvas) -> bool {
+        if self.fullscreen && self.size.is_some_and(|(_, rows)| rows == 0) {
+            return false;
+        }
         if self.inline_full_rewrite_deferred(prev, canvas) {
             return false;
         }
@@ -865,11 +868,16 @@ impl TerminalImpl for StdTerminal<'_> {
             if self.prev_size_on_write != self.size {
                 return true;
             }
-            if canvas.should_force_full_repaint() {
-                return prev.height().max(canvas.height()) > 0;
-            }
-            let max_height = prev.height().max(canvas.height());
-            return (0..max_height).any(|y| prev.row_change_start(canvas, y).is_some());
+            let visible_rows = fullscreen_visible_rows(
+                prev.height().max(canvas.height()),
+                self.prev_canvas_top_row,
+                self.size.map(|(_, rows)| rows),
+            );
+            return (0..visible_rows).any(|y| {
+                canvas.should_force_full_repaint()
+                    || y >= canvas.height()
+                    || prev.row_change_start(canvas, y).is_some()
+            });
         }
 
         if self.inline_force_full_rewrite_next_diff || self.inline_resize_requires_full_rewrite() {
@@ -901,6 +909,11 @@ impl TerminalImpl for StdTerminal<'_> {
         canvas: &Canvas,
         output: OutputContext,
     ) -> io::Result<()> {
+        if self.fullscreen && self.size.is_some_and(|(_, rows)| rows == 0) {
+            self.prev_canvas_height = canvas.height() as _;
+            self.prev_size_on_write = self.size;
+            return Ok(());
+        }
         if self.inline_full_rewrite_deferred(prev, canvas) {
             return Ok(());
         }
@@ -965,8 +978,12 @@ impl TerminalImpl for StdTerminal<'_> {
 
             // Fullscreen: absolute positioning.
             let top_row = self.prev_canvas_top_row;
-            let max_height = prev_for_diff.height().max(canvas.height());
-            for y in 0..max_height {
+            let visible_rows = fullscreen_visible_rows(
+                prev_for_diff.height().max(canvas.height()),
+                top_row,
+                self.size.map(|(_, rows)| rows),
+            );
+            for y in 0..visible_rows {
                 let start_col = if force_full_repaint || y >= canvas.height() {
                     Some(0)
                 } else {
@@ -1342,7 +1359,12 @@ impl<'a> StdTerminal<'a> {
     }
 
     fn write_fullscreen_canvas_absolute(&mut self, canvas: &Canvas) -> io::Result<()> {
-        if canvas.height() == 0 {
+        let visible_rows = fullscreen_visible_rows(
+            canvas.height(),
+            self.prev_canvas_top_row,
+            self.size.map(|(_, rows)| rows),
+        );
+        if visible_rows == 0 {
             return Ok(());
         }
 
@@ -1351,7 +1373,7 @@ impl<'a> StdTerminal<'a> {
         // rendering. Do the same at row granularity: absolute CUP per row never
         // scrolls the alt buffer, even when the canvas fills the viewport.
         self.dest.write_all(b"\x1b[0m")?;
-        for y in 0..canvas.height() {
+        for y in 0..visible_rows {
             self.dest
                 .queue(cursor::MoveTo(0, self.prev_canvas_top_row + y as u16))?;
             canvas.write_ansi_row_without_newline(y, &mut *self.dest)?;

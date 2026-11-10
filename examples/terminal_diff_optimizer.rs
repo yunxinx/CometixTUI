@@ -72,6 +72,7 @@ fn main() {
             canvas_diff: TerminalFullscreenCanvasDiffOptions {
                 top_row: 0,
                 force_full_repaint: false,
+                terminal_rows: None,
             },
             scroll_patch_ansi: None,
             erase_before_paint: false,
@@ -118,6 +119,7 @@ fn main() {
             canvas_diff: TerminalFullscreenCanvasDiffOptions {
                 top_row: 0,
                 force_full_repaint: false,
+                terminal_rows: None,
             },
             scroll_patch_ansi: None,
             erase_before_paint: false,
@@ -203,6 +205,7 @@ fn main() {
             canvas_diff: TerminalFullscreenCanvasDiffOptions {
                 top_row: 0,
                 force_full_repaint: false,
+                terminal_rows: None,
             },
             scroll_patch_ansi: None,
             erase_before_paint: false,

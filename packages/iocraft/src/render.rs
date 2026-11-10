@@ -2251,6 +2251,23 @@ impl<'a> Tree<'a> {
         })
     }
 
+    // Component changes must render before another input observes their props or layout.
+    // Still poll the terminal when a component wins, retaining input for that render.
+    async fn wait_for_change(&mut self, term: &mut Terminal<'_>) -> io::Result<bool> {
+        let component_changed =
+            match select(self.root_component.wait().boxed(), term.wait().boxed()).await {
+                Either::Right((result, _)) => {
+                    result?;
+                    false
+                }
+                Either::Left(_) => true,
+            };
+        if !component_changed || self.system_context.should_exit() || term.received_ctrl_c() {
+            return Ok(false);
+        }
+        term.wait_before_input().now_or_never().unwrap_or(Ok(false))
+    }
+
     async fn terminal_render_loop(
         &mut self,
         mut term: Terminal<'_>,
@@ -2264,6 +2281,7 @@ impl<'a> Tree<'a> {
         let mut main_screen_canvas: Option<Canvas> = None;
         let mut prev_terminal_size: Option<(u16, u16)> = None;
         let mut mouse_capture_enabled: Option<bool> = None;
+        let mut deferred_input = false;
         loop {
             // Resize settling: a drag delivers a burst of sizes, and painting any
             // of them would reset the inline canvas (and, on a width change, purge
@@ -2273,7 +2291,7 @@ impl<'a> Tree<'a> {
             // no intermediate frame can observe the new size and reset early.
             // Input still ends the wait: each event is reconciled before the next
             // is dispatched, ready input shares one paint, and later resizes settle again.
-            if term.take_resized() {
+            if term.take_resized() && !deferred_input {
                 let mut deadline = std::time::Instant::now() + RESIZE_SETTLE;
                 let mut resumed_during_settle = false;
                 loop {
@@ -2282,14 +2300,11 @@ impl<'a> Tree<'a> {
                         break;
                     }
                     let timer = futures_timer::Delay::new(remaining);
-                    if let futures::future::Either::Right((Either::Right((result, _)), _)) =
-                        futures::future::select(
-                            timer,
-                            select(self.root_component.wait().boxed(), term.wait().boxed()),
-                        )
-                        .await
+                    if let futures::future::Either::Right((result, _)) =
+                        futures::future::select(timer, self.wait_for_change(&mut term).boxed())
+                            .await
                     {
-                        result?;
+                        deferred_input = result?;
                     }
                     if term.take_resumed() {
                         term.reinitialize_after_resume()?;
@@ -2304,6 +2319,9 @@ impl<'a> Tree<'a> {
                         let _ = term.take_resized();
                         let _ = self.root_component.wait().now_or_never();
                         term.resolve_pending_ctrl_c();
+                        break;
+                    }
+                    if deferred_input {
                         break;
                     }
                     term.resolve_pending_ctrl_c();
@@ -2379,6 +2397,7 @@ impl<'a> Tree<'a> {
                     && batch_started.elapsed() < INPUT_BATCH_BUDGET
                     && term.has_pending_input()
                 {
+                    deferred_input = false;
                     term.wait().now_or_never()
                         .expect("peeked input is ready to dispatch")?;
                     let _ = term.take_input_dispatched();
@@ -2593,10 +2612,20 @@ impl<'a> Tree<'a> {
             if self.system_context.should_exit() || term.received_ctrl_c() {
                 break;
             }
-            if let Either::Right((result, _)) =
-                select(self.root_component.wait().boxed(), term.wait().boxed()).await
-            {
+            // An output clear or screen transition can end the input batch. Its paint
+            // is now committed, so the retained input can observe this render's state.
+            let dispatched = if std::mem::take(&mut deferred_input) {
+                term.wait().now_or_never()
+            } else {
+                None
+            };
+            if let Some(result) = dispatched {
                 result?;
+            } else {
+                deferred_input = self.wait_for_change(&mut term).await?;
+            }
+            if deferred_input {
+                continue;
             }
             if term.take_input_dispatched() {
                 // Commit controlled input state before dispatching the next input event.
@@ -2639,15 +2668,13 @@ impl<'a> Tree<'a> {
                         let timer = futures_timer::Delay::new(remaining);
                         let timed_out = match futures::future::select(
                             timer,
-                            select(self.root_component.wait().boxed(), term.wait().boxed()),
+                            self.wait_for_change(&mut term).boxed(),
                         )
                         .await
                         {
                             futures::future::Either::Left(_) => true,
-                            futures::future::Either::Right((wakeup, _)) => {
-                                if let Either::Right((result, _)) = wakeup {
-                                    result?;
-                                }
+                            futures::future::Either::Right((result, _)) => {
+                                deferred_input = result?;
                                 false
                             }
                         };
@@ -2666,6 +2693,9 @@ impl<'a> Tree<'a> {
                         let _ = term.take_resized();
                         let _ = self.root_component.wait().now_or_never();
                         term.resolve_pending_ctrl_c();
+                        break;
+                    }
+                    if deferred_input {
                         break;
                     }
                     if resumed_during_throttle {

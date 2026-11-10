@@ -1797,3 +1797,121 @@ async fn test_batched_flag_input_paints_only_complete_grapheme() {
     }
     crate::render::wake::set_push_wake_for_tests(None);
 }
+
+#[derive(Default)]
+struct AlwaysReadyInputHook {
+    polls: usize,
+}
+
+impl Hook for AlwaysReadyInputHook {
+    fn poll_change(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let this = self.get_mut();
+        this.polls += 1;
+        assert!(
+            this.polls < 10_000,
+            "input starved while component remained ready"
+        );
+        cx.waker().wake_by_ref();
+        std::task::Poll::Ready(())
+    }
+}
+
+#[derive(Default, Props)]
+struct BusyInputProps {
+    output: bool,
+}
+
+#[component]
+fn BusyInput(mut hooks: Hooks, props: &BusyInputProps) -> impl Into<AnyElement<'static>> {
+    let _ = hooks.use_hook(AlwaysReadyInputHook::default);
+    let (stdout, _) = hooks.use_output();
+    if props.output {
+        stdout.println("busy output");
+    }
+    let mut system = hooks.use_context_mut::<SystemContext>();
+    let mut renders = hooks.use_ref(|| 0);
+    let mut saw_key = hooks.use_state(|| false);
+    hooks.use_terminal_events(move |event| {
+        if matches!(event, TerminalEvent::Key(_)) {
+            saw_key.set(true);
+        }
+    });
+    renders.set(renders.get() + 1);
+    if saw_key.get() || renders.get() > 10 {
+        system.exit();
+    }
+    element!(Text(content: if saw_key.get() { "key" } else { "idle" }))
+}
+
+#[apply(test!)]
+async fn test_busy_component_does_not_starve_terminal_input() {
+    for push_wake in [false, true] {
+        crate::render::wake::set_push_wake_for_tests(Some(push_wake));
+        for log_output in [false, true] {
+            for resize_first in [false, true] {
+                for throttle in [None, Some(Duration::from_secs(60))] {
+                    let mut events = std::collections::VecDeque::new();
+                    if resize_first {
+                        events.push_back(TerminalEvent::Resize(80, 25));
+                    }
+                    events.push_back(TerminalEvent::Key(KeyEvent::new(
+                        KeyEventKind::Press,
+                        KeyCode::Char('x'),
+                    )));
+                    // One pending poll before each event exercises a wait after a
+                    // component-only wake, including throttle and resize settling.
+                    let mut pending = true;
+                    let events = futures::stream::poll_fn(move |cx| {
+                        if pending {
+                            pending = false;
+                            cx.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        } else {
+                            pending = true;
+                            events.pop_front().map_or(std::task::Poll::Pending, |e| {
+                                std::task::Poll::Ready(Some(e))
+                            })
+                        }
+                    });
+                    let mut app = element!(BusyInput(output: log_output));
+                    let helper = app.helper();
+                    let (term, output) =
+                        Terminal::mock(MockTerminalConfig::with_events(events).with_size(80, 24));
+                    let render_loop = async {
+                        let mut tree = Tree::new(app.props_mut(), helper);
+                        tree.terminal_render_loop(term, throttle, None)
+                            .await
+                            .unwrap();
+                    };
+                    let (_, frames) = futures::join!(render_loop, output.collect::<Vec<_>>());
+                    assert_eq!(
+                        frames.last().unwrap().to_string().trim(),
+                        "key",
+                        "push_wake={push_wake}, output={log_output}, resize={resize_first}, throttle={throttle:?}"
+                    );
+                }
+            }
+        }
+    }
+    crate::render::wake::set_push_wake_for_tests(None);
+}
+
+#[apply(test!)]
+async fn test_busy_component_propagates_input_error() {
+    for push_wake in [false, true] {
+        crate::render::wake::set_push_wake_for_tests(Some(push_wake));
+        let mut app = element!(BusyInput(output: true));
+        let helper = app.helper();
+        let mut tree = Tree::new(app.props_mut(), helper);
+        let term = Terminal::mock_with_event_error(io::Error::other("busy input failed"));
+        let error = tree
+            .terminal_render_loop(term, None, None)
+            .await
+            .expect_err("input error must be polled");
+        assert_eq!(error.to_string(), "busy input failed");
+    }
+    crate::render::wake::set_push_wake_for_tests(None);
+}

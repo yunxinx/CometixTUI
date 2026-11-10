@@ -92,12 +92,27 @@ pub fn plan_terminal_fullscreen_diff_patches(
 pub struct TerminalFullscreenCanvasDiffOptions {
     /// Zero-indexed terminal row offset for the retained canvas origin.
     pub top_row: u16,
-    /// Rewrite every retained row even when the canvases compare equal.
+    /// Current terminal row count used to clip row writes and removed-row clears.
+    ///
+    /// `None` leaves the canvas height unconstrained. `Some(0)`, or an origin
+    /// at or below the terminal bottom, produces no canvas row patches.
+    pub terminal_rows: Option<u16>,
+    /// Rewrite every visible retained row even when the canvases compare equal.
     ///
     /// The helper also honors `Canvas::force_full_repaint()` internally; this
     /// flag lets custom renderers request the same behavior without mutating
     /// the canvas metadata.
     pub force_full_repaint: bool,
+}
+
+pub(super) fn fullscreen_visible_rows(
+    canvas_height: usize,
+    top_row: u16,
+    terminal_rows: Option<u16>,
+) -> usize {
+    terminal_rows.map_or(canvas_height, |rows| {
+        canvas_height.min(usize::from(rows).saturating_sub(usize::from(top_row)))
+    })
 }
 
 pub(super) fn canvas_row_ansi_from_col(canvas: &Canvas, y: usize, start_col: usize) -> String {
@@ -139,6 +154,8 @@ fn clear_removed_columns_patch(
 /// through [`Canvas::row_change_start`], and rows removed by a shorter next
 /// canvas are cleared with `CSI 2 K`. Columns removed by a narrower next canvas
 /// are erased with default styling up to the previous width using bounded ECH.
+/// When `options.terminal_rows` is known, both row writes and removed-row clears
+/// are clipped to the visible rows below `options.top_row`.
 /// The function performs no terminal I/O and
 /// does not add cursor anchor/park or synchronized-output wrappers; pair it with
 /// [`plan_terminal_fullscreen_diff_patches`], [`optimize_terminal_patches`], and
@@ -161,7 +178,8 @@ pub fn terminal_fullscreen_canvas_diff_patches(
         .map(|previous| previous.height().max(next.height()))
         .unwrap_or_else(|| next.height());
 
-    for y in 0..max_height {
+    let visible_rows = fullscreen_visible_rows(max_height, options.top_row, options.terminal_rows);
+    for y in 0..visible_rows {
         let start_col = match previous {
             None => {
                 if y < next.height() {
@@ -231,7 +249,8 @@ pub fn terminal_fullscreen_packed_canvas_diff_patches(
         .map(|previous| previous.height.max(next.height))
         .unwrap_or(next.height);
 
-    for y in 0..max_height {
+    let visible_rows = fullscreen_visible_rows(max_height, options.top_row, options.terminal_rows);
+    for y in 0..visible_rows {
         let start_col = match previous {
             None => (y < next.height).then_some(0),
             Some(_) if options.force_full_repaint || y >= next.height => Some(0),
@@ -280,7 +299,10 @@ pub struct TerminalFullscreenCanvasFramePatchOptions {
     /// Whether the final fullscreen cursor preamble should erase the visible
     /// alt-screen before painting. This is the CC Ink resize path.
     pub erase_before_paint: bool,
-    /// Terminal row count used to park the cursor after the diff.
+    /// Current terminal row count used to clip the canvas diff and park the cursor.
+    ///
+    /// When set, this overrides `canvas_diff.terminal_rows`; otherwise that
+    /// lower-level value is used for both clipping and cursor parking.
     pub terminal_rows: Option<u16>,
     /// Whether to apply [`optimize_terminal_patches`] before adding fullscreen
     /// cursor anchor/park patches.
@@ -299,6 +321,15 @@ impl Default for TerminalFullscreenCanvasFramePatchOptions {
             erase_before_paint: false,
             terminal_rows: None,
             optimize: true,
+        }
+    }
+}
+
+impl TerminalFullscreenCanvasFramePatchOptions {
+    fn resolved_canvas_diff(&self) -> TerminalFullscreenCanvasDiffOptions {
+        TerminalFullscreenCanvasDiffOptions {
+            terminal_rows: self.terminal_rows.or(self.canvas_diff.terminal_rows),
+            ..self.canvas_diff
         }
     }
 }
@@ -343,6 +374,7 @@ pub fn plan_terminal_fullscreen_canvas_frame_patches(
     next: &Canvas,
     options: TerminalFullscreenCanvasFramePatchOptions,
 ) -> TerminalFullscreenCanvasFramePatchPlan {
+    let canvas_diff = options.resolved_canvas_diff();
     let mut content = Vec::new();
     let mut had_scroll_patch = false;
 
@@ -356,7 +388,7 @@ pub fn plan_terminal_fullscreen_canvas_frame_patches(
     content.extend(terminal_fullscreen_canvas_diff_patches(
         previous,
         next,
-        options.canvas_diff,
+        canvas_diff,
     ));
 
     if options.optimize {
@@ -368,7 +400,7 @@ pub fn plan_terminal_fullscreen_canvas_frame_patches(
         fullscreen: true,
         has_diff: !content.is_empty(),
         erase_before_paint: options.erase_before_paint,
-        terminal_rows: options.terminal_rows,
+        terminal_rows: canvas_diff.terminal_rows,
     });
     let mut patches = content;
     cursor_plan.apply_to(&mut patches);
@@ -395,6 +427,7 @@ pub fn plan_terminal_fullscreen_packed_canvas_frame_patches(
     style_cache: &mut CanvasStyleTransitionCache,
     options: TerminalFullscreenCanvasFramePatchOptions,
 ) -> TerminalFullscreenCanvasFramePatchPlan {
+    let canvas_diff = options.resolved_canvas_diff();
     let mut content = Vec::new();
     let mut had_scroll_patch = false;
 
@@ -410,7 +443,7 @@ pub fn plan_terminal_fullscreen_packed_canvas_frame_patches(
         next,
         pools,
         style_cache,
-        options.canvas_diff,
+        canvas_diff,
     ));
 
     if options.optimize {
@@ -422,7 +455,7 @@ pub fn plan_terminal_fullscreen_packed_canvas_frame_patches(
         fullscreen: true,
         has_diff: !content.is_empty(),
         erase_before_paint: options.erase_before_paint,
-        terminal_rows: options.terminal_rows,
+        terminal_rows: canvas_diff.terminal_rows,
     });
     let mut patches = content;
     cursor_plan.apply_to(&mut patches);

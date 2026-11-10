@@ -834,6 +834,16 @@ impl<'a> Terminal<'a> {
     }
 
     pub async fn wait(&mut self) -> io::Result<()> {
+        self.wait_for_event(false).await.map(|_| ())
+    }
+
+    /// Polls terminal work while retaining input until pending component changes render.
+    /// Returns true when a key, paste, or mouse event is ready but not dispatched.
+    pub(crate) async fn wait_before_input(&mut self) -> io::Result<bool> {
+        self.wait_for_event(true).await
+    }
+
+    async fn wait_for_event(&mut self, defer_input: bool) -> io::Result<bool> {
         use futures::future::{Either, poll_fn, select};
 
         let event_cell_snapshot = self.event_cell_snapshot.clone();
@@ -847,7 +857,7 @@ impl<'a> Terminal<'a> {
             } else {
                 let Some(event_stream) = self.event_stream.as_mut() else {
                     poll_fn(|cx| inner.poll_resumed(cx)).await;
-                    return Ok(());
+                    return Ok(false);
                 };
                 let event_stream_wake = self.event_stream_wake.clone();
                 let stream_waker = Waker::from(event_stream_wake.clone());
@@ -858,7 +868,7 @@ impl<'a> Terminal<'a> {
                 });
                 match select(next_event, poll_fn(|cx| inner.poll_resumed(cx))).await {
                     Either::Left((next, _)) => next,
-                    Either::Right(((), _)) => return Ok(()),
+                    Either::Right(((), _)) => return Ok(false),
                 }
             };
             let Some(event) = next else {
@@ -870,6 +880,17 @@ impl<'a> Terminal<'a> {
                 ));
             };
             let event = event?;
+            if defer_input
+                && matches!(
+                    event,
+                    TerminalEvent::Key(_)
+                        | TerminalEvent::Paste(_)
+                        | TerminalEvent::FullscreenMouse(_)
+                )
+            {
+                self.pending_event = Some(Ok(event));
+                return Ok(true);
+            }
             let now = Instant::now();
             if self
                 .last_stdin_event_at
@@ -895,7 +916,7 @@ impl<'a> Terminal<'a> {
                 // after `fg`. Generic iocraft apps receive Ctrl+Z as normal
                 // input unless they explicitly enable this policy.
                 let _ = self.inner.suspend();
-                return Ok(());
+                return Ok(false);
             }
             match &event {
                 TerminalEvent::FocusGained => self.terminal_focus_state = Some(true),
@@ -956,7 +977,7 @@ impl<'a> Terminal<'a> {
                 }
             }
             if self.received_ctrl_c || is_resize || self.input_dispatched {
-                return Ok(());
+                return Ok(false);
             }
         }
     }

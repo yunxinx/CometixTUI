@@ -173,6 +173,7 @@ fn test_terminal_fullscreen_canvas_diff_patches_use_absolute_rows_and_sparse_pre
         TerminalFullscreenCanvasDiffOptions {
             top_row: 1,
             force_full_repaint: false,
+            terminal_rows: None,
         },
     );
     let ansi = terminal_patches_to_ansi(&diff, true);
@@ -196,6 +197,7 @@ fn test_terminal_fullscreen_canvas_diff_patches_use_absolute_rows_and_sparse_pre
         TerminalFullscreenCanvasDiffOptions {
             top_row: 2,
             force_full_repaint: false,
+            terminal_rows: None,
         },
     );
     let full_ansi = terminal_patches_to_ansi(&full, true);
@@ -228,6 +230,7 @@ fn test_terminal_fullscreen_packed_canvas_diff_patches_use_sparse_packed_rows() 
         TerminalFullscreenCanvasDiffOptions {
             top_row: 1,
             force_full_repaint: false,
+            terminal_rows: None,
         },
     );
     let ansi = terminal_patches_to_ansi(&diff, true);
@@ -253,6 +256,7 @@ fn test_terminal_fullscreen_packed_canvas_diff_patches_use_sparse_packed_rows() 
         TerminalFullscreenCanvasDiffOptions {
             top_row: 2,
             force_full_repaint: false,
+            terminal_rows: None,
         },
     );
     let full_ansi = terminal_patches_to_ansi(&full, true);
@@ -285,6 +289,7 @@ fn test_plan_terminal_fullscreen_packed_canvas_frame_patches_orders_scroll_diff_
             canvas_diff: TerminalFullscreenCanvasDiffOptions {
                 top_row: 0,
                 force_full_repaint: false,
+                terminal_rows: None,
             },
             scroll_patch_ansi: Some("\x1b[1;2r\x1b[1S\x1b[r\x1b[H".to_string()),
             erase_before_paint: false,
@@ -325,6 +330,7 @@ fn test_plan_terminal_fullscreen_canvas_frame_patches_orders_scroll_diff_and_cur
             canvas_diff: TerminalFullscreenCanvasDiffOptions {
                 top_row: 0,
                 force_full_repaint: false,
+                terminal_rows: None,
             },
             scroll_patch_ansi: Some("\x1b[1;2r\x1b[1S\x1b[r\x1b[H".to_string()),
             erase_before_paint: false,
@@ -544,6 +550,7 @@ fn test_plan_terminal_fullscreen_canvas_scroll_frame_patches_shifts_previous_lik
             canvas_diff: TerminalFullscreenCanvasDiffOptions {
                 top_row: 0,
                 force_full_repaint: false,
+                terminal_rows: None,
             },
             scroll_patch_ansi: None,
             erase_before_paint: false,
@@ -633,6 +640,7 @@ fn test_plan_terminal_fullscreen_packed_canvas_scroll_frame_patches_shifts_previ
             canvas_diff: TerminalFullscreenCanvasDiffOptions {
                 top_row: 0,
                 force_full_repaint: false,
+                terminal_rows: None,
             },
             scroll_patch_ansi: None,
             erase_before_paint: false,
@@ -658,4 +666,243 @@ fn test_plan_terminal_fullscreen_packed_canvas_scroll_frame_patches_shifts_previ
         !ansi.contains("\x1b[1;1Hbbb") && !ansi.contains("\x1b[2;1Hccc"),
         "packed shifted baseline should avoid rewriting stable scrolled rows: {ansi:?}"
     );
+}
+
+fn fullscreen_height_test_canvas(rows: &[&str]) -> Canvas {
+    let mut canvas = Canvas::new(10, rows.len());
+    for (y, text) in rows.iter().enumerate() {
+        canvas.subview_mut(0, 0, 0, 0, 10, rows.len()).set_text(
+            0,
+            y as isize,
+            text,
+            CanvasTextStyle::default(),
+        );
+    }
+    canvas.clear_damage();
+    canvas
+}
+
+fn fullscreen_height_test_vt() -> avt::Vt {
+    let seed = fullscreen_height_test_canvas(&["TITLE", "body", "FOOTER", "old bottom"]);
+    let mut bytes = Vec::new();
+    seed.write_ansi_without_final_newline(&mut bytes).unwrap();
+    let mut vt = avt::Vt::new(10, 4);
+    vt.feed_str(&String::from_utf8(bytes).unwrap());
+    vt
+}
+
+#[test]
+fn test_fullscreen_shrink_preserves_bottom_border_and_clears_visible_removed_rows() {
+    let previous =
+        fullscreen_height_test_canvas(&["TITLE", "body", "FOOTER", "old bottom", "tail4", "tail5"]);
+    for next_rows in [
+        &["TITLE", "body", "FOOTER", "╰────────╯"][..],
+        &["TITLE", "body"][..],
+    ] {
+        let next = fullscreen_height_test_canvas(next_rows);
+        let (writer, bytes) = super::new_test_writer();
+        let mut terminal = super::new_fullscreen_term(writer, 0, 6);
+        terminal.size = Some((10, 4));
+        terminal.prev_size_on_write = terminal.size;
+        let mut vt = fullscreen_height_test_vt();
+        assert!(terminal.write_canvas_would_write(Some(&previous), &next));
+        terminal
+            .write_canvas(Some(&previous), &next, OutputContext::default())
+            .unwrap();
+        vt.feed_str(&String::from_utf8(std::mem::take(&mut *bytes.lock().unwrap())).unwrap());
+        for y in 0..4 {
+            assert_eq!(
+                vt.line(y).text(),
+                format!("{:10}", next_rows.get(y).unwrap_or(&""))
+            );
+        }
+        assert!(!terminal.write_canvas_would_write(Some(&next), &next));
+        terminal
+            .write_canvas(Some(&next), &next, OutputContext::default())
+            .unwrap();
+        assert!(bytes.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn test_fullscreen_initial_resize_and_forced_paints_clip_tall_canvas() {
+    let next =
+        fullscreen_height_test_canvas(&["TITLE", "body", "FOOTER", "╰────────╯", "tail4", "tail5"]);
+    for mode in 0..3 {
+        let (writer, bytes) = super::new_test_writer();
+        let mut terminal = super::new_fullscreen_term(writer, 0, 6);
+        terminal.size = Some((10, 4));
+        terminal.prev_size_on_write = Some((10, if mode == 1 { 6 } else { 4 }));
+        let mut forced = next.clone();
+        forced.force_full_repaint();
+        let (previous, canvas) = match mode {
+            0 => (None, &next),
+            1 => (Some(&next), &next),
+            _ => (Some(&next), &forced),
+        };
+        assert!(terminal.write_canvas_would_write(previous, canvas));
+        terminal
+            .write_canvas(previous, canvas, OutputContext::default())
+            .unwrap();
+        let ansi = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(!ansi.contains("tail"), "{ansi:?}");
+        let mut vt = avt::Vt::new(10, 4);
+        vt.feed_str(&ansi);
+        assert_eq!(vt.line(0).text(), "TITLE     ");
+        assert_eq!(vt.line(3).text(), "╰────────╯");
+    }
+}
+
+#[test]
+fn test_fullscreen_hidden_rows_are_noop_for_writer_and_prediction() {
+    let previous = fullscreen_height_test_canvas(&["same", "same", "same", "same", "old"]);
+    let mut next = previous.clone();
+    next.subview_mut(0, 0, 0, 0, 10, 5)
+        .set_text(0, 4, "new", CanvasTextStyle::default());
+    next.clear_damage();
+    for (rows, top_row, force, initial) in [
+        (4, 0, false, false),
+        (4, 1, false, false),
+        (4, 4, true, false),
+        (4, u16::MAX, true, false),
+        (0, 0, true, false),
+        (0, 0, true, true),
+    ] {
+        let (writer, bytes) = super::new_test_writer();
+        let mut terminal = super::new_fullscreen_term(writer, top_row, 5);
+        terminal.size = Some((10, rows));
+        terminal.prev_size_on_write = terminal.size;
+        let mut canvas = next.clone();
+        if force {
+            canvas.force_full_repaint();
+        }
+        let previous = (!initial).then_some(&previous);
+        assert!(!terminal.write_canvas_would_write(previous, &canvas));
+        terminal
+            .write_canvas(previous, &canvas, OutputContext::default())
+            .unwrap();
+        assert!(bytes.lock().unwrap().is_empty());
+    }
+}
+
+fn fullscreen_height_test_diff(
+    previous: Option<&Canvas>,
+    next: &Canvas,
+    options: TerminalFullscreenCanvasDiffOptions,
+    packed: bool,
+) -> Vec<TerminalPatch> {
+    if packed {
+        let mut pools = CanvasPackedCellPools::new();
+        let previous = previous.map(|canvas| canvas.pack_with(&mut pools));
+        let next = next.pack_with(&mut pools);
+        terminal_fullscreen_packed_canvas_diff_patches(
+            previous.as_ref(),
+            &next,
+            &pools,
+            &mut CanvasStyleTransitionCache::new(),
+            options,
+        )
+    } else {
+        terminal_fullscreen_canvas_diff_patches(previous, next, options)
+    }
+}
+
+#[test]
+fn test_fullscreen_canvas_and_packed_helpers_clip_writes_and_clears_from_origin() {
+    let previous =
+        fullscreen_height_test_canvas(&["TITLE", "body", "FOOTER", "old bottom", "tail4", "tail5"]);
+    let next = fullscreen_height_test_canvas(&["TITLE", "body", "FOOTER", "╰────────╯"]);
+    for packed in [false, true] {
+        for top_row in [0, 1] {
+            for force_full_repaint in [false, true] {
+                let options = TerminalFullscreenCanvasDiffOptions {
+                    top_row,
+                    terminal_rows: Some(4),
+                    force_full_repaint,
+                };
+                let patches = fullscreen_height_test_diff(Some(&previous), &next, options, packed);
+                let ansi = terminal_patches_to_ansi(&patches, true);
+                let mut vt = fullscreen_height_test_vt();
+                vt.feed_str(&ansi);
+                if top_row == 0 {
+                    assert_eq!(vt.line(3).text(), "╰────────╯");
+                } else {
+                    // The changed border is below the visible origin-relative extent.
+                    assert!(!ansi.contains("╰"), "{ansi:?}");
+                    if !force_full_repaint {
+                        assert!(patches.is_empty());
+                    }
+                }
+            }
+        }
+        for (terminal_rows, top_row) in [(0, 0), (4, 4), (4, u16::MAX)] {
+            let options = TerminalFullscreenCanvasDiffOptions {
+                top_row,
+                terminal_rows: Some(terminal_rows),
+                force_full_repaint: true,
+            };
+            assert!(
+                fullscreen_height_test_diff(Some(&previous), &next, options, packed).is_empty()
+            );
+            assert!(fullscreen_height_test_diff(None, &next, options, packed).is_empty());
+        }
+        let options = TerminalFullscreenCanvasDiffOptions::default();
+        let ansi = terminal_patches_to_ansi(
+            &fullscreen_height_test_diff(Some(&previous), &next, options, packed),
+            true,
+        );
+        assert!(
+            ansi.contains("\x1b[6;1H"),
+            "unknown height keeps the unconstrained convention: {ansi:?}"
+        );
+    }
+}
+
+#[test]
+fn test_fullscreen_frame_row_count_overrides_or_falls_back_to_diff_options() {
+    let previous =
+        fullscreen_height_test_canvas(&["TITLE", "body", "FOOTER", "old bottom", "tail4", "tail5"]);
+    let next = fullscreen_height_test_canvas(&["TITLE", "body", "FOOTER", "╰────────╯"]);
+    for packed in [false, true] {
+        for (frame_rows, diff_rows, expected_rows) in [
+            (Some(4), Some(6), 4),
+            (None, Some(4), 4),
+            (Some(0), Some(4), 0),
+        ] {
+            let options = TerminalFullscreenCanvasFramePatchOptions {
+                terminal_rows: frame_rows,
+                canvas_diff: TerminalFullscreenCanvasDiffOptions {
+                    terminal_rows: diff_rows,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let plan = if packed {
+                let mut pools = CanvasPackedCellPools::new();
+                let previous = previous.pack_with(&mut pools);
+                let next = next.pack_with(&mut pools);
+                plan_terminal_fullscreen_packed_canvas_frame_patches(
+                    Some(&previous),
+                    &next,
+                    &pools,
+                    &mut CanvasStyleTransitionCache::new(),
+                    options,
+                )
+            } else {
+                plan_terminal_fullscreen_canvas_frame_patches(Some(&previous), &next, options)
+            };
+            if expected_rows == 0 {
+                assert!(plan.is_empty());
+            } else {
+                let ansi = terminal_patches_to_ansi(&plan.patches, true);
+                let mut vt = fullscreen_height_test_vt();
+                vt.feed_str(&ansi);
+                assert_eq!(vt.line(3).text(), "╰────────╯");
+                assert_eq!(
+                    plan.cursor_plan.post_diff_patch,
+                    Some(TerminalPatch::Stdout("\x1b[4;1H".into()))
+                );
+            }
+        }
+    }
 }
