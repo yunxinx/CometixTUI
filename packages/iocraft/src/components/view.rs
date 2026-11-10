@@ -4640,7 +4640,7 @@ mod tests {
         assert!(!canvases[0].is_no_select(5, 0));
     }
 
-    #[derive(Props)]
+    #[derive(Default, Props)]
     struct ClippedClickAppProps {
         clip: bool,
     }
