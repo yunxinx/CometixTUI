@@ -59,7 +59,7 @@ CI runs checks on Ubuntu and Windows independently and saves an HTML coverage re
 
 ## iocraft upstream sync
 
-This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) changes up to `7b5f4e7` on top of the base fork, which last merged `3e26e2b` (v0.9.1). Applicable changes were applied directly or re-implemented in this fork's structure; a closing `-s ours` merge records the sync point. The first two syncs account for 38 upstream commits: 20 Ported, 14 Already covered, and 4 Not taken. Code and comment cleanup was incorporated with the corresponding ports. The ports below begin the third sync toward `997a5d3`; its closing merge is still pending.
+This fork has ported [ccbrown/iocraft](https://github.com/ccbrown/iocraft) changes through `997a5d3` on top of the base fork, which last merged `3e26e2b` (v0.9.1). Applicable changes were applied directly or re-implemented in this fork's structure; the `-s ours` merge `53ab4bb` records this sync point. The first two syncs account for 38 upstream commits: 20 Ported, 14 Already covered, and 4 Not taken. Code and comment cleanup was incorporated with the corresponding ports. The third sync accounts for six more upstream commits: four Ported and two Not taken.
 
 ### Third sync: Props defaults, Unicode editing, and terminal fixes
 
