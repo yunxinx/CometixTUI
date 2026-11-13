@@ -166,7 +166,8 @@ fn real_editor_roundtrip_in_native_pty() {
                             // ConPTY's inherited cursor requires a live host reply, including during resize.
                             let cursor = terminal.cursor();
                             let mut writer = reply_writer.lock().unwrap();
-                            write!(writer, "\x1b[{};{}R", cursor.row + 1, cursor.col + 1).unwrap();
+                            let response = format!("\x1b[{};{}R", cursor.row + 1, cursor.col + 1);
+                            writer.write_all(response.as_bytes()).unwrap();
                             writer.flush().unwrap();
                         }
                     }
@@ -204,12 +205,12 @@ fn real_editor_roundtrip_in_native_pty() {
             send_input(b"\x14");
             output.wait_for("A24:seed界");
             output.wait_for_sequence(b"\x1b[?1049h");
-            pair.master.resize(PtySize { cols: 30, ..size }).unwrap();
             output
                 .terminal
                 .lock()
                 .unwrap()
                 .resize(30, usize::from(rows));
+            pair.master.resize(PtySize { cols: 30, ..size }).unwrap();
             output.wait_for("A30:seed界");
             send_input(b"\x14");
             output.wait_for("M30:seed界");
@@ -244,6 +245,10 @@ fn real_editor_roundtrip_in_native_pty() {
             .unwrap();
         }
         assert!(output.closed, "PTY capture did not reach EOF");
+        assert!(
+            output.terminal.lock().unwrap().cursor().visible,
+            "exit restores cursor visibility"
+        );
         drop(output);
         reader_thread.join().unwrap();
         if let Err(panic) = result {
