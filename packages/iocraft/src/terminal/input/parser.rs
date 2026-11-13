@@ -529,6 +529,7 @@ fn sgr_mouse_to_fullscreen_mouse_event(mouse: &TerminalParsedMouse) -> Fullscree
         column: mouse.column.saturating_sub(1),
         row: mouse.row.saturating_sub(1),
         cell_is_blank: false,
+        frame: None,
         kind,
     }
 }
@@ -546,6 +547,7 @@ fn parsed_input_event_to_wheel_mouse_event(
             column: column.saturating_sub(1),
             row: row.saturating_sub(1),
             cell_is_blank: false,
+            frame: None,
             kind: if event.key.wheel_up {
                 MouseEventKind::ScrollUp
             } else {
@@ -559,6 +561,7 @@ fn parsed_input_event_to_wheel_mouse_event(
             column: column.saturating_sub(1),
             row: row.saturating_sub(1),
             cell_is_blank: false,
+            frame: None,
             kind: if event.key.wheel_up {
                 MouseEventKind::ScrollUp
             } else {

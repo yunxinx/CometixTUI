@@ -180,47 +180,20 @@ fn keyboard_modes_transfer_between_screens_and_survive_handoff_without_extra_pop
 
 #[test]
 fn panic_releases_the_owned_keyboard_entry_once() {
-    const CHILD: &str = "IOCRAFT_TEST_KEYBOARD_PANIC_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "terminal::tests::keyboard_modes::panic_releases_the_owned_keyboard_entry_once",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            String::from_utf8(output.stdout)
-                .unwrap()
-                .matches("\x1b[<1u")
-                .count(),
-            1
-        );
-        return;
-    }
     let (output, bytes) = new_test_writer();
     let mut terminal = new_inline_term(output, 0);
-    register_terminal_for_panic_restore(false);
     terminal.keyboard.supported = true;
     terminal
         .apply_raw_mode_enabled_with(true, |_| Ok(()))
         .unwrap();
     bytes.lock().unwrap().clear();
-    assert!(std::panic::catch_unwind(|| panic!("keyboard cleanup")).is_err());
-    assert!(!terminal.keyboard.is_active());
-    terminal
-        .apply_raw_mode_enabled_with(false, |_| Ok(()))
-        .unwrap();
     assert!(
-        !String::from_utf8(bytes.lock().unwrap().clone())
-            .unwrap()
-            .contains("\x1b[<1u")
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _terminal = terminal;
+            panic!("keyboard cleanup");
+        }))
+        .is_err()
     );
+    let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    assert_eq!(output.matches("\x1b[<1u").count(), 1);
 }

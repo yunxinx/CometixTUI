@@ -25,6 +25,7 @@ pub(super) struct TerminalWriter<'a> {
 }
 
 impl<'a> TerminalWriter<'a> {
+    #[cfg(not(test))]
     pub(super) fn new(inner: Box<dyn Write + Send + 'a>) -> Self {
         Self {
             inner,

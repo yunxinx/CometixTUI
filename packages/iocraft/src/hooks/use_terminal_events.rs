@@ -7,6 +7,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll},
 };
+use std::sync::{Arc, Mutex};
 use taffy::{Point, Rect};
 
 mod private {
@@ -181,15 +182,16 @@ impl UseTerminalEvents for Hooks<'_, '_> {
         let h = self.use_hook(move || UseTerminalEventsImpl {
             events: None,
             component_location: Default::default(),
+            identity: Arc::new(()),
             in_component: false,
             propagation_aware: false,
             observe_stopped: false,
             interest: TerminalEventInterest::ALL,
             f: None,
         });
-        h.f = Some(Box::new(move |event: &PropagatedTerminalEvent| {
-            f(event.event().clone())
-        }));
+        h.f = Some(Arc::new(Mutex::new(Box::new(
+            move |event: &PropagatedTerminalEvent| f(event.event().clone()),
+        ))));
     }
 
     fn use_local_terminal_events<F>(&mut self, mut f: F)
@@ -199,15 +201,16 @@ impl UseTerminalEvents for Hooks<'_, '_> {
         let h = self.use_hook(move || UseTerminalEventsImpl {
             events: None,
             component_location: Default::default(),
+            identity: Arc::new(()),
             in_component: true,
             propagation_aware: false,
             observe_stopped: false,
             interest: TerminalEventInterest::ALL,
             f: None,
         });
-        h.f = Some(Box::new(move |event: &PropagatedTerminalEvent| {
-            f(event.event().clone())
-        }));
+        h.f = Some(Arc::new(Mutex::new(Box::new(
+            move |event: &PropagatedTerminalEvent| f(event.event().clone()),
+        ))));
     }
 
     fn use_local_propagated_terminal_events<F>(&mut self, f: F)
@@ -217,13 +220,14 @@ impl UseTerminalEvents for Hooks<'_, '_> {
         let h = self.use_hook(move || UseTerminalEventsImpl {
             events: None,
             component_location: Default::default(),
+            identity: Arc::new(()),
             in_component: true,
             propagation_aware: true,
             observe_stopped: false,
             interest: TerminalEventInterest::ALL,
             f: None,
         });
-        h.f = Some(Box::new(f));
+        h.f = Some(Arc::new(Mutex::new(Box::new(f))));
     }
 
     fn use_propagated_terminal_events<F>(&mut self, f: F)
@@ -233,13 +237,14 @@ impl UseTerminalEvents for Hooks<'_, '_> {
         let h = self.use_hook(move || UseTerminalEventsImpl {
             events: None,
             component_location: Default::default(),
+            identity: Arc::new(()),
             in_component: false,
             propagation_aware: true,
             observe_stopped: false,
             interest: TerminalEventInterest::ALL,
             f: None,
         });
-        h.f = Some(Box::new(f));
+        h.f = Some(Arc::new(Mutex::new(Box::new(f))));
     }
 
     fn use_terminal_events_for<F>(&mut self, interest: TerminalEventInterest, mut f: F)
@@ -249,6 +254,7 @@ impl UseTerminalEvents for Hooks<'_, '_> {
         let h = self.use_hook(move || UseTerminalEventsImpl {
             events: None,
             component_location: Default::default(),
+            identity: Arc::new(()),
             in_component: false,
             propagation_aware: false,
             observe_stopped: false,
@@ -256,9 +262,9 @@ impl UseTerminalEvents for Hooks<'_, '_> {
             f: None,
         });
         h.interest = interest;
-        h.f = Some(Box::new(move |event: &PropagatedTerminalEvent| {
-            f(event.event().clone())
-        }));
+        h.f = Some(Arc::new(Mutex::new(Box::new(
+            move |event: &PropagatedTerminalEvent| f(event.event().clone()),
+        ))));
     }
 
     fn use_propagated_terminal_events_for<F>(&mut self, interest: TerminalEventInterest, f: F)
@@ -268,6 +274,7 @@ impl UseTerminalEvents for Hooks<'_, '_> {
         let h = self.use_hook(move || UseTerminalEventsImpl {
             events: None,
             component_location: Default::default(),
+            identity: Arc::new(()),
             in_component: false,
             propagation_aware: true,
             observe_stopped: false,
@@ -275,7 +282,7 @@ impl UseTerminalEvents for Hooks<'_, '_> {
             f: None,
         });
         h.interest = interest;
-        h.f = Some(Box::new(f));
+        h.f = Some(Arc::new(Mutex::new(Box::new(f))));
     }
 }
 
@@ -287,26 +294,34 @@ impl UseTerminalDefaultEvents for Hooks<'_, '_> {
         let h = self.use_hook(move || UseTerminalEventsImpl {
             events: None,
             component_location: Default::default(),
+            identity: Arc::new(()),
             in_component: false,
             propagation_aware: true,
             observe_stopped: true,
             interest: TerminalEventInterest::ALL,
             f: None,
         });
-        h.f = Some(Box::new(f));
+        h.f = Some(Arc::new(Mutex::new(Box::new(f))));
     }
 }
 
 type EventCallback = Box<dyn FnMut(&PropagatedTerminalEvent) + Send + 'static>;
 
+struct LocalInputProjection {
+    identity: Arc<()>,
+    location: (Point<i32>, Rect<u32>),
+    callback: Arc<Mutex<EventCallback>>,
+}
+
 struct UseTerminalEventsImpl {
     events: Option<TerminalEvents>,
     component_location: (Point<i32>, Rect<u32>),
+    identity: Arc<()>,
     in_component: bool,
     propagation_aware: bool,
     observe_stopped: bool,
     interest: TerminalEventInterest,
-    f: Option<EventCallback>,
+    f: Option<Arc<Mutex<EventCallback>>>,
 }
 
 impl Hook for UseTerminalEventsImpl {
@@ -334,9 +349,21 @@ impl Hook for UseTerminalEventsImpl {
                 continue;
             }
             if self.in_component {
-                let (location, visible_rect) = self.component_location;
                 match event {
                     TerminalEvent::FullscreenMouse(event) => {
+                        let (location, callback) = if let Some(frame) = &event.frame {
+                            let Some(projection) =
+                                frame.matching_targets::<LocalInputProjection>().find(
+                                    |projection| Arc::ptr_eq(&projection.identity, &self.identity),
+                                )
+                            else {
+                                continue;
+                            };
+                            (projection.location, Some(projection.callback.clone()))
+                        } else {
+                            (self.component_location, self.f.clone())
+                        };
+                        let (location, visible_rect) = location;
                         let (event_column, event_row) =
                             (u32::from(event.column), u32::from(event.row));
                         if event_column < visible_rect.left
@@ -348,15 +375,17 @@ impl Hook for UseTerminalEventsImpl {
                         }
                         let row = component_local_offset(event.row, location.y);
                         let column = component_local_offset(event.column, location.x);
-                        if let Some(f) = &mut self.f {
-                            f(&PropagatedTerminalEvent::new(
-                                TerminalEvent::FullscreenMouse(FullscreenMouseEvent {
-                                    row,
-                                    column,
-                                    ..event
-                                }),
-                                state,
-                            ));
+                        if let Some(f) = callback {
+                            f.lock().expect("input callback is not poisoned")(
+                                &PropagatedTerminalEvent::new(
+                                    TerminalEvent::FullscreenMouse(FullscreenMouseEvent {
+                                        row,
+                                        column,
+                                        ..event
+                                    }),
+                                    state,
+                                ),
+                            );
                         }
                     }
                     TerminalEvent::Key(_)
@@ -366,12 +395,16 @@ impl Hook for UseTerminalEventsImpl {
                     | TerminalEvent::Paste(_)
                     | TerminalEvent::Response(_) => {
                         if let Some(f) = &mut self.f {
-                            f(&PropagatedTerminalEvent::new(event, state));
+                            f.lock().expect("input callback is not poisoned")(
+                                &PropagatedTerminalEvent::new(event, state),
+                            );
                         }
                     }
                 }
             } else if let Some(f) = &mut self.f {
-                f(&PropagatedTerminalEvent::new(event, state));
+                f.lock().expect("input callback is not poisoned")(&PropagatedTerminalEvent::new(
+                    event, state,
+                ));
             }
         }
         if processed_ctrl_c {
@@ -399,6 +432,22 @@ impl Hook for UseTerminalEventsImpl {
     fn post_component_draw(&mut self, drawer: &mut crate::ComponentDrawer) {
         if self.in_component {
             self.component_location = (drawer.canvas_position(), drawer.visible_rect());
+            if let Some(callback) = &self.f {
+                let rect = drawer.visible_rect();
+                if rect.left < rect.right && rect.top < rect.bottom {
+                    drawer.add_hit_region(crate::HitRegion {
+                        column: rect.left.min(u16::MAX.into()) as u16,
+                        row: rect.top.min(u16::MAX.into()) as u16,
+                        width: (rect.right - rect.left).min(u16::MAX.into()) as u16,
+                        height: (rect.bottom - rect.top).min(u16::MAX.into()) as u16,
+                        target: crate::SourceCoverage::new(Arc::new(LocalInputProjection {
+                            identity: self.identity.clone(),
+                            location: self.component_location,
+                            callback: callback.clone(),
+                        })),
+                    });
+                }
+            }
         }
     }
 }

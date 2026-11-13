@@ -33,8 +33,8 @@ fn test_caller_input_stream_survives_terminal_handoff() {
         KeyCode::Char('x'),
     )))]);
     terminal.set_input_stream(source.boxed()).unwrap();
-    terminal.release_terminal().unwrap();
-    terminal.reacquire_terminal().unwrap();
+    futures::executor::block_on(terminal.release_terminal()).unwrap();
+    futures::executor::block_on(terminal.reacquire_terminal()).unwrap();
     assert!(matches!(
         terminal.poll_event_stream_now(),
         Poll::Ready(Some(Ok(TerminalEvent::Key(KeyEvent {
@@ -127,7 +127,12 @@ fn test_terminal_set_clipboard_writes_raw_osc52_without_sync_update() {
     .unwrap();
     stdout.buf.lock().unwrap().clear(); // discard setup cursor-hide bytes
 
-    terminal.set_clipboard("copy").unwrap();
+    terminal
+        .submit_output_batch(vec![OutputMessage::StdoutClipboard(
+            "copy".into(),
+            ClipboardMultiplexer::None,
+        )])
+        .unwrap();
 
     let output = String::from_utf8(stdout.buf.lock().unwrap().clone()).unwrap();
     assert_eq!(output, "\x1b]52;c;Y29weQ==\x07");
@@ -206,7 +211,12 @@ fn test_terminal_side_band_writes_flush_immediately() {
         "control sequences must flush at once"
     );
 
-    terminal.set_clipboard("copy").unwrap();
+    terminal
+        .submit_output_batch(vec![OutputMessage::StdoutClipboard(
+            "copy".into(),
+            ClipboardMultiplexer::None,
+        )])
+        .unwrap();
     assert_eq!(
         stdout.flushes.load(Ordering::SeqCst),
         baseline + 2,
@@ -214,7 +224,10 @@ fn test_terminal_side_band_writes_flush_immediately() {
     );
 
     terminal
-        .set_clipboard_with_multiplexer("copy", ClipboardMultiplexer::Tmux)
+        .submit_output_batch(vec![OutputMessage::StdoutClipboard(
+            "copy".into(),
+            ClipboardMultiplexer::Tmux,
+        )])
         .unwrap();
     assert_eq!(
         stdout.flushes.load(Ordering::SeqCst),
@@ -373,6 +386,7 @@ fn test_selection_controller_routes_fullscreen_mouse_press_drag_release() {
         column: 1,
         row: 0,
         cell_is_blank: false,
+        frame: None,
         kind: MouseEventKind::Down(event::MouseButton::Left),
     };
     let outcome = controller.handle_fullscreen_mouse_event(&canvas, &press, 1_000, false);
@@ -488,7 +502,10 @@ fn test_terminal_set_clipboard_with_multiplexer_wraps_osc52() {
     stdout.buf.lock().unwrap().clear();
 
     terminal
-        .set_clipboard_with_multiplexer("copy", ClipboardMultiplexer::Tmux)
+        .submit_output_batch(vec![OutputMessage::StdoutClipboard(
+            "copy".into(),
+            ClipboardMultiplexer::Tmux,
+        )])
         .unwrap();
 
     let output = String::from_utf8(stdout.buf.lock().unwrap().clone()).unwrap();
@@ -1026,6 +1043,10 @@ fn new_fullscreen_term(
     prev_canvas_height: u16,
 ) -> StdTerminal<'static> {
     StdTerminal {
+        finished: false,
+        window_title: None,
+        title_saved: false,
+        handed_off: false,
         input_is_terminal: false,
         dest: TerminalWriter::ansi(Box::new(dest)),
         alt: Box::new(io::sink()),
@@ -1062,6 +1083,10 @@ fn new_inline_term_with_size(
     term_size: (u16, u16),
 ) -> StdTerminal<'static> {
     StdTerminal {
+        finished: false,
+        window_title: None,
+        title_saved: false,
+        handed_off: false,
         input_is_terminal: false,
         dest: TerminalWriter::ansi(Box::new(dest)),
         alt: Box::new(io::sink()),
@@ -2745,9 +2770,7 @@ fn test_set_keyboard_enhancement_flags() {
 
     // Active: swapping flags emits pop + push.
     term.keyboard.supported = true;
-    term.keyboard
-        .enable(&mut term.dest, term.fullscreen)
-        .unwrap();
+    term.keyboard.enable(&mut term.dest).unwrap();
     buf.lock().unwrap().clear();
     let new_flags = event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
     term.set_keyboard_enhancement_flags(new_flags).unwrap();
@@ -2772,9 +2795,7 @@ fn test_keyboard_enhancement_reassertion_pops_before_push() {
     let (dest, buf) = new_test_writer();
     let mut term = new_inline_term(dest, 0);
     term.keyboard.supported = true;
-    term.keyboard
-        .enable(&mut term.dest, term.fullscreen)
-        .unwrap();
+    term.keyboard.enable(&mut term.dest).unwrap();
     buf.lock().unwrap().clear();
     term.keyboard.flags = event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
 
@@ -2799,9 +2820,7 @@ fn test_stdin_resume_reasserts_keyboard_and_mouse_without_focus_clear() {
     let mut term = new_fullscreen_term(dest, 0, 0);
     term.raw_mode_enabled = true;
     term.keyboard.supported = true;
-    term.keyboard
-        .enable(&mut term.dest, term.fullscreen)
-        .unwrap();
+    term.keyboard.enable(&mut term.dest).unwrap();
     buf.lock().unwrap().clear();
     term.mouse_capture = true;
 
@@ -2870,7 +2889,8 @@ fn test_resize_event_triggers_terminal_mode_reassertion() {
         dest: io::sink(),
     };
     let mut term = Terminal {
-        inner: Box::new(inner),
+        appended_newline: None,
+        inner: OutputBackend::Direct(Box::new(inner)),
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
@@ -2921,7 +2941,8 @@ fn test_stdin_gap_reasserts_terminal_modes_like_cc_ink() {
         dest: io::sink(),
     };
     let mut term = Terminal {
-        inner: Box::new(inner),
+        appended_newline: None,
+        inner: OutputBackend::Direct(Box::new(inner)),
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
@@ -2975,7 +2996,8 @@ fn test_same_size_resize_event_is_ignored() {
         dest: io::sink(),
     };
     let mut term = Terminal {
-        inner: Box::new(inner),
+        appended_newline: None,
+        inner: OutputBackend::Direct(Box::new(inner)),
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
@@ -3152,7 +3174,8 @@ fn test_synchronized_update_wraps_clear_canvas_when_it_writes() {
     let (dest, buf) = new_test_writer();
     let inner = new_inline_term(dest, 1);
     let mut term = Terminal {
-        inner: Box::new(inner),
+        appended_newline: None,
+        inner: OutputBackend::Direct(Box::new(inner)),
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
@@ -3204,7 +3227,8 @@ fn test_synchronized_update_stays_lazy_for_identical_canvas_write() {
     let mut inner = new_inline_term_with_size(dest, canvas.height() as _, (10, 5));
     inner.prev_size_on_write = inner.size;
     let mut term = Terminal {
-        inner: Box::new(inner),
+        appended_newline: None,
+        inner: OutputBackend::Direct(Box::new(inner)),
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
@@ -3253,7 +3277,8 @@ fn test_synchronized_update_wraps_current_damage_canvas_write() {
     let mut inner = new_inline_term_with_size(dest, prev.height() as _, (10, 5));
     inner.prev_size_on_write = inner.size;
     let mut term = Terminal {
-        inner: Box::new(inner),
+        appended_newline: None,
+        inner: OutputBackend::Direct(Box::new(inner)),
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
@@ -3313,7 +3338,8 @@ fn test_synchronized_update_wraps_previous_damage_canvas_write() {
     let mut inner = new_inline_term_with_size(dest, prev.height() as _, (10, 5));
     inner.prev_size_on_write = inner.size;
     let mut term = Terminal {
-        inner: Box::new(inner),
+        appended_newline: None,
+        inner: OutputBackend::Direct(Box::new(inner)),
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
@@ -3370,7 +3396,8 @@ fn test_synchronized_update_stays_lazy_for_identical_fullscreen_canvas_write() {
     inner.size = Some((10, 2));
     inner.prev_size_on_write = Some((10, 2));
     let mut term = Terminal {
-        inner: Box::new(inner),
+        appended_newline: None,
+        inner: OutputBackend::Direct(Box::new(inner)),
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
@@ -3449,7 +3476,8 @@ fn test_synchronized_update_wraps_pending_wrap_resolution() {
     let mut inner = new_inline_term(dest, 1);
     inner.inline_pending_wrap = true;
     let mut term = Terminal {
-        inner: Box::new(inner),
+        appended_newline: None,
+        inner: OutputBackend::Direct(Box::new(inner)),
         output: Output::Stdout,
         base_fullscreen: false,
         event_stream: None,
@@ -3518,48 +3546,6 @@ fn test_synchronized_update_skips_markers_when_disabled() {
         output, "hello",
         "disabled marker policy should emit only the payload"
     );
-}
-
-/// The panic-restore registry must track live terminals and reset the fullscreen
-/// count as fullscreen terminals are dropped, so the hook does not leave the
-/// alternate screen when only inline terminals remain alive.
-#[test]
-fn test_panic_restore_registration_counts() {
-    // Snapshot the baseline: other tests may have live terminals.
-    let (baseline_live, baseline_fullscreen) = {
-        let state = PANIC_RESTORE_STATE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (state.live_terminals, state.fullscreen_terminals)
-    };
-
-    register_terminal_for_panic_restore(true);
-    register_terminal_for_panic_restore(false);
-    {
-        let state = PANIC_RESTORE_STATE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(state.live_terminals, baseline_live + 2);
-        assert_eq!(state.fullscreen_terminals, baseline_fullscreen + 1);
-    }
-
-    unregister_terminal_for_panic_restore(true);
-    {
-        let state = PANIC_RESTORE_STATE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(state.live_terminals, baseline_live + 1);
-        assert_eq!(state.fullscreen_terminals, baseline_fullscreen);
-    }
-
-    unregister_terminal_for_panic_restore(false);
-    if baseline_live == 0 {
-        let state = PANIC_RESTORE_STATE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(state.live_terminals, 0);
-        assert_eq!(state.fullscreen_terminals, 0);
-    }
 }
 
 /// After a resume from suspension, the terminal must forget everything it knew
@@ -3847,10 +3833,10 @@ fn run_main_screen_with_alternate(
             .boxed()
     };
     let (mut terminal, _output) = Terminal::mock(MockTerminalConfig::default());
-    terminal.inner = Box::new(ScriptedTerminal {
+    terminal.inner = OutputBackend::Direct(Box::new(ScriptedTerminal {
         inner: new_inline_term_with_size(dest, 0, size),
         events: Some(events),
-    });
+    }));
     smol::block_on(crate::render::terminal_render_loop(
         &mut element!(MainScreenWithAlternate),
         terminal,
@@ -4404,8 +4390,8 @@ fn test_inline_force_full_repaint_rewrites_reachable_rows_without_scrollback_cle
         "forced repaint should not clear or purge native scrollback when protected rows are unchanged: {diff:?}"
     );
     assert!(
-        !diff.contains("one"),
-        "the cursor-restore-scroll protected top row should be skipped rather than duplicated into scrollback: {diff:?}"
+        diff.contains("one"),
+        "an equal-height canvas keeps its first row reachable: {diff:?}"
     );
     assert!(
         diff.contains("two") && diff.contains("five"),
@@ -4894,11 +4880,7 @@ fn test_inline_diff_tall_canvas_visible_change() {
 }
 
 #[test]
-fn test_inline_diff_full_viewport_top_row_change_full_rewrite() {
-    // Mirrors Ink/log-update's cursorRestoreScroll guard. When the previous
-    // frame exactly filled the viewport, a cursor restore can push the top
-    // row into scrollback; changing that row should therefore reset instead
-    // of relying on a relative move to the viewport top.
+fn inline_full_viewport_top_row_change_preserves_scrollback() {
     let style = CanvasTextStyle::default();
     let mut prev = Canvas::new(10, 5);
     for i in 0..5 {
@@ -4911,7 +4893,7 @@ fn test_inline_diff_full_viewport_top_row_change_full_rewrite() {
         .set_text(0, 0, "TOP", style);
 
     let (diff, vt) = inline_diff_vt(&prev, &next, (10, 5));
-    assert_inline_full_reset(&diff, "full-viewport top-row rewrite");
+    assert!(!String::from_utf8_lossy(&diff).contains("\x1b[3J"));
     assert_eq!(vt.line(0).text(), "TOP0      ");
     assert_eq!(vt.line(4).text(), "row4      ");
 }
@@ -5039,9 +5021,7 @@ fn test_inline_automatic_full_rewrites_restore_geometry_for_follow_up_resets() {
     assert_inline_full_reset(&second_reset, "follow-up offscreen rewrite");
     assert_eq!(term.prev_size_on_write, term.size);
 
-    // The shrink-to-viewport branch has the same obligation. Its next
-    // full-viewport top-row change must retain enough geometry to choose the
-    // scrollback-purging reset again.
+    // Shrinking into the viewport restores a completely reachable baseline.
     let tall = tall_canvas(0, "row0");
     let mut fit = Canvas::new(10, 5);
     for y in 0..5 {
@@ -5063,7 +5043,8 @@ fn test_inline_automatic_full_rewrites_restore_geometry_for_follow_up_resets() {
     term.write_canvas(Some(&fit), &fit_changed, OutputContext::default())
         .unwrap();
     let second_reset = diff_buf.lock().unwrap().clone();
-    assert_inline_full_reset(&second_reset, "post-shrink full-viewport rewrite");
+    assert!(!String::from_utf8_lossy(&second_reset).contains("\x1b[3J"));
+    assert!(String::from_utf8_lossy(&second_reset).contains("TOP"));
     assert_eq!(term.prev_size_on_write, term.size);
 }
 

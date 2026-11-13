@@ -51,6 +51,8 @@ pub type ScrollbackReplay = Arc<dyn Fn(usize) -> Vec<crate::Canvas> + Send + Syn
 
 /// The system context, which is always available to all components.
 pub struct SystemContext {
+    pub(crate) image_scope: Option<crate::ImageScope>,
+    pub(crate) output: Option<crate::terminal::OutputSender>,
     should_exit: bool,
     mouse_capture: Option<bool>,
     keyboard_enhancement_flags: Option<crate::KeyboardEnhancementFlags>,
@@ -62,6 +64,8 @@ pub struct SystemContext {
 impl SystemContext {
     pub(crate) fn new() -> Self {
         Self {
+            image_scope: None,
+            output: None,
             should_exit: false,
             mouse_capture: None,
             keyboard_enhancement_flags: None,
@@ -95,6 +99,11 @@ impl SystemContext {
 
     pub(crate) fn begin_render_frame(&mut self) {
         self.alternate_screen = None;
+    }
+
+    /// Declares the image lifetime presented by this application, even in a text-only frame.
+    pub fn set_image_scope(&mut self, scope: Option<crate::ImageScope>) {
+        self.image_scope = scope;
     }
 
     /// Requests that the current render tree run inside the terminal's alternate screen.

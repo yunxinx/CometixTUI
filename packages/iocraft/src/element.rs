@@ -14,7 +14,7 @@ use std::{
     fmt::Debug,
     future::Future,
     hash::Hash,
-    io::{self, IsTerminal, LineWriter, Write, stderr, stdout},
+    io::{self, IsTerminal, Write, stderr, stdout},
     pin::Pin,
     sync::Arc,
 };
@@ -365,8 +365,9 @@ enum RenderLoopFutureState<'a, E: ElementExt> {
         ignore_ctrl_c: bool,
         suspend_on_ctrl_z: bool,
         output: Output,
-        stdout_writer: Option<Box<dyn Write + Send + 'a>>,
-        stderr_writer: Option<Box<dyn Write + Send + 'a>>,
+        capacity: crate::OutputCapacity,
+        stdout_writer: Option<Box<dyn Write + Send + 'static>>,
+        stderr_writer: Option<Box<dyn Write + Send + 'static>>,
         throttle: Option<std::time::Duration>,
         frame_profile: Option<FrameProfileCallback<'a>>,
         terminal_diff_planning: TerminalDiffPlanning,
@@ -401,6 +402,7 @@ impl<'a, E: ElementExt + 'a> RenderLoopFuture<'a, E> {
                 ignore_ctrl_c: false,
                 suspend_on_ctrl_z: false,
                 output: Output::default(),
+                capacity: crate::OutputCapacity::default(),
                 stdout_writer: None,
                 stderr_writer: None,
                 throttle: Some(FRAME_INTERVAL),
@@ -411,6 +413,18 @@ impl<'a, E: ElementExt + 'a> RenderLoopFuture<'a, E> {
                 element,
             },
         }
+    }
+
+    /// Supplies an already admitted output envelope from a shared resource budget.
+    /// Keep enough capacity for queued targets, both screen baselines and a completing frame.
+    pub fn output_capacity(mut self, capacity: crate::OutputCapacity) -> Self {
+        match &mut self.state {
+            RenderLoopFutureState::Init {
+                capacity: current, ..
+            } => *current = capacity,
+            _ => panic!("output capacity is configured before rendering"),
+        }
+        self
     }
 
     /// Caps the render rate at the given number of frames per second. High-frequency
@@ -631,7 +645,7 @@ impl<'a, E: ElementExt + 'a> RenderLoopFuture<'a, E> {
     /// Default: `std::io::stdout()`
     #[cfg(feature = "unstable-output-streams")]
     #[cfg_attr(docsrs, doc(cfg(feature = "unstable-output-streams")))]
-    pub fn stdout<W: Write + Send + 'a>(mut self, writer: W) -> Self {
+    pub fn stdout<W: Write + Send + 'static>(mut self, writer: W) -> Self {
         match &mut self.state {
             RenderLoopFutureState::Init { stdout_writer, .. } => {
                 *stdout_writer = Some(Box::new(writer));
@@ -648,7 +662,7 @@ impl<'a, E: ElementExt + 'a> RenderLoopFuture<'a, E> {
     /// Default: `LineWriter::new(std::io::stderr())`
     #[cfg(feature = "unstable-output-streams")]
     #[cfg_attr(docsrs, doc(cfg(feature = "unstable-output-streams")))]
-    pub fn stderr<W: Write + Send + 'a>(mut self, writer: W) -> Self {
+    pub fn stderr<W: Write + Send + 'static>(mut self, writer: W) -> Self {
         match &mut self.state {
             RenderLoopFutureState::Init { stderr_writer, .. } => {
                 *stderr_writer = Some(Box::new(writer));
@@ -705,6 +719,7 @@ impl<'a, E: ElementExt + Send + 'a> Future for RenderLoopFuture<'a, E> {
                         ignore_ctrl_c,
                         suspend_on_ctrl_z,
                         output,
+                        capacity,
                         stdout_writer,
                         stderr_writer,
                         throttle,
@@ -720,6 +735,7 @@ impl<'a, E: ElementExt + Send + 'a> Future for RenderLoopFuture<'a, E> {
                             ignore_ctrl_c,
                             suspend_on_ctrl_z,
                             output,
+                            capacity,
                             stdout_writer,
                             stderr_writer,
                             throttle,
@@ -734,6 +750,7 @@ impl<'a, E: ElementExt + Send + 'a> Future for RenderLoopFuture<'a, E> {
                             ignore_ctrl_c,
                             suspend_on_ctrl_z,
                             output,
+                            capacity,
                             stdout_writer,
                             stderr_writer,
                             throttle,
@@ -746,18 +763,27 @@ impl<'a, E: ElementExt + Send + 'a> Future for RenderLoopFuture<'a, E> {
                         _ => unreachable!(),
                     };
                     let effective_mouse_capture = mouse_capture.unwrap_or(fullscreen);
-                    let stdout_handle = stdout_writer.unwrap_or_else(|| Box::new(stdout()));
-                    // Unlike stdout, stderr is unbuffered by default in the standard library
-                    let stderr_handle =
-                        stderr_writer.unwrap_or_else(|| Box::new(LineWriter::new(stderr())));
+                    let stdout_handle = match stdout_writer
+                        .map_or_else(|| crate::terminal::system_output(false), Ok)
+                    {
+                        Ok(writer) => writer,
+                        Err(error) => return std::task::Poll::Ready(Err(error)),
+                    };
+                    let stderr_handle = match stderr_writer
+                        .map_or_else(|| crate::terminal::system_output(true), Ok)
+                    {
+                        Ok(writer) => writer,
+                        Err(error) => return std::task::Poll::Ready(Err(error)),
+                    };
 
-                    let mut terminal = match Terminal::new(
+                    let mut terminal = match Terminal::owned(
                         stdout_handle,
                         stderr_handle,
                         output,
                         fullscreen,
                         effective_mouse_capture,
                         input_stream.as_ref().map(|(_, supported)| *supported),
+                        capacity,
                     ) {
                         Ok(t) => t,
                         Err(e) => return std::task::Poll::Ready(Err(e)),

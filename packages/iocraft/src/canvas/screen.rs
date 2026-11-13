@@ -144,6 +144,8 @@ impl StyleOverlay {
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CanvasCell {
+    /// Image attachment whose wire representation is bound by the output owner.
+    pub image: Option<CanvasImageCell>,
     /// The background color of this cell, if set.
     pub background_color: Option<Color>,
     pub(super) character: Option<Character>,
@@ -153,6 +155,9 @@ pub struct CanvasCell {
 }
 
 fn clear_cell_width_relationship(row: &mut [CanvasCell], x: usize) {
+    if let Some(cell) = row.get_mut(x) {
+        cell.image = None;
+    }
     let Some(width) = row.get(x).map(|cell| cell.cell_width) else {
         return;
     };
@@ -200,7 +205,7 @@ impl CanvasCell {
 
     /// Returns `true` if the cell has no content and no background color.
     pub fn is_empty(&self) -> bool {
-        self.background_color.is_none() && self.character.is_none()
+        self.background_color.is_none() && self.character.is_none() && self.image.is_none()
     }
 
     fn is_row_trim_empty(&self, overlay: Option<&StyleOverlay>) -> bool {
@@ -242,6 +247,8 @@ impl CanvasCell {
 /// - When implementing unit tests for components, you may want to render to a `Canvas` for inspection.
 #[derive(Clone)]
 pub struct Canvas {
+    pub(crate) output_allocations: crate::terminal::OutputAllocations,
+    pub(super) image_scope: Option<ImageScope>,
     pub(super) width: usize,
     /// Rows are `Arc`-shared copy-on-write: blitting a full row from another
     /// canvas is a pointer clone, the blank-canvas constructor shares one
@@ -278,7 +285,8 @@ pub struct Canvas {
 
 impl PartialEq for Canvas {
     fn eq(&self, other: &Self) -> bool {
-        self.width == other.width
+        self.image_scope == other.image_scope
+            && self.width == other.width
             && self.cells.len() == other.cells.len()
             && self
                 .cells
@@ -447,6 +455,68 @@ pub struct CursorDeclaration {
 }
 
 impl Canvas {
+    pub(crate) fn output_metadata_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.cells.capacity() * size_of::<std::sync::Arc<Vec<CanvasCell>>>()
+            + self.overlays.capacity() * size_of::<std::sync::Arc<Vec<Option<StyleOverlay>>>>()
+            + self.no_select.capacity() * size_of::<std::sync::Arc<Vec<bool>>>()
+            + self.soft_wrap.capacity() * size_of::<usize>()
+            + self.dirty_rows.capacity()
+            + self.height() * 3 * size_of::<std::sync::Arc<crate::terminal::Allocation>>()
+    }
+
+    pub(crate) fn reserve_output(
+        &self,
+        memory: &std::sync::Arc<crate::terminal::OutputMemory>,
+        resolve_images: bool,
+    ) -> io::Result<crate::terminal::OutputAllocations> {
+        let mut allocations = crate::terminal::OutputAllocations::default();
+        allocations.reserve(memory, self.output_metadata_bytes())?;
+        let mut images = std::collections::HashSet::new();
+        let mut image_bytes = 0usize;
+        for row in &self.cells {
+            let bytes = cell_row_bytes(row);
+            if resolve_images && row.iter().any(|cell| cell.image.is_some()) {
+                allocations.reserve(memory, bytes + row.len() * 32)?;
+            } else {
+                allocations.shared(memory, (0, std::sync::Arc::as_ptr(row) as usize), bytes)?;
+            }
+            for cell in row.iter().filter_map(|cell| cell.image.as_ref()) {
+                if images.insert(std::sync::Arc::as_ptr(&cell.image.source) as *const () as usize) {
+                    image_bytes = image_bytes
+                        .checked_add(cell.image.source.encoded_png().len())
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::OutOfMemory,
+                                "image sources exceed output limits",
+                            )
+                        })?;
+                    if image_bytes > 64 * 1024 * 1024 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::OutOfMemory,
+                            "image sources exceed output limits",
+                        ));
+                    }
+                }
+            }
+        }
+        for row in &self.overlays {
+            allocations.shared(
+                memory,
+                (1, std::sync::Arc::as_ptr(row) as usize),
+                row.capacity() * size_of::<Option<StyleOverlay>>(),
+            )?;
+        }
+        for row in &self.no_select {
+            allocations.shared(
+                memory,
+                (2, std::sync::Arc::as_ptr(row) as usize),
+                row.capacity(),
+            )?;
+        }
+        Ok(allocations)
+    }
+
     /// Constructs a new canvas with the given dimensions.
     pub fn new(width: usize, height: usize) -> Self {
         let blank_row = std::sync::Arc::new(vec![CanvasCell::default(); width]);
@@ -454,6 +524,8 @@ impl Canvas {
         let blank_no_select = Self::blank_no_select_row(width);
         Self {
             width,
+            output_allocations: Default::default(),
+            image_scope: None,
             cells: vec![blank_row; height],
             overlays: vec![blank_overlays; height],
             no_select: vec![blank_no_select; height],
@@ -1125,6 +1197,7 @@ impl Canvas {
         let copy_width = width.min(self.width - x);
         let copy_height = height.min(self.height() - y);
         let mut out = Canvas::new(copy_width, copy_height);
+        out.image_scope = self.image_scope.clone();
         out.subview_mut(0, 0, 0, 0, copy_width, copy_height)
             .blit_region_from(self, 0, 0, x, y, copy_width, copy_height);
         out.clear_damage();
@@ -2144,4 +2217,16 @@ impl Canvas {
 
         Some(start.min(self.width))
     }
+}
+
+fn cell_row_bytes(row: &Vec<CanvasCell>) -> usize {
+    row.capacity() * size_of::<CanvasCell>()
+        + row
+            .iter()
+            .filter_map(|cell| cell.character.as_ref())
+            .map(|character| {
+                character.value.capacity()
+                    + character.hyperlink.as_ref().map_or(0, String::capacity)
+            })
+            .sum::<usize>()
 }

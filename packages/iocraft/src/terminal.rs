@@ -8,7 +8,7 @@ use crate::{
     element::Output,
 };
 use crossterm::{
-    QueueableCommand, cursor,
+    cursor,
     event::{self, Event, EventStream},
     terminal,
 };
@@ -40,11 +40,26 @@ const STDIN_RESUME_GAP: Duration = Duration::from_secs(5);
 mod backend;
 mod capability;
 mod command;
+mod commit;
+mod draft;
+mod memory;
+pub(crate) use commit::OutputSender;
+use commit::{Operation, OutputSession};
+pub use draft::*;
+pub use memory::OutputCapacity;
+pub(crate) use memory::{Allocation, OutputAllocations, OutputMemory};
+mod session;
+pub use session::*;
 mod events;
 mod fullscreen;
+mod graphics;
 mod input;
 mod keyboard;
 mod log_update;
+mod platform;
+mod print;
+pub(crate) use platform::system_output;
+pub(crate) use print::OutputMessage;
 mod mock;
 mod query;
 mod scroll_hint;
@@ -52,10 +67,7 @@ mod synchronized;
 use synchronized::{OutputContext, OutputWriter, SynchronizedOutput};
 
 #[cfg(test)]
-use backend::{
-    PANIC_RESTORE_STATE, clear_canvas_inline, register_terminal_for_panic_restore,
-    unregister_terminal_for_panic_restore,
-};
+use backend::clear_canvas_inline;
 use backend::{ScreenTransition, ScreenTransitionPlan, StdTerminal, TerminalImpl};
 pub use capability::*;
 #[cfg(test)]
@@ -273,8 +285,77 @@ impl SelectionController {
     }
 }
 
+enum OutputBackend<'a> {
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "Physical backends are exercised directly by unit tests; runtime output uses the session owner"
+        )
+    )]
+    Direct(Box<dyn TerminalImpl + 'a>),
+    Worker(OutputSession),
+}
+
+impl<'a> std::ops::Deref for OutputBackend<'a> {
+    type Target = dyn TerminalImpl + 'a;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Direct(backend) => backend.as_ref(),
+            Self::Worker(_) => panic!("physical output belongs to its worker"),
+        }
+    }
+}
+
+impl std::ops::DerefMut for OutputBackend<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Direct(backend) => backend.as_mut(),
+            Self::Worker(_) => panic!("physical output belongs to its worker"),
+        }
+    }
+}
+
+impl OutputBackend<'_> {
+    fn poll_output_or_resume(&mut self, context: &mut Context<'_>) -> Poll<()> {
+        match self {
+            Self::Worker(output) => output.poll_output_or_resume(context),
+            Self::Direct(backend) => backend.poll_resumed(context),
+        }
+    }
+}
+
+struct QueuedWriter<'a, 'b> {
+    terminal: &'a mut Terminal<'b>,
+    render_destination: bool,
+}
+
+impl Write for QueuedWriter<'_, '_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let OutputBackend::Worker(output) = &mut self.terminal.inner {
+            output.enqueue(Operation::Bytes(bytes.to_vec(), self.render_destination))?;
+            Ok(bytes.len())
+        } else {
+            self.terminal
+                .direct_output_writer(self.render_destination)
+                .write(bytes)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let OutputBackend::Worker(output) = &mut self.terminal.inner {
+            output.enqueue(Operation::Flush(self.render_destination))
+        } else {
+            self.terminal
+                .direct_output_writer(self.render_destination)
+                .flush()
+        }
+    }
+}
+
 pub(crate) struct Terminal<'a> {
-    inner: Box<dyn TerminalImpl + 'a>,
+    appended_newline: Option<u16>,
+    inner: OutputBackend<'a>,
     output: Output,
     base_fullscreen: bool,
     // Input batching can observe EOF before wait() reports it to the render loop.
@@ -320,6 +401,7 @@ impl Wake for EventStreamWake {
 }
 
 impl<'a> Terminal<'a> {
+    #[cfg(test)]
     pub fn new(
         stdout: Box<dyn Write + Send + 'a>,
         stderr: Box<dyn Write + Send + 'a>,
@@ -333,14 +415,20 @@ impl<'a> Terminal<'a> {
             Output::Stdout => (stdout, stderr),
             Output::Stderr => (stderr, stdout),
         };
-        Ok(Self {
-            inner: Box::new(StdTerminal::new(
-                dest,
-                alt,
-                fullscreen,
-                mouse_capture,
-                keyboard_support,
-            )?),
+        let inner = OutputBackend::Direct(Box::new(StdTerminal::new(
+            dest,
+            alt,
+            fullscreen,
+            mouse_capture,
+            keyboard_support,
+        )?));
+        Ok(Self::with_backend(inner, output, fullscreen))
+    }
+
+    fn with_backend(inner: OutputBackend<'a>, output: Output, fullscreen: bool) -> Self {
+        Self {
+            appended_newline: None,
+            inner,
             output,
             base_fullscreen: fullscreen,
             event_stream: None,
@@ -362,14 +450,35 @@ impl<'a> Terminal<'a> {
             input_backend: TerminalInputBackend::Crossterm,
             raw_input_session_request: None,
             synchronized_output: SynchronizedOutput::new(is_synchronized_output_supported()),
-        })
+        }
     }
 
     pub fn enable_mouse_capture(&mut self) -> io::Result<()> {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            return output.enqueue(Operation::Mouse(true));
+        }
         self.inner.set_mouse_capture(true)
     }
 
+    pub(crate) fn submit_output_batch(&mut self, messages: Vec<OutputMessage>) -> io::Result<()> {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            return output.enqueue(Operation::PrintBatch(messages, self.output));
+        }
+        if messages.iter().any(OutputMessage::affects_visible_output) {
+            self.ensure_synchronized_update_started()?;
+        }
+        print::write_batch(
+            &mut *self.inner,
+            self.output,
+            &mut self.appended_newline,
+            messages,
+        )
+    }
+
     pub fn disable_mouse_capture(&mut self) -> io::Result<()> {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            return output.enqueue(Operation::Mouse(false));
+        }
         self.inner.set_mouse_capture(false)
     }
 
@@ -377,6 +486,9 @@ impl<'a> Terminal<'a> {
         &mut self,
         flags: event::KeyboardEnhancementFlags,
     ) -> io::Result<()> {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            return output.enqueue(Operation::Keyboard(flags));
+        }
         self.inner.set_keyboard_enhancement_flags(flags)
     }
 
@@ -393,14 +505,24 @@ impl<'a> Terminal<'a> {
     }
 
     pub fn is_raw_mode_supported(&self) -> bool {
+        if let OutputBackend::Worker(output) = &self.inner {
+            return output.raw_mode_supported;
+        }
         self.inner.is_raw_mode_supported()
     }
 
     pub fn is_raw_mode_enabled(&self) -> bool {
+        if let OutputBackend::Worker(output) = &self.inner {
+            return output.raw_mode;
+        }
         self.inner.is_raw_mode_enabled()
     }
 
     pub fn set_raw_mode_enabled(&mut self, raw_mode_enabled: bool) -> io::Result<()> {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            output.raw_mode = raw_mode_enabled;
+            return output.enqueue(Operation::RawMode(raw_mode_enabled));
+        }
         self.inner.set_raw_mode_enabled(raw_mode_enabled)
     }
 
@@ -428,6 +550,9 @@ impl<'a> Terminal<'a> {
     }
 
     pub fn is_fullscreen(&self) -> bool {
+        if let OutputBackend::Worker(output) = &self.inner {
+            return output.base_fullscreen || output.screen.is_some();
+        }
         self.inner.is_fullscreen()
     }
 
@@ -438,6 +563,11 @@ impl<'a> Terminal<'a> {
         if self.base_fullscreen {
             return Ok(false);
         }
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            let changed = output.screen.is_some() != request.is_some();
+            output.screen = request;
+            return Ok(changed);
+        }
         let plan = self.inner.plan_screen_transition(request);
         if plan.writes_output {
             self.ensure_synchronized_update_started()?;
@@ -446,10 +576,19 @@ impl<'a> Terminal<'a> {
     }
 
     pub fn refresh_size(&mut self) {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            if !output.mock {
+                output.size = terminal::size().ok();
+            }
+            return;
+        }
         self.inner.refresh_size()
     }
 
     pub fn size(&self) -> Option<(u16, u16)> {
+        if let OutputBackend::Worker(output) = &self.inner {
+            return output.size;
+        }
         self.inner.size()
     }
 
@@ -458,6 +597,9 @@ impl<'a> Terminal<'a> {
     }
 
     pub fn clear_canvas(&mut self) -> io::Result<()> {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            return output.enqueue(Operation::ClearCanvas);
+        }
         if self.inner.clear_canvas_would_write() {
             self.ensure_synchronized_update_started()?;
         }
@@ -465,11 +607,17 @@ impl<'a> Terminal<'a> {
     }
 
     pub fn clear_screen(&mut self) -> io::Result<()> {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            return output.enqueue(Operation::ClearScreen);
+        }
         self.ensure_synchronized_update_started()?;
         self.inner.clear_screen()
     }
 
     pub fn clear_terminal(&mut self) -> io::Result<()> {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            return output.enqueue(Operation::ClearTerminal);
+        }
         self.ensure_synchronized_update_started()?;
         self.inner.clear_terminal()
     }
@@ -484,6 +632,10 @@ impl<'a> Terminal<'a> {
     }
 
     pub(crate) fn set_scrollback_replay(&mut self, replay: Option<ScrollbackReplay>) {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            output.replay = replay;
+            return;
+        }
         self.inner.set_scrollback_replay(replay);
     }
 
@@ -493,6 +645,9 @@ impl<'a> Terminal<'a> {
         &mut self,
         prev: &Canvas,
     ) -> io::Result<()> {
+        if matches!(self.inner, OutputBackend::Worker(_)) {
+            return Ok(());
+        }
         if !self.inner.restore_inline_rows_would_write() {
             return Ok(());
         }
@@ -503,14 +658,24 @@ impl<'a> Terminal<'a> {
     pub(crate) fn write_canvas_after_repaint_check(
         &mut self,
         prev: Option<&Canvas>,
-        canvas: &Canvas,
-    ) -> io::Result<()> {
+        draft: FrameDraft,
+    ) -> io::Result<bool> {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            return output.enqueue_frame(Operation::Frame {
+                draft: Box::new(draft),
+                size: output.size,
+                screen: output.screen,
+                replay: output.replay.clone(),
+                receipt: None,
+            });
+        }
         // The render loop has already classified this frame as a repaint. Avoid
         // running the terminal backend's preflight row scan only to repeat the
         // same retained-canvas scan inside write_canvas().
         self.ensure_synchronized_update_started()?;
         self.inner
-            .write_canvas(prev, canvas, self.synchronized_output.context())
+            .write_canvas(prev, &draft.canvas, self.synchronized_output.context())
+            .map(|()| true)
     }
 
     /// Updates the retained screen-buffer metadata used to annotate mouse events
@@ -523,6 +688,9 @@ impl<'a> Terminal<'a> {
     /// session it was a quarter of every frame spent on events that could
     /// not arrive.
     pub fn set_event_cell_snapshot(&mut self, canvas: &Canvas) {
+        if matches!(self.inner, OutputBackend::Worker(_)) {
+            return;
+        }
         if !self.inner.mouse_events_possible() {
             self.event_cell_snapshot = None;
             return;
@@ -540,6 +708,7 @@ impl<'a> Terminal<'a> {
         snapshot: Option<&EventCellSnapshot>,
     ) -> TerminalEvent {
         if let TerminalEvent::FullscreenMouse(mouse) = &mut event {
+            mouse.frame = snapshot.and_then(|snapshot| snapshot.frame.clone());
             mouse.cell_is_blank = snapshot
                 .map(|snapshot| snapshot.cell_is_blank(mouse.column, mouse.row))
                 .unwrap_or(false);
@@ -553,43 +722,13 @@ impl<'a> Terminal<'a> {
         &mut self,
         declaration: Option<crate::canvas::CursorDeclaration>,
     ) -> io::Result<()> {
+        if matches!(self.inner, OutputBackend::Worker(_)) {
+            return Ok(());
+        }
         if self.inner.position_cursor_would_write(declaration) {
             self.ensure_synchronized_update_started()?;
         }
         self.inner.position_cursor(declaration)
-    }
-
-    /// Writes a raw OSC 52 clipboard sequence to the terminal.
-    ///
-    /// This is intentionally outside synchronized-update framing: it is not a
-    /// screen repaint and mirrors CC Ink's selection-copy path, which writes the
-    /// clipboard escape sequence directly to stdout after extracting selected
-    /// text. Clipboard transport fallbacks such as tmux buffers or native tools
-    /// remain application-level policy.
-    ///
-    /// Like [`Self::write_control_sequence`], the bytes are flushed at once so
-    /// the copy lands even when no repaint follows.
-    pub fn set_clipboard(&mut self, text: &str) -> io::Result<()> {
-        let dest = self.inner.dest();
-        crate::ansi::osc52_clipboard(dest, text)?;
-        dest.flush()
-    }
-
-    /// Writes an OSC 52 clipboard sequence using an explicit multiplexer
-    /// passthrough wrapper. This mirrors CC Ink's tmux/screen passthrough
-    /// helpers; native clipboard and tmux-buffer loading remain app policy.
-    pub fn set_clipboard_with_multiplexer(
-        &mut self,
-        text: &str,
-        multiplexer: ClipboardMultiplexer,
-    ) -> io::Result<()> {
-        if multiplexer == ClipboardMultiplexer::None {
-            self.set_clipboard(text)
-        } else {
-            let dest = self.inner.dest();
-            crate::ansi::osc52_clipboard_for_multiplexer(dest, text, multiplexer.into())?;
-            dest.flush()
-        }
     }
 
     /// Writes a raw non-visual terminal control sequence directly to stdout.
@@ -598,6 +737,9 @@ impl<'a> Terminal<'a> {
     /// canvas clearing, matching CC Ink's TerminalWriteProvider side channel for
     /// OSC notifications, terminal progress, and BEL-like controls.
     pub fn write_control_sequence(&mut self, sequence: &str) -> io::Result<()> {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            return output.enqueue(Operation::Control(sequence.to_owned(), None));
+        }
         self.inner.write_control_sequence(sequence)
     }
 
@@ -608,6 +750,9 @@ impl<'a> Terminal<'a> {
     /// deliver it: OSC 0 on Unix-likes, and crossterm's `SetTitle` on Windows so
     /// legacy conhost without VT support still receives `SetConsoleTitleW`.
     pub fn set_title(&mut self, title: &str) -> io::Result<()> {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            return output.enqueue(Operation::Title(title.to_owned()));
+        }
         self.inner.set_title(title)
     }
 
@@ -685,12 +830,18 @@ impl<'a> Terminal<'a> {
     /// (SIGCONT) since the last call. The render loop uses this to trigger a full
     /// terminal reinitialization and redraw.
     pub fn take_resumed(&mut self) -> bool {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            return output.take_resumed();
+        }
         self.inner.take_resumed()
     }
 
     /// Re-applies terminal modes and resets cached output state after a resume from
     /// suspension. See [`TerminalImpl::reinitialize_after_resume`].
     pub fn reinitialize_after_resume(&mut self) -> io::Result<()> {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            return output.resume();
+        }
         self.inner.reinitialize_after_resume()
     }
 
@@ -699,50 +850,68 @@ impl<'a> Terminal<'a> {
     /// reader while the terminal is handed off; it is recreated by
     /// [`Terminal::reacquire_terminal`]. Caller-owned streams retain their buffered
     /// events and are not polled until the handoff finishes.
-    pub fn release_terminal(&mut self) -> io::Result<()> {
+    pub async fn release_terminal(&mut self) -> io::Result<()> {
         if !self.caller_input_stream {
             self.event_stream = None;
+        }
+        self.query_queue.clear();
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            let (sender, receiver) = oneshot::channel();
+            output.enqueue(Operation::Release(sender))?;
+            return receiver
+                .await
+                .map_err(|_| io::Error::other("terminal release failed"))?;
         }
         self.inner.release_terminal_modes()
     }
 
     /// Restores terminal modes and the input event stream after
     /// [`Terminal::release_terminal`].
-    pub fn reacquire_terminal(&mut self) -> io::Result<()> {
-        self.inner.reacquire_terminal_modes()?;
+    pub async fn reacquire_terminal(&mut self) -> io::Result<()> {
+        if let OutputBackend::Worker(output) = &mut self.inner {
+            let (sender, receiver) = oneshot::channel();
+            output.enqueue(Operation::Reacquire(sender))?;
+            receiver
+                .await
+                .map_err(|_| io::Error::other("terminal reacquire failed"))??;
+        } else {
+            self.inner.reacquire_terminal_modes()?;
+        }
         self.start_event_stream()
     }
 
-    /// Borrows stdout, starting synchronization only when bytes are written.
-    pub fn stdout(&mut self) -> impl Write + '_ {
-        let render_destination = matches!(self.output, Output::Stdout);
-        self.output_writer(render_destination)
+    fn output_writer(&mut self, render_destination: bool) -> QueuedWriter<'_, 'a> {
+        if matches!(self.inner, OutputBackend::Worker(_)) {
+            return QueuedWriter {
+                terminal: self,
+                render_destination,
+            };
+        }
+        QueuedWriter {
+            terminal: self,
+            render_destination,
+        }
     }
 
-    /// Borrows stderr, starting synchronization only when bytes are written.
-    pub fn stderr(&mut self) -> impl Write + '_ {
-        let render_destination = matches!(self.output, Output::Stderr);
-        self.output_writer(render_destination)
-    }
-
-    /// Borrows the configured render destination.
-    pub fn render_output(&mut self) -> impl Write + '_ {
-        self.output_writer(true)
-    }
-
-    fn output_writer(&mut self, render_destination: bool) -> OutputWriter<'_> {
+    fn direct_output_writer(&mut self, render_destination: bool) -> OutputWriter<'_> {
         OutputWriter {
             synchronization: &mut self.synchronized_output,
-            backend: self.inner.as_mut(),
+            backend: &mut *self.inner,
             render_destination,
         }
     }
 
     fn ensure_synchronized_update_started(&mut self) -> io::Result<()> {
+        if matches!(self.inner, OutputBackend::Worker(_)) {
+            return Ok(());
+        }
         self.synchronized_output.start(self.inner.dest())
     }
 
     fn end_synchronized_update(&mut self) -> io::Result<()> {
+        if matches!(self.inner, OutputBackend::Worker(_)) {
+            return Ok(());
+        }
         self.synchronized_output.leave(self.inner.dest())
     }
 
@@ -764,7 +933,7 @@ impl<'a> Terminal<'a> {
         &mut self,
         stream: BoxStream<'static, io::Result<TerminalEvent>>,
     ) -> io::Result<()> {
-        self.inner.set_raw_mode_enabled(true)?;
+        self.set_raw_mode_enabled(true)?;
         self.event_stream = Some(stream.fuse());
         self.caller_input_stream = true;
         Ok(())
@@ -774,7 +943,16 @@ impl<'a> Terminal<'a> {
         if self.event_stream.is_none() {
             match self.input_backend {
                 TerminalInputBackend::Crossterm => {
-                    self.event_stream = Some(self.inner.event_stream()?.fuse());
+                    if matches!(self.inner, OutputBackend::Worker(_)) {
+                        if stdin().is_terminal() {
+                            self.set_raw_mode_enabled(true)?;
+                            self.event_stream = Some(backend::crossterm_event_stream().fuse());
+                        } else {
+                            self.event_stream = Some(stream::pending().boxed().fuse());
+                        }
+                    } else {
+                        self.event_stream = Some(self.inner.event_stream()?.fuse());
+                    }
                 }
                 TerminalInputBackend::RawInput(options) => {
                     self.raw_input_session_request = Some(options);
@@ -845,8 +1023,10 @@ impl<'a> Terminal<'a> {
 
     async fn wait_for_event(&mut self, defer_input: bool) -> io::Result<bool> {
         use futures::future::{Either, poll_fn, select};
+        if let OutputBackend::Worker(output) = &self.inner {
+            output.check()?;
+        }
 
-        let event_cell_snapshot = self.event_cell_snapshot.clone();
         loop {
             // Race the next terminal event against the resume (SIGCONT) signal so
             // the render loop wakes immediately when the process is foregrounded,
@@ -856,7 +1036,7 @@ impl<'a> Terminal<'a> {
                 Some(event)
             } else {
                 let Some(event_stream) = self.event_stream.as_mut() else {
-                    poll_fn(|cx| inner.poll_resumed(cx)).await;
+                    poll_fn(|cx| inner.poll_output_or_resume(cx)).await;
                     return Ok(false);
                 };
                 let event_stream_wake = self.event_stream_wake.clone();
@@ -866,9 +1046,14 @@ impl<'a> Terminal<'a> {
                     let mut stream_context = Context::from_waker(&stream_waker);
                     event_stream.poll_next_unpin(&mut stream_context)
                 });
-                match select(next_event, poll_fn(|cx| inner.poll_resumed(cx))).await {
+                match select(next_event, poll_fn(|cx| inner.poll_output_or_resume(cx))).await {
                     Either::Left((next, _)) => next,
-                    Either::Right(((), _)) => return Ok(false),
+                    Either::Right(((), _)) => {
+                        if let OutputBackend::Worker(output) = &self.inner {
+                            output.check()?;
+                        }
+                        return Ok(false);
+                    }
                 }
             };
             let Some(event) = next else {
@@ -896,7 +1081,10 @@ impl<'a> Terminal<'a> {
                 .last_stdin_event_at
                 .is_some_and(|last| now.duration_since(last) > STDIN_RESUME_GAP)
             {
-                let _ = self.inner.reassert_after_stdin_resume();
+                match &mut self.inner {
+                    OutputBackend::Worker(output) => output.enqueue(Operation::StdinResume)?,
+                    inner => inner.reassert_after_stdin_resume()?,
+                }
             }
             self.last_stdin_event_at = Some(now);
             let is_ctrl_c = matches!(
@@ -915,7 +1103,10 @@ impl<'a> Terminal<'a> {
                 // let the SIGCONT repair path repaint from a clean slate
                 // after `fg`. Generic iocraft apps receive Ctrl+Z as normal
                 // input unless they explicitly enable this policy.
-                let _ = self.inner.suspend();
+                match &mut self.inner {
+                    OutputBackend::Worker(output) => output.enqueue(Operation::Suspend)?,
+                    inner => inner.suspend()?,
+                }
                 return Ok(false);
             }
             match &event {
@@ -949,15 +1140,33 @@ impl<'a> Terminal<'a> {
                 matches!(event, TerminalEvent::Key(_) | TerminalEvent::Paste(_));
             if let TerminalEvent::Resize(width, height) = &event {
                 let next_size = (*width, *height);
-                if self.inner.size() == Some(next_size) {
+                if self.size() == Some(next_size) {
                     // Match CC Ink's resize handler: same-dimension resize
                     // events are terminal-settling noise. Do not wake the
                     // render loop or reset/reassert modes redundantly.
                     continue;
                 }
-                self.inner.set_size_from_resize_event(*width, *height);
+                match &mut self.inner {
+                    OutputBackend::Worker(output) => {
+                        output.size = Some(next_size);
+                        output.enqueue(Operation::Resize)?;
+                    }
+                    inner => {
+                        inner.set_size_from_resize_event(*width, *height);
+                        inner.reassert_after_resize()?;
+                    }
+                }
                 self.resized = true;
-                let _ = self.inner.reassert_after_resize();
+            }
+            let event_cell_snapshot = match &self.inner {
+                OutputBackend::Worker(output) => output.snapshot(),
+                _ => self.event_cell_snapshot.clone(),
+            };
+            if matches!(self.inner, OutputBackend::Worker(_))
+                && event_cell_snapshot.is_none()
+                && matches!(event, TerminalEvent::FullscreenMouse(_))
+            {
+                continue;
             }
             let event = Self::annotate_terminal_event(event, event_cell_snapshot.as_ref());
 
@@ -1014,6 +1223,42 @@ impl<'a> Terminal<'a> {
         (delivered, shared_state)
     }
 
+    pub(crate) fn output_sender(&self) -> Option<OutputSender> {
+        match &self.inner {
+            OutputBackend::Worker(output) => Some(output.sender()),
+            OutputBackend::Direct(_) => None,
+        }
+    }
+
+    pub(crate) fn take_output_clear(&mut self) -> bool {
+        match &mut self.inner {
+            OutputBackend::Worker(output) => output.take_visual_change(),
+            OutputBackend::Direct(_) => false,
+        }
+    }
+
+    pub(crate) async fn settle_mock_output(&mut self) -> io::Result<()> {
+        if let OutputBackend::Worker(output) = &mut self.inner
+            && output.mock
+        {
+            let (sender, receiver) = oneshot::channel();
+            output.enqueue(Operation::Barrier(sender))?;
+            receiver
+                .await
+                .map_err(|_| io::Error::other("mock output stopped"))??;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn finish(&mut self) -> io::Result<()> {
+        self.event_stream = None;
+        self.query_queue.clear();
+        match &mut self.inner {
+            OutputBackend::Worker(output) => output.finish().await,
+            inner => inner.flush(),
+        }
+    }
+
     pub fn events(&mut self) -> io::Result<TerminalEvents> {
         self.start_event_stream()?;
         let shared = Arc::new(TerminalEventsShared::new());
@@ -1023,6 +1268,63 @@ impl<'a> Terminal<'a> {
 }
 
 impl Terminal<'static> {
+    pub(crate) fn owned(
+        stdout: Box<dyn Write + Send>,
+        stderr: Box<dyn Write + Send>,
+        output: Output,
+        fullscreen: bool,
+        mouse_capture: bool,
+        keyboard_support: Option<bool>,
+        capacity: OutputCapacity,
+    ) -> io::Result<Self> {
+        let (destination, alternate) = match output {
+            Output::Stdout => (stdout, stderr),
+            Output::Stderr => (stderr, stdout),
+        };
+        let session = OutputSession::with_capacity(
+            destination,
+            alternate,
+            fullscreen,
+            mouse_capture,
+            keyboard_support,
+            output,
+            capacity,
+        )?;
+        Ok(Self::with_backend(
+            OutputBackend::Worker(session),
+            output,
+            fullscreen,
+        ))
+    }
+
+    pub(crate) fn mock_owned(mut config: MockTerminalConfig) -> (Self, MockTerminalOutputStream) {
+        let ignore_ctrl_c = config.ignore_ctrl_c;
+        let suspend_on_ctrl_z = config.suspend_on_ctrl_z;
+        let planning = config.canvas_diff_planning;
+        let input_backend = config.input_backend;
+        let stream = config.input_stream.take();
+        let caller_input_stream = stream.is_some();
+        let (mut backend, output) = MockTerminal::new(config);
+        let fullscreen = backend.is_fullscreen();
+        let input = stream.unwrap_or_else(|| {
+            backend
+                .event_stream()
+                .expect("mock input stream is available")
+        });
+        let session =
+            OutputSession::mock(backend, Output::Stdout).expect("mock output worker starts");
+        let mut terminal =
+            Self::with_backend(OutputBackend::Worker(session), Output::Stdout, fullscreen);
+        terminal.event_stream = Some(input.fuse());
+        terminal.caller_input_stream = caller_input_stream;
+        terminal.ignore_ctrl_c = ignore_ctrl_c;
+        terminal.suspend_on_ctrl_z = suspend_on_ctrl_z;
+        terminal.canvas_diff_planning = planning;
+        terminal.input_backend = input_backend;
+        (terminal, output)
+    }
+
+    #[cfg(test)]
     pub fn mock(mut config: MockTerminalConfig) -> (Self, MockTerminalOutputStream) {
         let ignore_ctrl_c = config.ignore_ctrl_c;
         let suspend_on_ctrl_z = config.suspend_on_ctrl_z;
@@ -1034,7 +1336,8 @@ impl Terminal<'static> {
         let base_fullscreen = term.fullscreen;
         (
             Self {
-                inner: Box::new(term),
+                appended_newline: None,
+                inner: OutputBackend::Direct(Box::new(term)),
                 output: Output::Stdout,
                 base_fullscreen,
                 event_stream: input_stream.map(StreamExt::fuse),
@@ -1074,11 +1377,11 @@ impl Write for Terminal<'_> {
         if !buf.is_empty() {
             self.ensure_synchronized_update_started()?;
         }
-        self.inner.write(buf)
+        self.output_writer(true).write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        self.output_writer(true).flush()
     }
 }
 
@@ -1090,7 +1393,9 @@ pub(crate) struct SynchronizedUpdate<'a, 'b> {
 
 impl<'a, 'b> SynchronizedUpdate<'a, 'b> {
     pub fn begin(terminal: &'a mut Terminal<'b>) -> Self {
-        terminal.synchronized_output.enter();
+        if matches!(terminal.inner, OutputBackend::Direct(_)) {
+            terminal.synchronized_output.enter();
+        }
         Self {
             inner: Some(terminal),
         }

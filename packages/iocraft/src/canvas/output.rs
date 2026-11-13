@@ -21,6 +21,43 @@ struct ClipBounds {
 }
 
 impl CanvasSubviewMut<'_> {
+    /// Draws an image attachment, preserving its original coordinates through clipping and blits.
+    pub fn set_image(&mut self, x: isize, y: isize, image: &CanvasImage) {
+        self.set_image_with_link(x, y, image, None);
+    }
+
+    /// Draws an image whose visible cells carry a hyperlink.
+    pub fn set_image_with_link(
+        &mut self,
+        x: isize,
+        y: isize,
+        image: &CanvasImage,
+        hyperlink: Option<&str>,
+    ) {
+        let (left, top, width, height) =
+            self.clipped_rect(x, y, image.columns.into(), image.rows.into());
+        let source_left = self.x as i128 + x as i128;
+        let source_top = self.y as i128 + y as i128;
+        for row in top..top + height {
+            for column in left..left + width {
+                self.canvas.clear_region(column, row, 1, 1);
+                self.canvas.cells_row_mut(row)[column].image = Some(CanvasImageCell {
+                    image: image.clone(),
+                    column: (column as i128 - source_left) as u16,
+                    row: (row as i128 - source_top) as u16,
+                });
+                if let Some(hyperlink) = hyperlink {
+                    self.canvas.cells_row_mut(row)[column].character = Some(Character {
+                        value: " ".into(),
+                        style: CanvasTextStyle::default(),
+                        hyperlink: Some(hyperlink.into()),
+                    });
+                }
+            }
+        }
+        self.canvas.mark_rows_written_range(top, top + height);
+    }
+
     // A clip can extend beyond isize even though its intersection fits on the canvas.
     fn clip_bounds(&self) -> ClipBounds {
         let width = self.canvas.width() as i128;

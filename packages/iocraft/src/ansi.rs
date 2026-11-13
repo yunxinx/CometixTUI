@@ -435,40 +435,37 @@ pub(crate) fn sanitize_osc_payload(text: &str) -> String {
         .collect()
 }
 
-/// Builds a raw OSC 52 clipboard-write sequence for the system clipboard.
-///
-/// This is the Rust terminal-output counterpart to CC Ink's `setClipboard` raw
-/// sequence (`ESC ] 52 ; c ; <base64> BEL`). Multiplexer/native-clipboard
-/// transports are owned by the shared Clipboard service; this helper also
-/// preserves the legacy raw OSC path when no service is provided.
-pub(crate) fn osc52_clipboard_sequence(text: &str) -> String {
-    osc52_clipboard_sequence_with_kitty(text, false)
-}
-
-/// Clipboard callers supply the resolved terminal identity; tmux inner OSC
-/// intentionally retains BEL regardless of the outer terminal.
-pub(crate) fn osc52_clipboard_sequence_with_kitty(text: &str, is_kitty: bool) -> String {
-    let terminator = if is_kitty { "\x1b\\" } else { "\x07" };
-    format!("\x1b]52;c;{}{terminator}", base64_encode(text.as_bytes()))
-}
-
-pub(crate) fn osc52_clipboard_sequence_for_multiplexer(
-    text: &str,
-    multiplexer: MultiplexerPassthrough,
-) -> String {
-    wrap_for_multiplexer_sequence(&osc52_clipboard_sequence(text), multiplexer)
-}
-
-pub(crate) fn osc52_clipboard(w: &mut (impl Write + ?Sized), text: &str) -> io::Result<()> {
-    w.write_all(osc52_clipboard_sequence(text).as_bytes())
-}
-
 pub(crate) fn osc52_clipboard_for_multiplexer(
-    w: &mut (impl Write + ?Sized),
+    output: &mut (impl Write + ?Sized),
     text: &str,
     multiplexer: MultiplexerPassthrough,
 ) -> io::Result<()> {
-    w.write_all(osc52_clipboard_sequence_for_multiplexer(text, multiplexer).as_bytes())
+    write_clipboard(output, text, multiplexer, false)
+}
+
+pub(crate) fn write_clipboard(
+    output: &mut (impl Write + ?Sized),
+    text: &str,
+    multiplexer: MultiplexerPassthrough,
+    is_kitty: bool,
+) -> io::Result<()> {
+    match multiplexer {
+        MultiplexerPassthrough::None => output.write_all(b"\x1b]52;c;")?,
+        MultiplexerPassthrough::Tmux => output.write_all(b"\x1bPtmux;\x1b\x1b]52;c;")?,
+        MultiplexerPassthrough::Screen => output.write_all(b"\x1bP\x1b]52;c;")?,
+    }
+    for chunk in text.as_bytes().chunks(3072) {
+        output.write_all(base64_encode(chunk).as_bytes())?;
+    }
+    output.write_all(if is_kitty && multiplexer == MultiplexerPassthrough::None {
+        b"\x1b\\"
+    } else {
+        b"\x07"
+    })?;
+    if multiplexer != MultiplexerPassthrough::None {
+        output.write_all(b"\x1b\\")?;
+    }
+    Ok(())
 }
 
 /// Filters a terminal title so it cannot terminate the OSC 0 payload or
@@ -494,6 +491,18 @@ pub(crate) fn terminal_title_sequence(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn clipboard_sequence(text: &str) -> String {
+        clipboard_sequence_for_multiplexer(text, super::MultiplexerPassthrough::None)
+    }
+    fn clipboard_sequence_for_multiplexer(
+        text: &str,
+        multiplexer: super::MultiplexerPassthrough,
+    ) -> String {
+        let mut output = Vec::new();
+        super::osc52_clipboard_for_multiplexer(&mut output, text, multiplexer).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
     fn supports_hyperlinks_env<'a>(
         pairs: &'a [(&'a str, &'a str)],
         stdout_supported: bool,
@@ -776,14 +785,11 @@ mod tests {
 
     #[test]
     fn osc52_clipboard_sequence_base64_encodes_utf8_text() {
-        assert_eq!(super::osc52_clipboard_sequence(""), "\x1b]52;c;\x07");
-        assert_eq!(super::osc52_clipboard_sequence("f"), "\x1b]52;c;Zg==\x07");
-        assert_eq!(super::osc52_clipboard_sequence("fo"), "\x1b]52;c;Zm8=\x07");
-        assert_eq!(super::osc52_clipboard_sequence("foo"), "\x1b]52;c;Zm9v\x07");
-        assert_eq!(
-            super::osc52_clipboard_sequence("中文"),
-            "\x1b]52;c;5Lit5paH\x07"
-        );
+        assert_eq!(clipboard_sequence(""), "\x1b]52;c;\x07");
+        assert_eq!(clipboard_sequence("f"), "\x1b]52;c;Zg==\x07");
+        assert_eq!(clipboard_sequence("fo"), "\x1b]52;c;Zm8=\x07");
+        assert_eq!(clipboard_sequence("foo"), "\x1b]52;c;Zm9v\x07");
+        assert_eq!(clipboard_sequence("中文"), "\x1b]52;c;5Lit5paH\x07");
     }
 
     #[test]
@@ -798,10 +804,7 @@ mod tests {
             "\x1bP\x1b]52;c;Y29weQ==\x07\x1b\\"
         );
         assert_eq!(
-            super::osc52_clipboard_sequence_for_multiplexer(
-                "copy",
-                super::MultiplexerPassthrough::Tmux,
-            ),
+            clipboard_sequence_for_multiplexer("copy", super::MultiplexerPassthrough::Tmux,),
             "\x1bPtmux;\x1b\x1b]52;c;Y29weQ==\x07\x1b\\"
         );
     }

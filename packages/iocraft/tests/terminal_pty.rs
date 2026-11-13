@@ -11,6 +11,8 @@ fn Editor(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut text = hooks.use_state(|| String::from("seed"));
     let mut alternate = hooks.use_state(|| false);
     let mut application = hooks.use_app();
+    let mut handle = hooks.use_ref_default::<TextInputHandle>();
+    let (stdout, _) = hooks.use_output();
     let mut system = hooks.use_context_mut::<SystemContext>();
     if alternate.get() {
         system.request_alternate_screen(false);
@@ -22,6 +24,17 @@ fn Editor(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 alternate.set(!alternate.get());
             }
+            if key.code == KeyCode::F(6) {
+                text.set("ABCDEFGHIJKLMNOPQRSTUVWXY\nabcdefghijklmnopqrstuvwxyz".into());
+                handle.write().set_cursor_offset(25);
+            }
+            if key.code == KeyCode::F(12) {
+                stdout.set_window_title(format!(
+                    "TEST_EDITOR:{}:{:?}",
+                    handle.read().cursor_offset(),
+                    text.to_string()
+                ));
+            }
             if key.code == KeyCode::Char('q') {
                 application.exit();
             }
@@ -31,8 +44,12 @@ fn Editor(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         View(width: u32::from(width), height: u32::from(height), flex_direction: FlexDirection::Row) {
             Text(content: format!("{}{width}:", if alternate.get() { "A" } else { "M" }))
             View(flex_grow: 1.0_f32) {
-                TextInput(value: text.to_string(), has_focus: true, multiline: true, max_height: height,
-                    on_change: move |value| text.set(value))
+                #(if alternate.get() {
+                    element!(Text(content: text.to_string())).into_any()
+                } else {
+                    element!(TextInput(value: text.to_string(), handle, has_focus: true, multiline: true, max_height: height,
+                        on_change: move |value| text.set(value))).into_any()
+                })
             }
         }
     }
@@ -226,6 +243,35 @@ fn run_editor_in_native_pty(rows: u16, test_name: &str) {
             send_input(b"\x14");
             output.wait_for("M30:seed界");
             output.wait_for_sequence(b"\x1b[?1049l");
+            send_input(b"\x15\x1b[200~abcdef\nx\nabcdef\x1b[201~\x1b[A");
+            send_input(b"\x1b[24~");
+            output.wait_for_sequence(b"TEST_EDITOR:8:\"abcdef\\nx\\nabcdef\"");
+            send_input(b"\x14");
+            output.wait_for("A30:");
+            send_input(b"\x14");
+            output.wait_for("M30:");
+            send_input(b"\x1b[B\x1b[24~");
+            output.wait_for_sequence(b"TEST_EDITOR:15:\"abcdef\\nx\\nabcdef\"");
+            send_input(b"\x1b[A\x1b[A\x0b\x1b[24~");
+            output.wait_for_sequence(b"TEST_EDITOR:6:\"abcdefx\\nabcdef\"");
+            send_input(b"\x14");
+            output.wait_for("A30:");
+            send_input(b"\x14");
+            output.wait_for("M30:");
+            send_input(b"\x19\x1b[24~");
+            output.wait_for_sequence(b"TEST_EDITOR:7:\"abcdef\\nx\\nabcdef\"");
+            send_input(b"\x1b[17~\x1b[B\x1b[24~");
+            output.wait_for_sequence(
+                b"TEST_EDITOR:51:\"ABCDEFGHIJKLMNOPQRSTUVWXY\\nabcdefghijklmnopqrstuvwxyz\"",
+            );
+            send_input(b"\x14");
+            output.wait_for("A30:");
+            send_input(b"\x14");
+            output.wait_for("M30:");
+            send_input(b"\x1b[A\x1b[24~");
+            output.wait_for_sequence(
+                b"TEST_EDITOR:25:\"ABCDEFGHIJKLMNOPQRSTUVWXY\\nabcdefghijklmnopqrstuvwxyz\"",
+            );
             send_input(b"q");
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {

@@ -27,7 +27,7 @@ fn screen_transitions_and_final_cursor_share_one_transaction() {
     let (mut terminal, _) = Terminal::mock(MockTerminalConfig::default());
     let mut backend = new_inline_term_with_size(writer, 0, (40, 8));
     backend.raw_mode_enabled = true;
-    terminal.inner = Box::new(backend);
+    terminal.inner = OutputBackend::Direct(Box::new(backend));
     for request in [
         Some(crate::context::AlternateScreenRequest {
             mouse_tracking: true,
@@ -155,7 +155,7 @@ fn partial_begin_body_end_and_flush_failures_propagate_and_close_the_transaction
         let (mut terminal, _) = Terminal::mock(MockTerminalConfig::default());
         let mut backend = new_inline_term_with_size(TestWriter::default(), 0, (40, 8));
         backend.dest = TerminalWriter::ansi(Box::new(writer));
-        terminal.inner = Box::new(backend);
+        terminal.inner = OutputBackend::Direct(Box::new(backend));
         let error = terminal
             .synchronized_update(|terminal| terminal.write_all(body))
             .unwrap_err();
@@ -180,7 +180,7 @@ fn partial_begin_body_end_and_flush_failures_propagate_and_close_the_transaction
 fn nested_scopes_and_unwind_close_only_the_outer_transaction() {
     let (writer, bytes) = new_test_writer();
     let (mut terminal, _) = Terminal::mock(MockTerminalConfig::default());
-    terminal.inner = Box::new(new_inline_term_with_size(writer, 0, (40, 8)));
+    terminal.inner = OutputBackend::Direct(Box::new(new_inline_term_with_size(writer, 0, (40, 8))));
     terminal
         .synchronized_update(|terminal| {
             terminal.write_all(b"outer")?;
@@ -208,7 +208,7 @@ fn nested_scopes_and_unwind_close_only_the_outer_transaction() {
 fn identical_screen_requests_and_nonraw_mouse_changes_emit_nothing() {
     let (writer, bytes) = new_test_writer();
     let (mut terminal, _) = Terminal::mock(MockTerminalConfig::default());
-    terminal.inner = Box::new(new_inline_term_with_size(writer, 0, (40, 8)));
+    terminal.inner = OutputBackend::Direct(Box::new(new_inline_term_with_size(writer, 0, (40, 8))));
     terminal
         .synchronized_update(|terminal| {
             assert!(!terminal.set_dynamic_alternate_screen(None)?);
@@ -277,10 +277,10 @@ fn animation_frames_leave_stable_memo_text_unwritten() {
     let (writer, bytes) = new_test_writer();
     let (sender, events) = mpsc::unbounded();
     let (mut terminal, _) = Terminal::mock(MockTerminalConfig::default());
-    terminal.inner = Box::new(ScriptedTerminal {
+    terminal.inner = OutputBackend::Direct(Box::new(ScriptedTerminal {
         inner: new_inline_term_with_size(writer, 0, (40, 8)),
         events: Some(events.boxed()),
-    });
+    }));
     let mut frames = Vec::new();
     let mut offset = 0;
     let result = smol::block_on(crate::render::terminal_render_loop(
@@ -366,7 +366,7 @@ fn scroll_patches_require_capability_active_transaction_and_valid_geometry() {
         backend.size = Some((columns, 5));
         backend.prev_size_on_write = backend.size;
         let (mut terminal, _) = Terminal::mock(MockTerminalConfig::default());
-        terminal.inner = Box::new(backend);
+        terminal.inner = OutputBackend::Direct(Box::new(backend));
         terminal.synchronized_output.atomic_capability = atomic_capability;
         terminal.synchronized_output.emit_markers = emit_markers;
         if scoped {
@@ -429,10 +429,10 @@ fn rendering_propagates_transition_and_output_hook_errors_without_panicking() {
             flushes: 0,
         }));
         let (mut terminal, _) = Terminal::mock(MockTerminalConfig::default());
-        terminal.inner = Box::new(ScriptedTerminal {
+        terminal.inner = OutputBackend::Direct(Box::new(ScriptedTerminal {
             inner: backend,
             events: None,
-        });
+        }));
         let result = smol::block_on(crate::render::terminal_render_loop(
             &mut element!(FailingFrame(alternate)),
             terminal,

@@ -12,6 +12,8 @@ use std::{
 use unicode_segmentation::UnicodeSegmentation;
 
 mod ansi;
+mod graphics;
+pub use graphics::*;
 mod measure_text;
 mod output;
 mod packed_screen;

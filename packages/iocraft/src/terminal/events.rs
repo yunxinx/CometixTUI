@@ -324,6 +324,9 @@ pub struct FullscreenMouseEvent {
     /// metadata so click handlers can ignore empty space to the right of text.
     pub cell_is_blank: bool,
 
+    /// Input projection of the last complete local frame when this event was dispatched.
+    pub frame: Option<Arc<crate::CommittedFrame>>,
+
     /// The kind of mouse event.
     pub kind: MouseEventKind,
 }
@@ -343,6 +346,7 @@ impl FullscreenMouseEvent {
             column,
             row,
             cell_is_blank: false,
+            frame: None,
             kind,
         }
     }
@@ -359,7 +363,8 @@ impl FullscreenMouseEvent {
 pub(super) struct EventCellSnapshot {
     width: usize,
     height: usize,
-    blank: Vec<bool>,
+    blank: Arc<[bool]>,
+    pub(super) frame: Option<Arc<crate::CommittedFrame>>,
 }
 
 impl EventCellSnapshot {
@@ -375,7 +380,8 @@ impl EventCellSnapshot {
         Self {
             width,
             height,
-            blank,
+            blank: blank.into(),
+            frame: None,
         }
     }
 

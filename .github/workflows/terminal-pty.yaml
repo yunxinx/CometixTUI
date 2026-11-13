@@ -12,7 +12,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-2025]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
@@ -26,3 +26,15 @@ jobs:
           name: terminal-pty-${{ matrix.os }}
           path: terminal-pty-results
           if-no-files-found: error
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Build workspace
+        run: cargo build --workspace
+      - name: Test workspace
+        run: cargo test --workspace
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build documentation
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings

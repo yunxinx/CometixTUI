@@ -26,7 +26,7 @@ pub struct TerminalFrameBounds {
 /// Returns whether a CC Ink-style terminal diff should clear before rendering.
 ///
 /// This mirrors `frame.ts::shouldClearScreen(...)`: resize wins first, then
-/// current or previous frames whose screen height is at least the viewport
+/// current or previous frames whose screen height exceeds the viewport
 /// height are treated as offscreen/scrollback-producing and require a clear.
 /// It is a mode-neutral helper for custom renderers; iocraft's built-in
 /// retained-canvas renderer has additional inline/fullscreen-specific guards.
@@ -38,7 +38,7 @@ pub fn should_clear_terminal_screen(
         return Some(TerminalClearReason::Resize);
     }
 
-    if next.screen_height >= next.viewport_height || prev.screen_height >= prev.viewport_height {
+    if next.screen_height > next.viewport_height || prev.screen_height > prev.viewport_height {
         return Some(TerminalClearReason::Offscreen);
     }
 
@@ -109,7 +109,7 @@ pub fn analyze_terminal_inline_diff(
     let shrinking = bounds.next_screen_height < bounds.prev_screen_height;
     let prev_had_scrollback = bounds.prev_viewport_height > 0
         && bounds.prev_screen_height > 0
-        && bounds.prev_screen_height >= bounds.prev_viewport_height;
+        && bounds.prev_screen_height > bounds.prev_viewport_height;
 
     let resize_requires_clear = bounds.next_viewport_height < bounds.prev_viewport_height
         || (bounds.prev_viewport_width != 0
