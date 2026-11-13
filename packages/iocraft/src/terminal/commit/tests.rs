@@ -573,12 +573,12 @@ fn automatic_replay_prepares_before_purging_and_balances_synchronization() {
             if exceeds_capacity {
                 assert_eq!(result.unwrap_err().kind(), io::ErrorKind::OutOfMemory);
                 assert!(
-                    !emitted.contains("\x1b[3J"),
+                    !emitted.contains(clear_terminal_sequence()),
                     "failed preparation preserves scrollback"
                 );
             } else {
                 result.unwrap();
-                assert!(emitted.contains("\x1b[3J"));
+                assert!(emitted.contains(clear_terminal_sequence()));
                 assert_eq!(emitted.matches("restored-history").count(), 1);
                 assert_eq!(
                     emitted.matches("\x1b[?2026h").count(),
