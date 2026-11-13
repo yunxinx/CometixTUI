@@ -259,7 +259,8 @@ impl OutputSession {
     }
 
     pub(super) fn mock(backend: MockTerminal, output: Output) -> io::Result<Self> {
-        Self::spawn(
+        let raw_mode = backend.is_raw_mode_enabled();
+        let mut session = Self::spawn(
             backend.is_fullscreen(),
             output,
             backend.size(),
@@ -267,7 +268,9 @@ impl OutputSession {
             true,
             OutputCapacity::default(),
             move |_| Ok(Box::new(backend)),
-        )
+        )?;
+        session.raw_mode = raw_mode;
+        Ok(session)
     }
 
     fn spawn(
@@ -526,6 +529,26 @@ impl OutputSession {
 }
 
 impl OutputSender {
+    pub(crate) fn prepare_replay(
+        &self,
+        bytes: usize,
+        prepare: impl FnOnce() -> ScrollbackReplay,
+    ) -> Option<ScrollbackReplay> {
+        match self.shared.memory.reserve(bytes) {
+            Ok(allocation) => {
+                let replay = prepare();
+                Some(Arc::new(move |width| {
+                    let _allocation = &allocation;
+                    replay(width)
+                }))
+            }
+            Err(error) => {
+                self.fail_admission(&error);
+                None
+            }
+        }
+    }
+
     pub(crate) fn committed_frame(&self) -> Option<Arc<CommittedFrame>> {
         self.shared
             .pending
@@ -912,16 +935,19 @@ impl OutputOwner {
                             synchronization.context(),
                             &mut |replay, width, prepare, writer| {
                                 if prepare {
-                                    synchronization.leave(writer)?;
-                                    for mut history in replay(width) {
-                                        history.output_allocations =
-                                            history.reserve_output(&memory, false)?;
-                                        let plan = super::graphics::GraphicsPlan::reserve(
-                                            &history, &memory,
-                                        )?;
-                                        prepared_history.push((history, plan));
-                                    }
-                                    return Ok(());
+                                    let result = synchronization.leave(writer).and_then(|()| {
+                                        for mut history in replay(width) {
+                                            history.output_allocations =
+                                                history.reserve_output(&memory, false)?;
+                                            let plan = super::graphics::GraphicsPlan::reserve(
+                                                &history, &memory,
+                                            )?;
+                                            prepared_history.push((history, plan));
+                                        }
+                                        Ok(())
+                                    });
+                                    synchronization.enter();
+                                    return result;
                                 }
                                 let end = synchronization.leave(writer);
                                 let result = end.and_then(|()| {

@@ -150,8 +150,21 @@ impl SystemContext {
         self.keyboard_enhancement_flags
     }
 
-    /// Registers the history the inline renderer replays into native scrollback after purging
-    /// it, replacing any earlier registration. Without one, a purge leaves only the live canvas.
+    /// Reserves owned replay-source storage before preparing its callback.
+    /// Admission failures are reported by the render loop. Shared, already-budgeted
+    /// source allocations are excluded from `owned_bytes`.
+    pub fn prepare_scrollback_replay(
+        &mut self,
+        owned_bytes: usize,
+        prepare: impl FnOnce() -> ScrollbackReplay,
+    ) {
+        self.scrollback_replay = match &self.output {
+            Some(output) => output.prepare_replay(owned_bytes, prepare),
+            None => Some(prepare()),
+        };
+    }
+
+    /// Registers history to replay after an inline scrollback purge, replacing the earlier callback.
     pub fn set_scrollback_replay(&mut self, replay: ScrollbackReplay) {
         self.scrollback_replay = Some(replay);
     }

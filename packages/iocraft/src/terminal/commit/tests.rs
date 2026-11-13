@@ -523,3 +523,68 @@ fn dropped_history_receipt_does_not_hide_render_loop_admission_failure() {
         );
     });
 }
+
+#[test]
+fn automatic_replay_prepares_before_purging_and_balances_synchronization() {
+    smol::block_on(async {
+        for exceeds_capacity in [false, true] {
+            let capture = Capture::default();
+            let mut output = OutputSession::with_capacity(
+                Box::new(capture.clone()),
+                Box::new(io::sink()),
+                false,
+                false,
+                Some(false),
+                Output::Stdout,
+                OutputCapacity::new(256 * 1024, ()),
+            )
+            .unwrap();
+            let mut first = Canvas::new(20, 6);
+            first.subview_mut(0, 0, 0, 0, 20, 6).set_text(
+                0,
+                0,
+                "initial",
+                CanvasTextStyle::default(),
+            );
+            output.enqueue(frame(first, 3)).unwrap();
+            barrier(&mut output).await;
+            let prefix = capture.bytes.lock().unwrap().len();
+            let mut next = frame(Canvas::new(21, 6), 3);
+            if let Operation::Frame { size, replay, .. } = &mut next {
+                *size = Some((21, 3));
+                *replay = Some(Arc::new(move |_| {
+                    if exceeds_capacity {
+                        return vec![Canvas::new(4000, 100)];
+                    }
+                    let mut history = Canvas::new(21, 1);
+                    history.subview_mut(0, 0, 0, 0, 21, 1).set_text(
+                        0,
+                        0,
+                        "restored-history",
+                        CanvasTextStyle::default(),
+                    );
+                    vec![history]
+                }));
+            }
+            output.enqueue(next).unwrap();
+            let result = output.finish().await;
+            let bytes = capture.bytes.lock().unwrap();
+            let emitted = std::str::from_utf8(&bytes[prefix..]).unwrap();
+            if exceeds_capacity {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::OutOfMemory);
+                assert!(
+                    !emitted.contains("\x1b[3J"),
+                    "failed preparation preserves scrollback"
+                );
+            } else {
+                result.unwrap();
+                assert!(emitted.contains("\x1b[3J"));
+                assert_eq!(emitted.matches("restored-history").count(), 1);
+                assert_eq!(
+                    emitted.matches("\x1b[?2026h").count(),
+                    emitted.matches("\x1b[?2026l").count()
+                );
+            }
+        }
+    });
+}

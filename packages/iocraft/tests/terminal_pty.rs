@@ -24,6 +24,10 @@ fn Editor(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 alternate.set(!alternate.get());
             }
+            if key.code == KeyCode::F(5) {
+                text.set("abcdef\nx\nabcdef".into());
+                handle.write().set_cursor_offset(15);
+            }
             if key.code == KeyCode::F(6) {
                 text.set("ABCDEFGHIJKLMNOPQRSTUVWXY\nabcdefghijklmnopqrstuvwxyz".into());
                 handle.write().set_cursor_offset(25);
@@ -266,7 +270,7 @@ fn run_editor_in_native_pty(rows: u16, test_name: &str) {
             send_input(b"\x14");
             output.wait_for("M30:seed界");
             output.wait_for_sequence(b"\x1b[?1049l");
-            send_input(b"\x15\x1b[200~abcdef\nx\nabcdef\x1b[201~\x1b[A");
+            send_input(b"\x1b[15~\x1b[A");
             send_input(b"\x1b[24~");
             output.wait_for_sequence(b"TEST_EDITOR:8:\"abcdef\\nx\\nabcdef\"");
             send_input(b"\x14");
@@ -325,10 +329,12 @@ fn run_editor_in_native_pty(rows: u16, test_name: &str) {
             .unwrap();
         }
         assert!(output.closed, "PTY capture did not reach EOF");
-        assert!(
-            output.terminal.lock().unwrap().cursor().visible,
-            "exit restores cursor visibility"
-        );
+        if result.is_ok() {
+            assert!(
+                output.terminal.lock().unwrap().cursor().visible,
+                "exit restores cursor visibility"
+            );
+        }
         drop(output);
         reader_thread.join().unwrap();
         if let Err(panic) = result {

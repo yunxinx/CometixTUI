@@ -176,6 +176,12 @@ impl TextInputHandle {
 
     /// Gets the current cursor offset in UTF-8 bytes, including while unmounted.
     pub fn cursor_offset(&self) -> usize {
+        if self
+            .revision
+            .is_some_and(|revision| revision.try_get().is_some())
+        {
+            return self.cursor_position.offset;
+        }
         self.requested_cursor_offset
             .unwrap_or(self.cursor_position.offset)
     }

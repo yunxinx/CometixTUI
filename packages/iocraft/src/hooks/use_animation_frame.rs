@@ -334,6 +334,12 @@ mod tests {
                 // Honor wakes raised while polling (e.g. a timer writing
                 // state) before reading the canvas, but do not await timers.
                 while executor.try_tick() {}
+                while rendered.borrow().as_str() != expected && clock.now_ms() < before {
+                    executor
+                        .run(smol::Timer::after(Duration::from_millis(1)))
+                        .await;
+                    while executor.try_tick() {}
+                }
                 let observed_at = clock.now_ms();
                 assert!(
                     observed_at < before,
