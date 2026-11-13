@@ -16,7 +16,9 @@ fn Editor(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         system.request_alternate_screen(false);
     }
     hooks.use_terminal_events(move |event| {
-        if let TerminalEvent::Key(key) = event {
+        if let TerminalEvent::Key(key) = event
+            && key.kind == KeyEventKind::Press
+        {
             if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 alternate.set(!alternate.get());
             }
@@ -100,13 +102,27 @@ impl Output {
 }
 
 #[test]
-fn real_editor_roundtrip_in_native_pty() {
+fn real_editor_roundtrip_in_one_row_pty() {
+    run_editor_in_native_pty(1, "real_editor_roundtrip_in_one_row_pty");
+}
+
+#[test]
+fn real_editor_roundtrip_in_two_row_pty() {
+    run_editor_in_native_pty(2, "real_editor_roundtrip_in_two_row_pty");
+}
+
+#[test]
+fn real_editor_roundtrip_in_three_row_pty() {
+    run_editor_in_native_pty(3, "real_editor_roundtrip_in_three_row_pty");
+}
+
+fn run_editor_in_native_pty(rows: u16, test_name: &str) {
     if std::env::var_os("IOCRAFT_PTY_CHILD").is_some() {
         println!();
         smol::block_on(element!(Editor).render_loop()).unwrap();
         return;
     }
-    for rows in [1, 2, 3] {
+    {
         let size = PtySize {
             rows,
             cols: 24,
@@ -117,12 +133,7 @@ fn real_editor_roundtrip_in_native_pty() {
             .openpty(size)
             .expect("native PTY is required");
         let mut command = CommandBuilder::new(std::env::current_exe().unwrap());
-        command.args([
-            "--exact",
-            "real_editor_roundtrip_in_native_pty",
-            "--nocapture",
-            "--test-threads=1",
-        ]);
+        command.args(["--exact", test_name, "--nocapture", "--test-threads=1"]);
         command.env("IOCRAFT_PTY_CHILD", "1");
         command.env("TERM", "xterm-256color");
         let mut reader = pair.master.try_clone_reader().unwrap();
