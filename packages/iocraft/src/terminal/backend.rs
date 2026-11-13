@@ -13,7 +13,13 @@ pub(super) struct ScreenTransitionPlan {
     pub(super) writes_output: bool,
 }
 
+pub(super) type ReplayWriter<'a> =
+    dyn FnMut(&ScrollbackReplay, usize, bool, &mut dyn Write) -> io::Result<()> + 'a;
+
 pub(super) trait TerminalImpl: Write + Send {
+    fn finish(&mut self) -> io::Result<()> {
+        self.flush()
+    }
     fn refresh_size(&mut self) {}
     fn size(&self) -> Option<(u16, u16)> {
         None
@@ -68,6 +74,9 @@ pub(super) trait TerminalImpl: Write + Send {
     /// - Elsewhere, OSC 0 is written directly with the shared Kitty ST / BEL
     ///   terminator policy and flushed immediately, since a title-only write
     ///   is not followed by a frame flush when the canvas is unchanged.
+    fn set_window_title(&mut self, title: &str) -> io::Result<()> {
+        self.set_title(title)
+    }
     fn set_title(&mut self, title: &str) -> io::Result<()>;
 
     /// Writes a raw non-visual control sequence to the render output.
@@ -197,6 +206,15 @@ pub(super) trait TerminalImpl: Write + Send {
         canvas: &Canvas,
         output: OutputContext,
     ) -> io::Result<()>;
+    fn write_canvas_with_replay(
+        &mut self,
+        prev: Option<&Canvas>,
+        canvas: &Canvas,
+        output: OutputContext,
+        _write_history: &mut ReplayWriter<'_>,
+    ) -> io::Result<()> {
+        self.write_canvas(prev, canvas, output)
+    }
     fn event_stream(&mut self) -> io::Result<BoxStream<'static, io::Result<TerminalEvent>>>;
     fn dest(&mut self) -> &mut dyn Write;
     fn alt(&mut self) -> &mut dyn Write;
@@ -253,7 +271,7 @@ impl ResumeSignalListener {
         })
     }
 
-    fn poll_resumed(&self, cx: &mut Context<'_>) -> Poll<()> {
+    pub(super) fn poll_resumed(&self, cx: &mut Context<'_>) -> Poll<()> {
         use std::sync::atomic::Ordering;
         if self.shared.resumed.load(Ordering::SeqCst) {
             return Poll::Ready(());
@@ -268,7 +286,7 @@ impl ResumeSignalListener {
         }
     }
 
-    fn take_resumed(&self) -> bool {
+    pub(super) fn take_resumed(&self) -> bool {
         self.shared
             .resumed
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -310,32 +328,6 @@ pub(super) fn clear_canvas_inline(
     }
 }
 
-/// Global bookkeeping for the panic hook that restores the terminal to a usable state
-/// before the default hook prints the panic message and backtrace.
-///
-/// Without this, a panic in fullscreen mode is invisible: the message goes to the
-/// alternate screen, which is discarded when the process exits and the shell restores
-/// the main screen. Raw mode similarly survives the panic, leaving the user's shell
-/// with no echo and broken line input.
-pub(super) struct PanicRestoreState {
-    /// Number of live `StdTerminal`s that have modified terminal state. The hook is a
-    /// no-op when this is zero (e.g. after a clean shutdown).
-    pub(super) live_terminals: usize,
-    /// Number of live terminals in fullscreen (alternate screen) mode.
-    pub(super) fullscreen_terminals: usize,
-}
-
-pub(super) static PANIC_RESTORE_STATE: Mutex<PanicRestoreState> = Mutex::new(PanicRestoreState {
-    live_terminals: 0,
-    fullscreen_terminals: 0,
-});
-
-static INSTALL_PANIC_HOOK: std::sync::Once = std::sync::Once::new();
-
-/// Best-effort terminal restoration, safe to call from a panic hook. Writes go directly
-/// to stdout: raw mode is a tty-level state (restored via ioctl, not the stream), and
-/// the escape sequences reach the same tty regardless of which stream the renderer was
-/// configured to use.
 // Diagnostic kill-switch for the inline diff damage-skip fast path. The skip
 // is sound only while every canvas write path marks its rows; set
 // `IOCRAFT_DISABLE=damage-skip` to force full per-row scans when bisecting
@@ -344,74 +336,7 @@ fn damage_skip_enabled() -> bool {
     !crate::debug_env::disabled().damage_skip
 }
 
-fn restore_terminal_for_panic() {
-    let state = PANIC_RESTORE_STATE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if state.live_terminals == 0 {
-        return;
-    }
-    let mut stdout = io::stdout();
-    let _ = terminal::disable_raw_mode();
-    let _ = stdout.queue(event::DisableBracketedPaste);
-    let _ = stdout.queue(event::DisableFocusChange);
-    let _ = stdout.queue(event::DisableMouseCapture);
-    if state.fullscreen_terminals > 0 {
-        super::keyboard::restore_keyboard_for_panic(&mut stdout, true);
-        let _ = stdout.queue(terminal::LeaveAlternateScreen);
-    }
-    super::keyboard::restore_keyboard_for_panic(&mut stdout, false);
-    let _ = stdout.queue(cursor::Show);
-    let _ = stdout.flush();
-}
-
-pub(super) fn register_terminal_for_panic_restore(fullscreen: bool) {
-    INSTALL_PANIC_HOOK.call_once(|| {
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            restore_terminal_for_panic();
-            prev_hook(info);
-        }));
-    });
-    let mut state = PANIC_RESTORE_STATE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.live_terminals += 1;
-    if fullscreen {
-        state.fullscreen_terminals += 1;
-    }
-}
-
-fn register_fullscreen_mode_for_panic_restore() {
-    let mut state = PANIC_RESTORE_STATE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.fullscreen_terminals += 1;
-}
-
-fn unregister_fullscreen_mode_for_panic_restore() {
-    let mut state = PANIC_RESTORE_STATE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.fullscreen_terminals = state.fullscreen_terminals.saturating_sub(1);
-}
-
-pub(super) fn unregister_terminal_for_panic_restore(fullscreen: bool) {
-    let mut state = PANIC_RESTORE_STATE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.live_terminals = state.live_terminals.saturating_sub(1);
-    if fullscreen {
-        state.fullscreen_terminals = state.fullscreen_terminals.saturating_sub(1);
-    }
-    if state.live_terminals == 0 {
-        state.fullscreen_terminals = 0;
-    }
-}
-
-/// Main-screen state kept while a dynamic alternate screen is shown. The main
-/// screen still holds the inline frame when the alternate screen is left, with the
-/// cursor back on its baseline, so the inline renderer resumes exactly here.
+/// Inline geometry restored when the alternate screen returns its saved cursor.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SavedMainScreen {
     mouse_capture: bool,
@@ -422,6 +347,10 @@ pub(super) struct SavedMainScreen {
 }
 
 pub(super) struct StdTerminal<'a> {
+    pub(super) finished: bool,
+    pub(super) window_title: Option<String>,
+    pub(super) title_saved: bool,
+    pub(super) handed_off: bool,
     pub(super) input_is_terminal: bool,
     pub(super) dest: TerminalWriter<'a>,
     pub(super) alt: Box<dyn Write + Send + 'a>,
@@ -478,6 +407,13 @@ impl Write for StdTerminal<'_> {
 }
 
 impl TerminalImpl for StdTerminal<'_> {
+    fn finish(&mut self) -> io::Result<()> {
+        StdTerminal::finish(self)
+    }
+    fn set_window_title(&mut self, title: &str) -> io::Result<()> {
+        self.window_title = Some(crate::ansi::sanitize_terminal_title(title));
+        self.apply_window_title()
+    }
     fn set_title(&mut self, title: &str) -> io::Result<()> {
         #[cfg(windows)]
         {
@@ -556,8 +492,7 @@ impl TerminalImpl for StdTerminal<'_> {
         &mut self,
         flags: event::KeyboardEnhancementFlags,
     ) -> io::Result<()> {
-        self.keyboard
-            .set_flags(flags, &mut self.dest, self.fullscreen)
+        self.keyboard.set_flags(flags, &mut self.dest)
     }
 
     #[cfg(unix)]
@@ -593,6 +528,7 @@ impl TerminalImpl for StdTerminal<'_> {
             self.release_terminal_modes()?;
             signal_hook::low_level::raise(signal_hook::consts::signal::SIGSTOP)
                 .map_err(io::Error::other)?;
+            self.reinitialize_after_resume()?;
             if let Some(signal) = &self.resume_signal {
                 signal.mark_resumed();
             }
@@ -669,13 +605,12 @@ impl TerminalImpl for StdTerminal<'_> {
                 self.keyboard.disable(&mut self.dest)?;
                 // Cleanup owns the alternate screen before an enter command can be partially written.
                 self.fullscreen = true;
-                register_fullscreen_mode_for_panic_restore();
                 self.dest
                     .queue(terminal::EnterAlternateScreen)?
                     .queue(terminal::Clear(terminal::ClearType::All))?
                     .queue(cursor::MoveTo(0, 0))?;
                 if self.raw_mode_enabled {
-                    self.keyboard.enable(&mut self.dest, true)?;
+                    self.keyboard.enable(&mut self.dest)?;
                 }
                 self.set_mouse_capture(mouse_tracking)?;
                 self.reset_retained_output_state();
@@ -690,9 +625,8 @@ impl TerminalImpl for StdTerminal<'_> {
                 self.dest.queue(terminal::LeaveAlternateScreen)?;
                 self.fullscreen = false;
                 self.dynamic_alternate_saved_main_screen = None;
-                unregister_fullscreen_mode_for_panic_restore();
                 if self.raw_mode_enabled {
-                    self.keyboard.enable(&mut self.dest, false)?;
+                    self.keyboard.enable(&mut self.dest)?;
                 }
                 self.reset_retained_output_state();
                 if let Some(saved) = saved {
@@ -909,6 +843,31 @@ impl TerminalImpl for StdTerminal<'_> {
         canvas: &Canvas,
         output: OutputContext,
     ) -> io::Result<()> {
+        let mut prepared = Vec::new();
+        self.write_canvas_with_replay(
+            prev,
+            canvas,
+            output,
+            &mut |replay, width, prepare, writer| {
+                if !prepare {
+                    for canvas in prepared.drain(..) {
+                        Canvas::write_ansi(&canvas, &mut *writer)?;
+                    }
+                } else {
+                    prepared = replay(width);
+                }
+                Ok(())
+            },
+        )
+    }
+
+    fn write_canvas_with_replay(
+        &mut self,
+        prev: Option<&Canvas>,
+        canvas: &Canvas,
+        output: OutputContext,
+        write_history: &mut ReplayWriter<'_>,
+    ) -> io::Result<()> {
         if self.fullscreen && self.size.is_some_and(|(_, rows)| rows == 0) {
             self.prev_canvas_height = canvas.height() as _;
             self.prev_size_on_write = self.size;
@@ -1015,7 +974,7 @@ impl TerminalImpl for StdTerminal<'_> {
         }
 
         if self.inline_force_full_rewrite_next_diff || self.inline_resize_requires_full_rewrite() {
-            self.clear_inline_for_full_rewrite(prev.height(), canvas.height())?;
+            self.clear_inline_for_full_rewrite(prev.height(), canvas.height(), write_history)?;
             self.prev_canvas_height = canvas.height() as _;
             self.prev_size_on_write = self.size;
             self.write_inline_canvas_without_final_newline(canvas)?;
@@ -1032,7 +991,7 @@ impl TerminalImpl for StdTerminal<'_> {
                 return Ok(());
             }
 
-            self.clear_inline_for_full_rewrite(prev.height(), canvas.height())?;
+            self.clear_inline_for_full_rewrite(prev.height(), canvas.height(), write_history)?;
             self.prev_canvas_height = canvas.height() as _;
             self.prev_size_on_write = self.size;
             self.write_inline_canvas_without_final_newline(canvas)?;
@@ -1046,7 +1005,7 @@ impl TerminalImpl for StdTerminal<'_> {
         let new_height = canvas.height();
 
         if self.inline_shrink_requires_full_rewrite(prev_height, new_height) {
-            self.clear_inline_for_full_rewrite(prev_height, new_height)?;
+            self.clear_inline_for_full_rewrite(prev_height, new_height, write_history)?;
             self.prev_canvas_height = canvas.height() as _;
             self.prev_size_on_write = self.size;
             self.write_inline_canvas_without_final_newline(canvas)?;
@@ -1090,7 +1049,7 @@ impl TerminalImpl for StdTerminal<'_> {
                 if prev.row_eq(canvas, y) {
                     continue;
                 }
-                self.clear_inline_for_full_rewrite(prev_height, new_height)?;
+                self.clear_inline_for_full_rewrite(prev_height, new_height, write_history)?;
                 self.prev_canvas_height = canvas.height() as _;
                 self.prev_size_on_write = self.size;
                 self.write_inline_canvas_without_final_newline(canvas)?;
@@ -1175,33 +1134,7 @@ impl TerminalImpl for StdTerminal<'_> {
 
         self.apply_raw_mode_enabled(true)?;
 
-        Ok(EventStream::new()
-            .filter_map(|event| async move {
-                match event {
-                    Ok(Event::Key(event)) => Some(Ok(TerminalEvent::Key(KeyEvent {
-                        code: event.code,
-                        modifiers: event.modifiers,
-                        kind: event.kind,
-                    }))),
-                    Ok(Event::Mouse(event)) => {
-                        Some(Ok(TerminalEvent::FullscreenMouse(FullscreenMouseEvent {
-                            modifiers: event.modifiers,
-                            column: event.column,
-                            row: event.row,
-                            cell_is_blank: false,
-                            kind: event.kind,
-                        })))
-                    }
-                    Ok(Event::Resize(width, height)) => {
-                        Some(Ok(TerminalEvent::Resize(width, height)))
-                    }
-                    Ok(Event::FocusGained) => Some(Ok(TerminalEvent::FocusGained)),
-                    Ok(Event::FocusLost) => Some(Ok(TerminalEvent::FocusLost)),
-                    Ok(Event::Paste(text)) => Some(Ok(TerminalEvent::Paste(text))),
-                    Err(error) => Some(Err(error)),
-                }
-            })
-            .boxed())
+        Ok(crossterm_event_stream())
     }
 
     fn dest(&mut self) -> &mut dyn Write {
@@ -1218,6 +1151,7 @@ impl<'a> StdTerminal<'a> {
         &mut self,
         enable_os_raw_mode: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
+        self.handed_off = false;
         // The shell restored cooked mode while we were stopped, but our bookkeeping
         // still says raw mode is on. Re-apply every terminal mode unconditionally,
         // bypassing apply_raw_mode_enabled's change detection.
@@ -1261,27 +1195,36 @@ impl<'a> StdTerminal<'a> {
         self.prev_size_on_write = None;
         self.inline_pending_wrap = false;
         self.inline_force_full_rewrite_next_diff = false;
-        Ok(())
+        if let Some(saved) = &mut self.dynamic_alternate_saved_main_screen {
+            saved.prev_canvas_height = 0;
+            saved.prev_size_on_write = None;
+            saved.inline_bottom_gap = 0;
+            saved.inline_force_full_rewrite_next_diff = false;
+        }
+        self.apply_window_title()
     }
 
     pub(super) fn release_terminal_modes_with(
         &mut self,
         disable_os_raw_mode: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
-        if !self.input_is_terminal {
+        if self.handed_off {
             return Ok(());
         }
-
-        // Keep bookkeeping intact while physically restoring cooked mode; the
-        // matching reacquire call reasserts exactly the modes that were active.
-        self.restore_cursor_baseline()?;
-        let mut result = if self.raw_mode_enabled {
-            self.release_input_modes_with(disable_os_raw_mode)
-        } else {
-            Ok(())
-        };
+        let mut result = self.restore_window_title();
+        result = result.and(self.restore_cursor_baseline());
+        if self.input_is_terminal && self.raw_mode_enabled {
+            result = result.and(self.release_input_modes_with(disable_os_raw_mode));
+        }
+        if self.fullscreen {
+            result = result.and(self.dest.queue(terminal::LeaveAlternateScreen).map(|_| ()));
+        }
         result = result.and(self.dest.queue(cursor::Show).map(|_| ()));
-        result.and(self.dest.flush())
+        result = result.and(self.dest.flush());
+        if result.is_ok() {
+            self.handed_off = true;
+        }
+        result
     }
 
     fn release_input_modes_with(
@@ -1306,6 +1249,10 @@ impl<'a> StdTerminal<'a> {
         keyboard_support: Option<bool>,
     ) -> io::Result<Self> {
         let input_is_terminal = stdin().is_terminal();
+        #[cfg(test)]
+        let dest = TerminalWriter::ansi(dest);
+        #[cfg(not(test))]
+        let dest = TerminalWriter::new(dest);
         // The probe blocks on a query response, and some terminals (e.g. WezTerm)
         // don't answer queries while a synchronized update is open — probing lazily
         // from within a render would stall until the query times out.
@@ -1313,7 +1260,11 @@ impl<'a> StdTerminal<'a> {
             && keyboard_support
                 .unwrap_or_else(|| terminal::supports_keyboard_enhancement().unwrap_or(false));
         let mut term = Self {
-            dest: TerminalWriter::new(dest),
+            finished: false,
+            window_title: None,
+            title_saved: false,
+            handed_off: false,
+            dest,
             alt,
             input_is_terminal,
             fullscreen,
@@ -1347,7 +1298,6 @@ impl<'a> StdTerminal<'a> {
                 .queue(terminal::Clear(terminal::ClearType::All))?
                 .queue(cursor::MoveTo(0, 0))?;
         }
-        register_terminal_for_panic_restore(fullscreen);
         Ok(term)
     }
 
@@ -1461,6 +1411,7 @@ impl<'a> StdTerminal<'a> {
         &mut self,
         prev_height: usize,
         next_height: usize,
+        write_history: &mut ReplayWriter<'_>,
     ) -> io::Result<()> {
         let (Some((prev_width, prev_viewport_height)), Some((next_width, next_viewport_height))) =
             (self.prev_size_on_write, self.size)
@@ -1491,23 +1442,18 @@ impl<'a> StdTerminal<'a> {
         };
         match should_clear_terminal_screen(prev, next) {
             Some(TerminalClearReason::Resize | TerminalClearReason::Offscreen) => {
+                let replay = self.scrollback_replay.clone();
+                if let Some(replay) = &replay {
+                    write_history(replay, usize::from(next_width), true, &mut *self.dest)?;
+                }
                 self.clear_terminal()?;
-                self.replay_scrollback()
+                if let Some(replay) = &replay {
+                    write_history(replay, usize::from(next_width), false, &mut *self.dest)?;
+                }
+                Ok(())
             }
             Some(TerminalClearReason::Clear) | None => self.clear_canvas(),
         }
-    }
-
-    /// Writes the registered history at the current width, leaving the cursor at
-    /// the start of the row where the canvas rewrite begins.
-    fn replay_scrollback(&mut self) -> io::Result<()> {
-        let (Some(replay), Some((width, _))) = (self.scrollback_replay.clone(), self.size) else {
-            return Ok(());
-        };
-        for canvas in replay(width as usize) {
-            canvas.write_ansi(&mut *self.dest)?;
-        }
-        Ok(())
     }
 
     fn inline_resize_requires_full_rewrite(&self) -> bool {
@@ -1554,7 +1500,7 @@ impl<'a> StdTerminal<'a> {
         // that should become visible again are in terminal scrollback and
         // cannot be pulled down with ordinary erase/cursor movement. Clear and
         // repaint instead of trying to patch the currently visible suffix.
-        prev_height >= rows && new_height <= rows
+        prev_height > rows && new_height <= rows
     }
 
     pub(super) fn inline_unreachable_rows_for_diff(&self, prev_height: usize) -> usize {
@@ -1576,7 +1522,7 @@ impl<'a> StdTerminal<'a> {
         // MoveToPreviousLine would misalign every subsequent write.
         let physical_height = prev_height + self.inline_bottom_gap as usize;
         let viewport_y = physical_height.saturating_sub(rows);
-        let cursor_restore_scroll = usize::from(physical_height >= rows);
+        let cursor_restore_scroll = usize::from(physical_height > rows);
         viewport_y + cursor_restore_scroll
     }
 
@@ -1794,7 +1740,7 @@ impl<'a> StdTerminal<'a> {
     }
 
     pub(super) fn reassert_keyboard_enhancement(&mut self) -> io::Result<()> {
-        self.keyboard.reassert(&mut self.dest, self.fullscreen)
+        self.keyboard.reassert(&mut self.dest)
     }
 
     fn apply_raw_mode_enabled(&mut self, raw_mode_enabled: bool) -> io::Result<()> {
@@ -1822,7 +1768,7 @@ impl<'a> StdTerminal<'a> {
             // From here on, even a partial initialization owns cleanup.
             self.raw_mode_enabled = true;
             let result = (|| {
-                self.keyboard.enable(&mut self.dest, self.fullscreen)?;
+                self.keyboard.enable(&mut self.dest)?;
                 if self.mouse_capture {
                     self.dest.execute(event::EnableMouseCapture)?;
                 }
@@ -1850,31 +1796,99 @@ impl<'a> StdTerminal<'a> {
     }
 }
 
-impl Drop for StdTerminal<'_> {
-    fn drop(&mut self) {
-        let _ = self.restore_cursor_baseline();
-        let _ = self.apply_raw_mode_enabled(false);
-        if self.fullscreen {
-            let _ = self.dest.queue(terminal::LeaveAlternateScreen);
-        } else if self.prev_canvas_height > 0 {
-            let _ = self.dest.write_all(b"\r\n");
+impl StdTerminal<'_> {
+    fn apply_window_title(&mut self) -> io::Result<()> {
+        let Some(title) = &self.window_title else {
+            return Ok(());
+        };
+        if !self.title_saved {
+            self.title_saved = true;
+            self.dest.write_all(b"\x1b[22;0t")?;
         }
-        let _ = self.dest.queue(cursor::Show);
-        // CC Ink's unmount path ends with these two so side-band state set via
-        // `progress(...)` / `use_tab_status` cannot outlive the app. The
-        // progress clear is unconditional (a no-op on terminals that ignore
-        // OSC 9;4); the tab-status clear shares the hook's capability gate and
-        // multiplexer wrapping.
-        let _ = self
-            .dest
-            .write_all(crate::ansi::CLEAR_ITERM2_PROGRESS.as_bytes());
+        #[cfg(windows)]
+        self.dest.queue(terminal::SetTitle(title))?;
+        #[cfg(not(windows))]
+        write!(&mut *self.dest, "\x1b]2;{title}\x07")?;
+        self.dest.flush()
+    }
+
+    fn restore_window_title(&mut self) -> io::Result<()> {
+        if !self.title_saved {
+            return Ok(());
+        }
+        self.dest.write_all(b"\x1b[23;0t")?;
+        self.dest.flush()?;
+        self.title_saved = false;
+        Ok(())
+    }
+
+    pub(super) fn finish(&mut self) -> io::Result<()> {
+        if self.finished || self.handed_off {
+            return Ok(());
+        }
+        let attempt = |action: &mut dyn FnMut() -> io::Result<()>| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(action))
+                .unwrap_or_else(|_| Err(io::Error::other("terminal cleanup writer panicked")))
+        };
+        // OS input restoration precedes writer-dependent cleanup, even for a panicking sink.
+        let mut result = attempt(&mut || self.apply_raw_mode_enabled(false));
+        result = result.and(attempt(&mut || self.restore_cursor_baseline()));
+        result = result.and(attempt(&mut || self.restore_window_title()));
+        if self.fullscreen {
+            result = result.and(attempt(&mut || {
+                self.dest.queue(terminal::LeaveAlternateScreen).map(|_| ())
+            }));
+        } else if self.prev_canvas_height > 0 {
+            result = result.and(attempt(&mut || self.dest.write_all(b"\r\n")));
+        }
+        result = result.and(attempt(&mut || self.dest.queue(cursor::Show).map(|_| ())));
+        result = result.and(attempt(&mut || {
+            self.dest
+                .write_all(crate::ansi::CLEAR_ITERM2_PROGRESS.as_bytes())
+        }));
         if crate::hooks::supports_tab_status() {
             let clear = crate::ansi::wrap_for_current_multiplexer_sequence(
                 &crate::ansi::clear_tab_status_sequence(),
             );
-            let _ = self.dest.write_all(clear.as_bytes());
+            result = result.and(attempt(&mut || self.dest.write_all(clear.as_bytes())));
         }
-        let _ = self.dest.flush();
-        unregister_terminal_for_panic_restore(self.fullscreen);
+        result = result.and(attempt(&mut || self.dest.flush()));
+        self.finished = true;
+        result
     }
+}
+
+impl Drop for StdTerminal<'_> {
+    fn drop(&mut self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.finish()));
+    }
+}
+
+pub(super) fn crossterm_event_stream() -> BoxStream<'static, io::Result<TerminalEvent>> {
+    EventStream::new()
+        .filter_map(|event| async move {
+            match event {
+                Ok(Event::Key(event)) => Some(Ok(TerminalEvent::Key(KeyEvent {
+                    code: event.code,
+                    modifiers: event.modifiers,
+                    kind: event.kind,
+                }))),
+                Ok(Event::Mouse(event)) => {
+                    Some(Ok(TerminalEvent::FullscreenMouse(FullscreenMouseEvent {
+                        modifiers: event.modifiers,
+                        column: event.column,
+                        row: event.row,
+                        cell_is_blank: false,
+                        frame: None,
+                        kind: event.kind,
+                    })))
+                }
+                Ok(Event::Resize(width, height)) => Some(Ok(TerminalEvent::Resize(width, height))),
+                Ok(Event::FocusGained) => Some(Ok(TerminalEvent::FocusGained)),
+                Ok(Event::FocusLost) => Some(Ok(TerminalEvent::FocusLost)),
+                Ok(Event::Paste(text)) => Some(Ok(TerminalEvent::Paste(text))),
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .boxed()
 }

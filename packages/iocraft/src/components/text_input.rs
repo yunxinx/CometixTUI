@@ -72,7 +72,8 @@ impl Hook for CursorOverlayState {
 
 /// A handle which can be used for imperative control of a [`TextInput`] component.
 ///
-/// The handle retains the most recent nonempty line or word deletion for Ctrl+Y. Keep it in
+/// The handle retains cursor affinity, vertical column preference, scroll position and the
+/// most recent nonempty line or word deletion for Ctrl+Y. Keep it in
 /// a parent component to preserve that text across input unmounts and value replacements.
 ///
 /// # Example
@@ -107,15 +108,52 @@ impl Hook for CursorOverlayState {
 /// ```
 #[derive(Default)]
 pub struct TextInputHandle {
-    inner: Option<TextInputHandleInner>,
-    /// An offset set while no input was mounted, applied by the next one to mount.
-    pending_cursor_offset: Option<usize>,
+    revision: Option<State<u64>>,
+    previous_value: String,
+    cursor_position: CursorPosition,
+    requested_cursor_offset: Option<usize>,
+    scroll_offset_row: usize,
+    scroll_offset_col: usize,
+    vertical_movement_col_preference: Option<usize>,
     deleted_text: String,
 }
 
-struct TextInputHandleInner {
-    cursor_position: State<CursorPosition>,
-    requested_cursor_offset: State<Option<usize>>,
+struct InputField<T> {
+    handle: Ref<TextInputHandle>,
+    read: fn(&TextInputHandle) -> &T,
+    write: fn(&mut TextInputHandle) -> &mut T,
+}
+
+impl<T> Copy for InputField<T> {}
+impl<T> Clone for InputField<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: Clone + PartialEq> InputField<T> {
+    fn get(&self) -> T {
+        (self.read)(&self.handle.read()).clone()
+    }
+    fn with<R>(&self, read: impl FnOnce(&T) -> R) -> R {
+        read((self.read)(&self.handle.read()))
+    }
+    fn set(&mut self, value: T) {
+        let revision = {
+            let mut handle = self.handle.write();
+            let field = (self.write)(&mut handle);
+            if *field == value {
+                return;
+            }
+            *field = value;
+            handle.revision
+        };
+        if let Some(mut revision) = revision
+            && let Some(value) = revision.try_get()
+        {
+            revision.set(value.wrapping_add(1));
+        }
+    }
 }
 
 impl TextInputHandle {
@@ -128,24 +166,24 @@ impl TextInputHandle {
     /// Set while the input is unmounted, the offset applies when an input mounts with this
     /// handle.
     pub fn set_cursor_offset(&mut self, offset: usize) {
-        match &mut self.inner {
-            Some(inner) if inner.requested_cursor_offset.try_get().is_some() => {
-                inner.requested_cursor_offset.set(Some(offset));
-            }
-            _ => self.pending_cursor_offset = Some(offset),
+        self.requested_cursor_offset = Some(offset);
+        if let Some(mut revision) = self.revision
+            && let Some(value) = revision.try_get()
+        {
+            revision.set(value.wrapping_add(1));
         }
     }
 
-    /// Gets the current cursor offset.
-    ///
-    /// The offset is in bytes, not characters.
+    /// Gets the current cursor offset in UTF-8 bytes, including while unmounted.
     pub fn cursor_offset(&self) -> usize {
-        self.inner
-            .as_ref()
-            .and_then(|inner| inner.cursor_position.try_get())
-            .map(|cursor| cursor.offset)
-            .or(self.pending_cursor_offset)
-            .unwrap_or(0)
+        if self
+            .revision
+            .is_some_and(|revision| revision.try_get().is_some())
+        {
+            return self.cursor_position.offset;
+        }
+        self.requested_cursor_offset
+            .unwrap_or(self.cursor_position.offset)
     }
 }
 
@@ -686,25 +724,41 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
         TextWrap::NoWrap
     };
 
-    let mut prev_value = hooks.use_state(|| "".to_string());
-    let mut cursor_position = hooks.use_state(CursorPosition::default);
-    let mut requested_cursor_offset = hooks.use_state(|| None);
-    let mut scroll_offset_row = hooks.use_state(|| 0usize);
-    let mut scroll_offset_col = hooks.use_state(|| 0usize);
-    let mut vertical_movement_col_preference = hooks.use_state(|| None);
-    let (width, height) = hooks.use_size(!auto_grow);
-    let (width, height) = (usize::from(width), usize::from(height));
-
     let local_handle = hooks.use_ref_default::<TextInputHandle>();
     let mut handle = props.handle.unwrap_or(local_handle);
-    let pending_cursor_offset = {
-        let mut handle = handle.write();
-        handle.inner = Some(TextInputHandleInner {
-            cursor_position,
-            requested_cursor_offset,
-        });
-        handle.pending_cursor_offset.take()
+    handle.write().revision = Some(hooks.use_state(|| 0u64));
+    let mut prev_value = InputField {
+        handle,
+        read: |state| &state.previous_value,
+        write: |state| &mut state.previous_value,
     };
+    let mut cursor_position = InputField {
+        handle,
+        read: |state| &state.cursor_position,
+        write: |state| &mut state.cursor_position,
+    };
+    let mut requested_cursor_offset = InputField {
+        handle,
+        read: |state| &state.requested_cursor_offset,
+        write: |state| &mut state.requested_cursor_offset,
+    };
+    let mut scroll_offset_row = InputField {
+        handle,
+        read: |state| &state.scroll_offset_row,
+        write: |state| &mut state.scroll_offset_row,
+    };
+    let mut scroll_offset_col = InputField {
+        handle,
+        read: |state| &state.scroll_offset_col,
+        write: |state| &mut state.scroll_offset_col,
+    };
+    let mut vertical_movement_col_preference = InputField {
+        handle,
+        read: |state| &state.vertical_movement_col_preference,
+        write: |state| &mut state.vertical_movement_col_preference,
+    };
+    let (width, height) = hooks.use_size(!auto_grow);
+    let (width, height) = (usize::from(width), usize::from(height));
 
     let max_text_width = if wrap == TextWrap::Wrap {
         // Reserve the last column for the cursor.
@@ -733,12 +787,10 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
 
     // Input sets the cursor along with the value it edits; a value the parent changed on its own
     // moves the cursor by the edit that most likely produced it.
-    if props.value.as_str() != prev_value.read().as_str() {
-        let new_cursor_offset = new_cursor_offset(
-            &prev_value.read(),
-            cursor_position.get().offset,
-            &props.value,
-        );
+    if prev_value.with(|previous| props.value.as_str() != previous.as_str()) {
+        let cursor_offset = cursor_position.get().offset;
+        let new_cursor_offset =
+            prev_value.with(|previous| new_cursor_offset(previous, cursor_offset, &props.value));
         if cursor_position.get() != CursorPosition::new(new_cursor_offset) {
             cursor_position.set(CursorPosition::new(new_cursor_offset));
         }
@@ -750,7 +802,7 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
     if requested.is_some() {
         requested_cursor_offset.set(None);
     }
-    if let Some(requested) = requested.or(pending_cursor_offset) {
+    if let Some(requested) = requested {
         let requested = clamp_to_grapheme_boundary(&props.value, requested);
         if cursor_position.get() != CursorPosition::new(requested) {
             cursor_position.set(CursorPosition::new(requested));
@@ -919,10 +971,12 @@ pub fn TextInput(mut hooks: Hooks, props: &mut TextInputProps) -> impl Into<AnyE
                             handled = true;
                         }
                         KeyCode::Char('y') if control => {
-                            let handle = handle.read();
-                            if !handle.deleted_text.is_empty() {
-                                value.insert_str(cursor, &handle.deleted_text);
-                                edited = Some(cursor + handle.deleted_text.len());
+                            {
+                                let handle = handle.read();
+                                if !handle.deleted_text.is_empty() {
+                                    value.insert_str(cursor, &handle.deleted_text);
+                                    edited = Some(cursor + handle.deleted_text.len());
+                                }
                             }
                             vertical_movement_col_preference.set(None);
                             handled = true;

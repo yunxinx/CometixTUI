@@ -2,7 +2,7 @@ use super::super::*;
 use crate::prelude::*;
 
 #[test]
-fn test_should_clear_terminal_screen_matches_cc_ink_frame_helper() {
+fn screen_clear_distinguishes_equal_height_from_overflow() {
     let base = TerminalFrameBounds {
         screen_height: 3,
         viewport_width: 80,
@@ -10,6 +10,16 @@ fn test_should_clear_terminal_screen_matches_cc_ink_frame_helper() {
     };
 
     assert_eq!(should_clear_terminal_screen(base, base), None);
+    assert_eq!(
+        should_clear_terminal_screen(
+            base,
+            TerminalFrameBounds {
+                screen_height: 10,
+                ..base
+            }
+        ),
+        None
+    );
     assert_eq!(
         should_clear_terminal_screen(
             base,
@@ -34,7 +44,7 @@ fn test_should_clear_terminal_screen_matches_cc_ink_frame_helper() {
         should_clear_terminal_screen(
             base,
             TerminalFrameBounds {
-                screen_height: 10,
+                screen_height: 11,
                 ..base
             }
         ),
@@ -43,7 +53,7 @@ fn test_should_clear_terminal_screen_matches_cc_ink_frame_helper() {
     assert_eq!(
         should_clear_terminal_screen(
             TerminalFrameBounds {
-                screen_height: 10,
+                screen_height: 11,
                 ..base
             },
             base
@@ -128,8 +138,8 @@ fn test_analyze_terminal_inline_diff_matches_cc_log_update_geometry_guards() {
     });
     assert_eq!(growing_after_full_viewport.clear_reason, None);
     assert_eq!(
-        growing_after_full_viewport.unreachable_rows, 1,
-        "cursorRestoreScroll contributes one unreachable top row"
+        growing_after_full_viewport.unreachable_rows, 0,
+        "the complete previous frame remains reachable before extending it"
     );
     assert!(growing_after_full_viewport.growing);
 

@@ -1,4 +1,5 @@
 use super::{SelectionClipboardPath, SelectionContext, UseContext};
+use crate::terminal::OutputMessage as Message;
 use crate::{
     Canvas, Clipboard, ClipboardMultiplexer, ComponentUpdater, Hook, Hooks, SelectionController,
     SelectionState,
@@ -7,14 +8,9 @@ use core::{
     pin::Pin,
     task::{Context, Poll, Waker},
 };
-use crossterm::{QueueableCommand, cursor};
 use futures::{channel::oneshot, future::BoxFuture};
-use std::io::{self, Write};
-use std::{
-    borrow::Cow,
-    sync::{Arc, Mutex},
-};
-use unicode_width::UnicodeWidthChar;
+use std::io;
+use std::sync::{Arc, Mutex};
 
 mod private {
     pub trait Sealed {}
@@ -64,36 +60,25 @@ impl UseOutput for Hooks<'_, '_> {
         let clipboard = self
             .try_use_context::<Clipboard>()
             .map(|value| value.clone());
+        let session = self
+            .try_use_context::<crate::terminal::OutputSender>()
+            .map(|context| context.clone());
         let output = self.use_hook(UseOutputImpl::default);
+        output
+            .state
+            .lock()
+            .expect("output handle is not poisoned")
+            .session = session;
         output.clipboard = clipboard;
         (output.use_stdout(), output.use_stderr())
     }
 }
 
-enum Message {
-    Stdout(String),
-    StdoutNoNewline(String),
-    StdoutClipboard(String, ClipboardMultiplexer),
-    StdoutControl(String),
-    StdoutControlAcknowledged(String, oneshot::Sender<io::Result<()>>),
-    Stderr(String),
-    StderrNoNewline(String),
-}
-
-impl Message {
-    fn affects_visible_output(&self) -> bool {
-        !matches!(
-            self,
-            Message::StdoutClipboard(..)
-                | Message::StdoutControl(_)
-                | Message::StdoutControlAcknowledged(..)
-        )
-    }
-}
-
 #[derive(Default)]
 struct UseOutputState {
+    session: Option<crate::terminal::OutputSender>,
     closed: bool,
+    changed: bool,
     queue: Vec<Message>,
     waker: Option<Waker>,
 }
@@ -101,7 +86,17 @@ struct UseOutputState {
 fn enqueue(state: &Mutex<UseOutputState>, message: Message) {
     let waker = {
         let mut state = state.lock().unwrap();
-        if state.closed && matches!(message, Message::StdoutControlAcknowledged(..)) {
+        if state.closed {
+            return;
+        }
+        if let Some(session) = state.session.clone() {
+            state.changed = true;
+            let waker = state.waker.take();
+            drop(state);
+            session.submit(message);
+            if let Some(waker) = waker {
+                waker.wake();
+            }
             return;
         }
         state.queue.push(message);
@@ -112,205 +107,23 @@ fn enqueue(state: &Mutex<UseOutputState>, message: Message) {
     }
 }
 
-fn normalize_terminal_newlines(text: &str) -> Cow<'_, str> {
-    let mut prev = '\0';
-    let mut normalized = None::<String>;
-    for (idx, ch) in text.char_indices() {
-        if ch == '\n' && prev != '\r' {
-            let out = normalized.get_or_insert_with(|| {
-                let mut s = String::with_capacity(text.len() + 1);
-                s.push_str(&text[..idx]);
-                s
-            });
-            out.push('\r');
-            out.push('\n');
-        } else if let Some(out) = normalized.as_mut() {
-            out.push(ch);
-        }
-        prev = ch;
-    }
-    normalized.map(Cow::Owned).unwrap_or(Cow::Borrowed(text))
-}
-
-fn skip_ansi_string_control(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    let mut saw_escape = false;
-    for ch in chars.by_ref() {
-        if ch == '\u{7}' {
-            break;
-        }
-        if saw_escape && ch == '\\' {
-            break;
-        }
-        saw_escape = ch == '\u{1b}';
-    }
-}
-
-fn skip_ansi_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    let Some(kind) = chars.next() else {
-        return;
-    };
-    match kind {
-        '[' => {
-            for ch in chars.by_ref() {
-                let code = ch as u32;
-                if (0x40..=0x7e).contains(&code) {
-                    break;
-                }
-            }
-        }
-        ']' | 'P' | '_' | '^' | 'X' => skip_ansi_string_control(chars),
-        _ => {}
-    }
-}
-
-fn advance_printable_width(col: u16, char_width: usize, terminal_width: Option<usize>) -> u16 {
-    if char_width == 0 {
-        return col;
-    }
-
-    let Some(terminal_width) = terminal_width.filter(|w| *w > 0) else {
-        return (col as usize)
-            .saturating_add(char_width)
-            .min(u16::MAX as usize) as u16;
-    };
-
-    // `col == terminal_width` represents the VT pending-wrap state after a
-    // printable ended exactly at the right margin. The next printable first
-    // wraps to the following row before drawing at column 0.
-    let start_col = if col as usize >= terminal_width {
-        0
-    } else {
-        col as usize
-    };
-    let advanced = start_col.saturating_add(char_width);
-    if advanced <= terminal_width {
-        // Preserve `terminal_width` as the pending-wrap marker.
-        advanced as u16
-    } else {
-        (advanced % terminal_width) as u16
-    }
-}
-
-fn advance_terminal_column(col: u16, text: &str, terminal_width: Option<usize>) -> u16 {
-    let mut col = col;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\u{1b}' => skip_ansi_escape(&mut chars),
-            '\r' | '\n' => col = 0,
-            '\t' => {
-                let next_tab = ((col as usize / 8) + 1) * 8;
-                let delta = next_tab.saturating_sub(col as usize);
-                col = advance_printable_width(col, delta, terminal_width);
-            }
-            '\u{8}' => col = col.saturating_sub(1),
-            _ if ch.is_control() => {}
-            _ => {
-                col = advance_printable_width(col, ch.width().unwrap_or(0), terminal_width);
-            }
-        }
-    }
-    col
-}
-
 #[derive(Default)]
 struct OutputBatch {
     queue: Vec<Message>,
-    appended_newline: Option<u16>,
 }
 
 impl OutputBatch {
     fn exec(&mut self, updater: &mut ComponentUpdater) -> io::Result<()> {
-        if self.queue.is_empty() {
+        if self.queue.is_empty() || updater.terminal_mut().is_none() {
             return Ok(());
         }
-
-        // Check if we have a terminal - if not, messages stay queued
-        if updater.terminal_mut().is_none() {
-            return Ok(());
-        }
-
-        let has_visible_output = self.queue.iter().any(Message::affects_visible_output);
-        if has_visible_output {
+        if self.queue.iter().any(Message::affects_visible_output) {
             updater.clear_terminal_output();
         }
-        let Some(terminal) = updater.terminal_mut() else {
-            return Ok(());
-        };
-        let terminal_width = terminal.size().map(|(width, _)| width as usize);
-
-        if has_visible_output {
-            if let Some(col) = self.appended_newline {
-                terminal
-                    .render_output()
-                    .queue(cursor::MoveUp(1))
-                    .and_then(|w| w.queue(cursor::MoveRight(col)))?;
-            }
-            // Flush render output to ensure escape sequences are sent before any
-            // cross-stream writes (e.g., stdout messages when rendering to stderr).
-            terminal.render_output().flush()?;
-        }
-
-        // Track the virtual cursor column ourselves instead of querying the
-        // terminal. Crossterm's cursor::position() races with EventStream's
-        // raw-mode stdin reader and can fail or steal bytes; when that happens
-        // no extra newline is emitted and the next canvas frame is painted on
-        // the same row as the progress output (visible tearing in kitty).
-        let mut output_col = self.appended_newline.unwrap_or(0);
-
-        for msg in self.queue.drain(..) {
-            match msg {
-                Message::Stdout(msg) => {
-                    let mut formatted = normalize_terminal_newlines(&msg).into_owned();
-                    formatted.push_str("\r\n");
-                    terminal.stdout().write_all(formatted.as_bytes())?;
-                    output_col = 0;
-                }
-                Message::StdoutNoNewline(msg) => {
-                    let formatted = normalize_terminal_newlines(&msg);
-                    terminal.stdout().write_all(formatted.as_bytes())?;
-                    output_col = advance_terminal_column(output_col, &msg, terminal_width);
-                }
-                Message::StdoutClipboard(msg, multiplexer) => {
-                    terminal.set_clipboard_with_multiplexer(&msg, multiplexer)?;
-                }
-                Message::StdoutControl(sequence) => {
-                    terminal.write_control_sequence(&sequence)?;
-                }
-                Message::StdoutControlAcknowledged(sequence, sender) => {
-                    let result = terminal.write_control_sequence(&sequence);
-                    let _ = sender.send(result);
-                }
-                Message::Stderr(msg) => {
-                    let mut formatted = normalize_terminal_newlines(&msg).into_owned();
-                    formatted.push_str("\r\n");
-                    terminal.stderr().write_all(formatted.as_bytes())?;
-                    output_col = 0;
-                }
-                Message::StderrNoNewline(msg) => {
-                    let formatted = normalize_terminal_newlines(&msg);
-                    terminal.stderr().write_all(formatted.as_bytes())?;
-                    output_col = advance_terminal_column(output_col, &msg, terminal_width);
-                }
-            }
-        }
-
-        if has_visible_output {
-            // Flush stdout and stderr so the terminal processes all written
-            // bytes before we append the trailing newline.
-            terminal.stdout().flush()?;
-            terminal.stderr().flush()?;
-            if output_col > 0 {
-                self.appended_newline = match terminal_width {
-                    Some(width) if output_col as usize >= width => None,
-                    _ => Some(output_col),
-                };
-                terminal.render_output().write_all(b"\r\n")?;
-            } else {
-                self.appended_newline = None;
-            }
-        }
-        Ok(())
+        updater
+            .terminal_mut()
+            .expect("output admission has a terminal")
+            .submit_output_batch(std::mem::take(&mut self.queue))
     }
 }
 
@@ -322,20 +135,43 @@ pub struct StdoutHandle {
 }
 
 impl StdoutHandle {
+    /// Reads the last complete local frame without retaining its canvas or component tree.
+    pub fn committed_frame(&self) -> Option<Arc<crate::CommittedFrame>> {
+        let session = self
+            .state
+            .lock()
+            .expect("output handle is not poisoned")
+            .session
+            .clone()?;
+        session.committed_frame()
+    }
+
+    /// Appends prepared history above the live frame and restores that frame and its cursor.
+    /// The receipt resolves after the complete local write and flush.
+    pub fn append_history(
+        &self,
+        draft: crate::HistoryDraft,
+    ) -> BoxFuture<'static, io::Result<crate::CommitReceipt>> {
+        let session = self
+            .state
+            .lock()
+            .expect("output handle is not poisoned")
+            .session
+            .clone();
+        match session {
+            Some(session) => session.append_history_with_errors(draft, true),
+            None => Box::pin(async {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "history output requires a terminal session",
+                ))
+            }),
+        }
+    }
+
     pub(crate) fn without_clipboard(mut self) -> Self {
         self.clipboard = None;
         self
-    }
-
-    /// Starts native/tmux clipboard work and returns the sequence to write.
-    /// This intentionally does not wait for native clipboard completion.
-    pub fn prepare_clipboard(&self, text: &str) -> BoxFuture<'static, String> {
-        if let Some(clipboard) = &self.clipboard {
-            clipboard.set_clipboard(text)
-        } else {
-            let sequence = crate::ansi::osc52_clipboard_sequence(text);
-            Box::pin(async move { sequence })
-        }
     }
 
     /// Notification confidence, resolved by the shared clipboard policy.
@@ -408,22 +244,45 @@ impl StdoutHandle {
         enqueue(&self.state, Message::StdoutControl(sequence));
     }
 
+    /// Sets the window title in output order, preserving the prior terminal title.
+    /// The output owner restores it before handoff and normal finish.
+    pub fn set_window_title(&self, title: impl Into<String>) {
+        enqueue(&self.state, Message::WindowTitle(title.into()));
+    }
+
     /// Queues an OSC 52 clipboard write to stdout.
     ///
     /// Unlike [`StdoutHandle::print`], this is a non-visual terminal control
     /// sequence: it does not clear or reposition the retained render canvas.
     /// This makes it suitable for fullscreen text-selection copy behavior.
     pub fn set_clipboard<S: ToString>(&self, text: S) {
-        if let Some(clipboard) = &self.clipboard {
-            let prepared = clipboard.set_clipboard(&text.to_string());
-            let stdout = self.clone();
-            clipboard.spawn(Box::pin(async move {
-                let sequence = prepared.await;
-                let _ = stdout.write_control_sequence_and_wait(sequence).await;
-            }));
-            return;
-        }
-        self.set_clipboard_with_multiplexer(text, ClipboardMultiplexer::None);
+        drop(self.set_clipboard_and_wait(text));
+    }
+
+    /// Accepts an ordered copy before starting any helper. Completes after helpers and
+    /// terminal output have finished; component unmount does not cancel an accepted root copy.
+    pub fn set_clipboard_and_wait<S: ToString>(
+        &self,
+        text: S,
+    ) -> BoxFuture<'static, io::Result<()>> {
+        let (sender, receiver) = oneshot::channel();
+        let root = self
+            .clipboard
+            .as_ref()
+            .and_then(Clipboard::output)
+            .unwrap_or(self);
+        enqueue(
+            &root.state,
+            Message::Copy(text.to_string(), self.clipboard.clone(), sender),
+        );
+        Box::pin(async move {
+            receiver.await.unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "terminal output is closed",
+                ))
+            })
+        })
     }
 
     /// Queues an OSC 52 clipboard write to stdout using an explicit
@@ -434,7 +293,12 @@ impl StdoutHandle {
         multiplexer: ClipboardMultiplexer,
     ) {
         enqueue(
-            &self.state,
+            &self
+                .clipboard
+                .as_ref()
+                .and_then(Clipboard::output)
+                .unwrap_or(self)
+                .state,
             Message::StdoutClipboard(text.to_string(), multiplexer),
         );
     }
@@ -594,7 +458,7 @@ impl Hook for UseOutputImpl {
         // must stay armed so output queued after this frame's drain still
         // wakes the component under push-wake harvesting.
         let old_waker = state.waker.replace(waker);
-        let result = if state.queue.is_empty() {
+        let result = if state.queue.is_empty() && !state.changed {
             Poll::Pending
         } else {
             Poll::Ready(())
@@ -612,6 +476,7 @@ impl Hook for UseOutputImpl {
     fn post_component_effects(&mut self, updater: &mut ComponentUpdater) {
         {
             let mut state = self.state.lock().unwrap();
+            state.changed = false;
             if state.queue.is_empty() || updater.terminal_mut().is_none() {
                 return;
             }
@@ -698,7 +563,7 @@ mod tests {
 
     #[cfg(feature = "unstable-output-streams")]
     #[test]
-    fn test_backend_output_is_flushed_on_the_next_update() {
+    fn backend_output_accepts_reentrant_messages_in_order() {
         #[derive(Default)]
         struct Trace {
             stdout: Option<StdoutHandle>,
@@ -767,8 +632,12 @@ mod tests {
                 crate::render::wake::set_push_wake_for_tests(None);
                 let trace = trace.lock().unwrap();
                 assert_eq!(
-                    trace.writes,
-                    [(1, "outer".to_string()), (2, "nested".to_string())]
+                    trace
+                        .writes
+                        .iter()
+                        .map(|(_, text)| text.as_str())
+                        .collect::<Vec<_>>(),
+                    ["outer", "nested"]
                 );
                 assert!(
                     trace
@@ -784,48 +653,6 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("writer output must not deadlock");
         worker.join().unwrap();
-    }
-
-    #[test]
-    fn test_normalize_terminal_newlines_preserves_carriage_return_alignment() {
-        assert!(matches!(
-            normalize_terminal_newlines("plain"),
-            Cow::Borrowed("plain")
-        ));
-        assert_eq!(normalize_terminal_newlines("a\nb").as_ref(), "a\r\nb");
-        assert_eq!(normalize_terminal_newlines("a\r\nb").as_ref(), "a\r\nb");
-        assert_eq!(normalize_terminal_newlines("\nDone!").as_ref(), "\r\nDone!");
-    }
-
-    #[test]
-    fn test_advance_terminal_column_tracks_print_continuation_without_dsr() {
-        assert_eq!(advance_terminal_column(0, "Working...", None), 10);
-        assert_eq!(advance_terminal_column(10, ".", None), 11);
-        assert_eq!(advance_terminal_column(11, "\nDone!", None), 5);
-        assert_eq!(advance_terminal_column(0, "中\t", None), 8);
-    }
-
-    #[test]
-    fn test_advance_terminal_column_wraps_with_terminal_width() {
-        assert_eq!(advance_terminal_column(0, "abcdef", Some(10)), 6);
-        assert_eq!(advance_terminal_column(6, "abcdef", Some(10)), 2);
-        assert_eq!(advance_terminal_column(0, "1234567890", Some(10)), 10);
-        assert_eq!(advance_terminal_column(10, ".", Some(10)), 1);
-        assert_eq!(advance_terminal_column(0, "12345\nabc", Some(10)), 3);
-    }
-
-    #[test]
-    fn test_advance_terminal_column_ignores_ansi_controls() {
-        assert_eq!(advance_terminal_column(0, "\x1b[31mred\x1b[0m", None), 3);
-        assert_eq!(
-            advance_terminal_column(
-                0,
-                "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\",
-                None,
-            ),
-            4
-        );
-        assert_eq!(advance_terminal_column(3, "\x08!", None), 3);
     }
 
     /// Queues side-band output from an effect and exits in the same (first)
@@ -1088,13 +915,17 @@ mod tests {
                 bytes: Arc::new(Mutex::new(Vec::new())),
                 fail_control,
             };
-            element! {
+            let result = element! {
                 ContextProvider(value: crate::Context::owned(proof.clone())) { AckApp }
             }
             .render_loop()
             .stdout(proof)
-            .await
-            .unwrap();
+            .await;
+            if fail_control {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            } else {
+                result.unwrap();
+            }
         }
     }
     struct NoProcessBackend;
@@ -1107,9 +938,6 @@ mod tests {
             _: std::time::Duration,
         ) -> BoxFuture<'static, i32> {
             panic!("explicit multiplexer override must not invoke native or tmux processes")
-        }
-        fn spawn(&self, _: BoxFuture<'static, ()>) {
-            panic!("explicit override must not detach work")
         }
         fn is_kitty(&self) -> bool {
             true
@@ -1127,9 +955,9 @@ mod tests {
         );
         owner.clipboard = None;
         let plain = owner.use_stdout();
-        assert_eq!(
-            futures::executor::block_on(plain.prepare_clipboard("A")),
-            "\x1b]52;c;QQ==\x07"
+        plain.set_clipboard("A");
+        assert!(
+            matches!(&owner.state.lock().unwrap().queue[1], Message::Copy(text, None, _) if text == "A")
         );
         assert_eq!(plain.get_clipboard_path(), SelectionClipboardPath::Osc52);
     }
@@ -1188,7 +1016,7 @@ mod tests {
     #[cfg(feature = "unstable-output-streams")]
     #[derive(Default)]
     struct DeferredClipboardBackend {
-        tasks: Mutex<Vec<BoxFuture<'static, ()>>>,
+        release: Mutex<Option<oneshot::Receiver<()>>>,
     }
     #[cfg(feature = "unstable-output-streams")]
     impl crate::ClipboardBackend for DeferredClipboardBackend {
@@ -1199,10 +1027,13 @@ mod tests {
             _: &str,
             _: std::time::Duration,
         ) -> BoxFuture<'static, i32> {
-            Box::pin(async { 0 })
-        }
-        fn spawn(&self, task: BoxFuture<'static, ()>) {
-            self.tasks.lock().unwrap().push(task);
+            let release = self.release.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(release) = release {
+                    release.await.unwrap();
+                }
+                0
+            })
         }
         fn is_kitty(&self) -> bool {
             true
@@ -1214,6 +1045,7 @@ mod tests {
         output: AckProof,
         backend: Arc<DeferredClipboardBackend>,
         child_unmounted: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     }
     #[cfg(feature = "unstable-output-streams")]
     #[derive(Clone)]
@@ -1272,12 +1104,27 @@ mod tests {
                 );
                 smol::Timer::after(std::time::Duration::from_millis(1)).await;
             }
-            // Delay the detached clipboard continuation until the actual child
-            // output hook has been destroyed; the retained root still owns I/O.
-            let tasks = std::mem::take(&mut *proof.backend.tasks.lock().unwrap());
-            assert!(!tasks.is_empty());
-            for task in tasks {
-                task.await;
+            proof
+                .release
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+            while !proof
+                .output
+                .bytes
+                .lock()
+                .unwrap()
+                .windows(b"52;c;QQ==".len())
+                .any(|bytes| bytes == b"52;c;QQ==")
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "accepted clipboard did not finish"
+                );
+                smol::Timer::after(std::time::Duration::from_millis(1)).await;
             }
             assert!(
                 proof
@@ -1303,14 +1150,18 @@ mod tests {
     }
     #[cfg(feature = "unstable-output-streams")]
     #[apply(test!)]
-    async fn detached_clipboard_output_reaches_real_writer_after_child_unmount() {
+    async fn accepted_clipboard_survives_child_unmount() {
         let output = AckProof {
             bytes: Arc::new(Mutex::new(Vec::new())),
             fail_control: false,
         };
+        let (release, receiver) = oneshot::channel();
         let proof = LifetimeProof {
+            release: Arc::new(Mutex::new(Some(release))),
             output: output.clone(),
-            backend: Arc::new(DeferredClipboardBackend::default()),
+            backend: Arc::new(DeferredClipboardBackend {
+                release: Mutex::new(Some(receiver)),
+            }),
             child_unmounted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         element! {
@@ -1320,5 +1171,74 @@ mod tests {
         .stdout(output)
         .await
         .unwrap();
+    }
+    #[component]
+    fn MixedCopyChild(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let (stdout, _) = hooks.use_output();
+        hooks.use_effect(
+            move || {
+                stdout.set_clipboard("A");
+                stdout.set_clipboard_with_multiplexer("B", ClipboardMultiplexer::Screen);
+            },
+            (),
+        );
+        hooks.use_context_mut::<SystemContext>().exit();
+        element!(View)
+    }
+
+    #[component]
+    fn MixedCopyRoot(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let (stdout, _) = hooks.use_output();
+        let service = hooks.use_context::<Clipboard>().clone().with_output(stdout);
+        element!(ContextProvider(value: crate::Context::owned(service)) { MixedCopyChild })
+    }
+
+    #[cfg(feature = "unstable-output-streams")]
+    #[apply(test!)]
+    async fn mixed_copy_transports_keep_root_acceptance_order() {
+        let output = AckProof {
+            bytes: Arc::new(Mutex::new(Vec::new())),
+            fail_control: false,
+        };
+        let service = Clipboard::new(Arc::new(DeferredClipboardBackend::default()))
+            .with_native_test_environment();
+        element!(ContextProvider(value: crate::Context::owned(service)) { MixedCopyRoot })
+            .render_loop()
+            .stdout(output.clone())
+            .await
+            .unwrap();
+        let bytes = output.bytes.lock().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.find("52;c;QQ==").unwrap() < text.find("52;c;Qg==").unwrap());
+    }
+
+    #[cfg(feature = "unstable-output-streams")]
+    #[test]
+    fn mock_copy_preparation_yields_to_the_calling_executor() {
+        let (done, result) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            smol::block_on(async {
+                let (release, receiver) = oneshot::channel();
+                let service = Clipboard::new(Arc::new(DeferredClipboardBackend {
+                    release: Mutex::new(Some(receiver)),
+                }))
+                .with_native_test_environment();
+                let mut app = element!(ContextProvider(value: crate::Context::owned(service)) { MixedCopyRoot });
+                let render = async {
+                    let mut frames = app.mock_terminal_render_loop(MockTerminalConfig::default());
+                    while frames.next().await.is_some() {}
+                };
+                let helper = async {
+                    smol::Timer::after(std::time::Duration::from_millis(10)).await;
+                    release.send(()).unwrap();
+                };
+                futures::join!(render, helper);
+            });
+            done.send(()).unwrap();
+        });
+        result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("mock preparation must release the runtime thread");
+        thread.join().unwrap();
     }
 }

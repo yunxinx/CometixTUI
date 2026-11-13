@@ -1,8 +1,4 @@
-//! Clipboard policy from CC Ink `termio/osc.ts:62-231`.
-//! The application supplies process execution and detached-task lifetime;
-//! iocraft owns native fallback, tmux policy, caching and terminal sequences.
-
-use crate::ansi::{self, MultiplexerPassthrough};
+use crate::ansi::MultiplexerPassthrough;
 use crate::hooks::{SelectionClipboardPath, StdoutHandle};
 use futures::future::BoxFuture;
 use std::sync::{Arc, Mutex};
@@ -11,7 +7,7 @@ use std::time::Duration;
 /// Host capabilities needed by the clipboard service, with no executor dependency.
 pub trait ClipboardBackend: Send + Sync + 'static {
     /// Starts the process immediately, returning its eventual exit status.
-    /// The process must continue if the returned future is dropped.
+    /// The output owner retains the future until the helper has exited or timed out.
     fn execute(
         &self,
         program: &str,
@@ -19,8 +15,6 @@ pub trait ClipboardBackend: Send + Sync + 'static {
         input: &str,
         timeout: Duration,
     ) -> BoxFuture<'static, i32>;
-    /// Detaches a continuation from the component lifetime.
-    fn spawn(&self, future: BoxFuture<'static, ()>);
     /// Uses the application's resolved terminal identity.
     fn is_kitty(&self) -> bool;
 }
@@ -32,6 +26,8 @@ pub struct Clipboard {
     backend: Arc<dyn ClipboardBackend>,
     linux_copy: Arc<Mutex<LinuxCopy>>,
     output: Option<Arc<StdoutHandle>>,
+    #[cfg(test)]
+    environment: Option<Environment>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +39,7 @@ enum LinuxCopy {
     Xsel,
 }
 
+#[derive(Clone)]
 struct Environment {
     platform: &'static str,
     ssh: bool,
@@ -77,6 +74,8 @@ impl Clipboard {
             backend,
             linux_copy: Arc::new(Mutex::new(LinuxCopy::Unprobed)),
             output: None,
+            #[cfg(test)]
+            environment: None,
         }
     }
 
@@ -98,57 +97,67 @@ impl Clipboard {
         Environment::current().get_clipboard_path()
     }
 
-    /// Maps to CC `setClipboard`. Starts native and tmux work immediately;
-    /// only tmux is awaited before returning the raw control sequence.
-    pub fn set_clipboard(&self, text: &str) -> BoxFuture<'static, String> {
-        self.set_clipboard_with_environment(text, Environment::current())
+    #[cfg(test)]
+    pub(crate) fn with_native_test_environment(mut self) -> Self {
+        self.environment = Some(Environment {
+            platform: "macos",
+            ssh: false,
+            tmux: false,
+            iterm: false,
+        });
+        self
     }
 
-    pub(crate) fn spawn(&self, future: BoxFuture<'static, ()>) {
-        self.backend.spawn(future);
+    pub(crate) async fn prepare(&self, text: &str) -> PreparedClipboard {
+        #[cfg(test)]
+        let environment = self
+            .environment
+            .clone()
+            .unwrap_or_else(Environment::current);
+        #[cfg(not(test))]
+        let environment = Environment::current();
+        self.prepare_with_environment(text, environment).await
     }
 
-    fn set_clipboard_with_environment(
+    async fn prepare_with_environment(
         &self,
         text: &str,
-        env: Environment,
-    ) -> BoxFuture<'static, String> {
-        let raw = ansi::osc52_clipboard_sequence_with_kitty(text, self.backend.is_kitty());
-        if !env.ssh {
-            self.copy_native(text, env.platform);
+        environment: Environment,
+    ) -> PreparedClipboard {
+        if !environment.ssh {
+            self.copy_native(text, environment.platform).await;
         }
-        let tmux = self.tmux_load_buffer(text, &env);
-        let passthrough =
-            ansi::osc52_clipboard_sequence_for_multiplexer(text, MultiplexerPassthrough::Tmux);
-        Box::pin(async move { if tmux.await { passthrough } else { raw } })
+        let tmux = environment.tmux
+            && self
+                .backend
+                .execute(
+                    "tmux",
+                    if environment.iterm {
+                        &["load-buffer", "-"]
+                    } else {
+                        &["load-buffer", "-w", "-"]
+                    },
+                    text,
+                    Duration::from_secs(2),
+                )
+                .await
+                == 0;
+        PreparedClipboard {
+            multiplexer: if tmux {
+                MultiplexerPassthrough::Tmux
+            } else {
+                MultiplexerPassthrough::None
+            },
+            is_kitty: self.backend.is_kitty(),
+        }
     }
 
-    // Maps to CC `tmuxLoadBuffer`: iTerm2 must not receive tmux's -w emission.
-    fn tmux_load_buffer(&self, text: &str, env: &Environment) -> BoxFuture<'static, bool> {
-        let process = env.tmux.then(|| {
-            self.backend.execute(
-                "tmux",
-                if env.iterm {
-                    &["load-buffer", "-"]
-                } else {
-                    &["load-buffer", "-w", "-"]
-                },
-                text,
-                Duration::from_millis(2000),
-            )
-        });
-        Box::pin(async move {
-            match process {
-                Some(p) => p.await == 0,
-                None => false,
-            }
-        })
-    }
-
-    // Maps to CC `copyNative`: a cached failure never triggers a new probe.
-    fn copy_native(&self, text: &str, platform: &str) {
-        let timeout = Duration::from_millis(2000);
-        let cached = *self.linux_copy.lock().unwrap();
+    async fn copy_native(&self, text: &str, platform: &str) {
+        let timeout = Duration::from_secs(2);
+        let cached = *self
+            .linux_copy
+            .lock()
+            .expect("clipboard policy is not poisoned");
         let command: Option<(&str, &[&str])> = match platform {
             "macos" => Some(("pbcopy", &[])),
             "windows" => Some(("clip", &[])),
@@ -160,66 +169,69 @@ impl Clipboard {
             },
             _ => None,
         };
-        if let Some((program, args)) = command {
-            drop(self.backend.execute(program, args, text, timeout));
+        if let Some((program, arguments)) = command {
+            self.backend
+                .execute(program, arguments, text, timeout)
+                .await;
         } else if platform == "linux" && cached == LinuxCopy::Unprobed {
-            // No probing state: simultaneous first calls independently launch
-            // wl-copy, exactly as the source's undefined/null/tool union does.
-            let first = self.backend.execute("wl-copy", &[], text, timeout);
-            let service = self.clone();
-            let text = text.to_string();
-            self.backend.spawn(Box::pin(async move {
-                let winner = if first.await == 0 {
-                    LinuxCopy::WlCopy
-                } else if service
-                    .backend
-                    .execute("xclip", &["-selection", "clipboard"], &text, timeout)
-                    .await
-                    == 0
-                {
-                    LinuxCopy::Xclip
-                } else if service
-                    .backend
-                    .execute("xsel", &["--clipboard", "--input"], &text, timeout)
-                    .await
-                    == 0
-                {
-                    LinuxCopy::Xsel
-                } else {
-                    LinuxCopy::Unavailable
-                };
-                *service.linux_copy.lock().unwrap() = winner;
-            }));
+            let winner = if self.backend.execute("wl-copy", &[], text, timeout).await == 0 {
+                LinuxCopy::WlCopy
+            } else if self
+                .backend
+                .execute("xclip", &["-selection", "clipboard"], text, timeout)
+                .await
+                == 0
+            {
+                LinuxCopy::Xclip
+            } else if self
+                .backend
+                .execute("xsel", &["--clipboard", "--input"], text, timeout)
+                .await
+                == 0
+            {
+                LinuxCopy::Xsel
+            } else {
+                LinuxCopy::Unavailable
+            };
+            *self
+                .linux_copy
+                .lock()
+                .expect("clipboard policy is not poisoned") = winner;
         }
     }
+}
+
+pub(crate) struct PreparedClipboard {
+    pub(crate) multiplexer: MultiplexerPassthrough,
+    pub(crate) is_kitty: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::{channel::oneshot, executor::block_on};
+    use futures::{FutureExt, channel::oneshot, executor::block_on};
     use std::collections::VecDeque;
 
-    /// (program, args, input, timeout) of one `execute` call.
     type Call = (String, Vec<String>, String, Duration);
-
     #[derive(Default)]
     struct Backend {
         calls: Mutex<Vec<Call>>,
         replies: Mutex<VecDeque<BoxFuture<'static, i32>>>,
-        tasks: Mutex<Vec<BoxFuture<'static, ()>>>,
     }
     impl ClipboardBackend for Backend {
         fn execute(
             &self,
             program: &str,
-            args: &[&str],
+            arguments: &[&str],
             input: &str,
             timeout: Duration,
         ) -> BoxFuture<'static, i32> {
             self.calls.lock().unwrap().push((
                 program.into(),
-                args.iter().map(|s| s.to_string()).collect(),
+                arguments
+                    .iter()
+                    .map(|argument| argument.to_string())
+                    .collect(),
                 input.into(),
                 timeout,
             ));
@@ -228,9 +240,6 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| Box::pin(async { 0 }))
-        }
-        fn spawn(&self, future: BoxFuture<'static, ()>) {
-            self.tasks.lock().unwrap().push(future);
         }
         fn is_kitty(&self) -> bool {
             true
@@ -243,22 +252,16 @@ mod tests {
                 .unwrap()
                 .push_back(Box::pin(async move { code }));
         }
-        fn drain(&self) {
-            let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
-            for task in tasks {
-                block_on(task);
-            }
-        }
         fn programs(&self) -> Vec<String> {
             self.calls
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|c| c.0.clone())
+                .map(|call| call.0.clone())
                 .collect()
         }
     }
-    fn env(platform: &'static str, ssh: bool, tmux: bool, iterm: bool) -> Environment {
+    fn environment(platform: &'static str, ssh: bool, tmux: bool, iterm: bool) -> Environment {
         Environment {
             platform,
             ssh,
@@ -266,15 +269,16 @@ mod tests {
             iterm,
         }
     }
+    fn sequence(prepared: PreparedClipboard, text: &str) -> String {
+        let mut output = Vec::new();
+        crate::ansi::write_clipboard(&mut output, text, prepared.multiplexer, prepared.is_kitty)
+            .unwrap();
+        String::from_utf8(output).unwrap()
+    }
 
     #[test]
-    fn clipboard_native_starts_before_tmux_and_does_not_wait_for_native_completion() {
+    fn clipboard_preparation_waits_for_native_before_tmux_and_terminal_output() {
         let backend = Arc::new(Backend::default());
-        backend
-            .replies
-            .lock()
-            .unwrap()
-            .push_back(Box::pin(futures::future::pending()));
         let (release, reply) = oneshot::channel();
         backend
             .replies
@@ -282,21 +286,24 @@ mod tests {
             .unwrap()
             .push_back(Box::pin(async move { reply.await.unwrap() }));
         let service = Clipboard::new(backend.clone());
-        let prepared =
-            service.set_clipboard_with_environment("中文\n🌈", env("macos", false, true, false));
+        let mut prepared = Box::pin(
+            service.prepare_with_environment("copy", environment("macos", false, true, false)),
+        );
+        assert!(backend.programs().is_empty());
+        assert!(prepared.as_mut().now_or_never().is_none());
+        assert_eq!(backend.programs(), ["pbcopy"]);
+        release.send(0).unwrap();
+        assert_eq!(
+            sequence(block_on(prepared), "copy"),
+            "\x1bPtmux;\x1b\x1b]52;c;Y29weQ==\x07\x1b\\"
+        );
         assert_eq!(backend.programs(), ["pbcopy", "tmux"]);
         let calls = backend.calls.lock().unwrap();
         assert_eq!(calls[1].1, ["load-buffer", "-w", "-"]);
         assert!(
             calls
                 .iter()
-                .all(|c| c.2 == "中文\n🌈" && c.3 == Duration::from_secs(2))
-        );
-        drop(calls);
-        release.send(0).unwrap();
-        assert_eq!(
-            block_on(prepared),
-            "\x1bPtmux;\x1b\x1b]52;c;5Lit5paHCvCfjIg=\x07\x1b\\"
+                .all(|call| call.2 == "copy" && call.3 == Duration::from_secs(2))
         );
     }
 
@@ -306,32 +313,41 @@ mod tests {
         backend.reply(1);
         let service = Clipboard::new(backend.clone());
         assert_eq!(
-            block_on(service.set_clipboard_with_environment("A", env("macos", true, true, true))),
+            sequence(
+                block_on(
+                    service.prepare_with_environment("A", environment("macos", true, true, true))
+                ),
+                "A"
+            ),
             "\x1b]52;c;QQ==\x1b\\"
         );
         assert_eq!(backend.programs(), ["tmux"]);
         assert_eq!(backend.calls.lock().unwrap()[0].1, ["load-buffer", "-"]);
         assert_eq!(
-            block_on(service.set_clipboard_with_environment("", env("macos", true, false, false))),
+            sequence(
+                block_on(
+                    service.prepare_with_environment("", environment("macos", true, false, false))
+                ),
+                ""
+            ),
             "\x1b]52;c;\x1b\\"
         );
-        assert_eq!(backend.programs(), ["tmux"]);
         assert_eq!(
-            env("macos", false, true, false).get_clipboard_path(),
+            environment("macos", false, true, false).get_clipboard_path(),
             SelectionClipboardPath::Native
         );
         assert_eq!(
-            env("linux", false, false, false).get_clipboard_path(),
+            environment("linux", false, false, false).get_clipboard_path(),
             SelectionClipboardPath::Osc52
         );
         assert_eq!(
-            env("macos", true, true, false).get_clipboard_path(),
+            environment("macos", true, true, false).get_clipboard_path(),
             SelectionClipboardPath::TmuxBuffer
         );
     }
 
     #[test]
-    fn clipboard_linux_probe_order_cached_success_failure_and_concurrent_first_calls() {
+    fn clipboard_linux_probe_order_and_cached_success_or_failure() {
         for (replies, expected, winner) in [
             (vec![0], vec!["wl-copy"], LinuxCopy::WlCopy),
             (vec![1, 0], vec!["wl-copy", "xclip"], LinuxCopy::Xclip),
@@ -351,43 +367,31 @@ mod tests {
                 backend.reply(reply);
             }
             let service = Clipboard::new(backend.clone());
-            drop(service.set_clipboard_with_environment("one", env("linux", false, false, false)));
-            backend.drain();
+            block_on(
+                service.prepare_with_environment("one", environment("linux", false, false, false)),
+            );
             assert_eq!(backend.programs(), expected);
             assert_eq!(*service.linux_copy.lock().unwrap(), winner);
             let count = backend.calls.lock().unwrap().len();
             backend.reply(1);
-            drop(
-                service
-                    .clone()
-                    .set_clipboard_with_environment("two", env("linux", false, false, false)),
+            block_on(
+                service.prepare_with_environment("two", environment("linux", false, false, false)),
             );
-            backend.drain();
             assert_eq!(
                 backend.calls.lock().unwrap().len(),
                 count + usize::from(winner != LinuxCopy::Unavailable)
             );
             assert_eq!(*service.linux_copy.lock().unwrap(), winner);
         }
-        let backend = Arc::new(Backend::default());
-        let service = Clipboard::new(backend.clone());
-        drop(service.set_clipboard_with_environment("one", env("linux", false, false, false)));
-        drop(
-            service
-                .clone()
-                .set_clipboard_with_environment("two", env("linux", false, false, false)),
-        );
-        assert_eq!(backend.programs(), ["wl-copy", "wl-copy"]);
-        assert_eq!(*service.linux_copy.lock().unwrap(), LinuxCopy::Unprobed);
-        backend.drain();
-        assert_eq!(*service.linux_copy.lock().unwrap(), LinuxCopy::WlCopy);
     }
 
     #[test]
     fn clipboard_windows_uses_clip_without_shell_or_arguments() {
         let backend = Arc::new(Backend::default());
         let service = Clipboard::new(backend.clone());
-        drop(service.set_clipboard_with_environment("text", env("windows", false, false, false)));
+        block_on(
+            service.prepare_with_environment("text", environment("windows", false, false, false)),
+        );
         assert_eq!(backend.programs(), ["clip"]);
         assert!(backend.calls.lock().unwrap()[0].1.is_empty());
     }

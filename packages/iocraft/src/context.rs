@@ -44,13 +44,15 @@ pub(crate) struct ExitOnCtrlCContext(pub bool);
 
 /// Renders the application history that precedes the inline canvas at a given terminal width.
 ///
-/// The inline renderer calls it right after it purges native scrollback (a width change, or a
-/// frame whose offscreen rows changed) and writes the returned canvases, oldest first, above the
-/// live canvas. Each canvas is written as complete rows, so it carries its own spacing.
+/// The inline renderer prepares these rows before purging native scrollback after a width change
+/// or a change to offscreen rows. It then writes them oldest first above the live canvas.
+/// Each canvas is written as complete rows, so it carries its own spacing.
 pub type ScrollbackReplay = Arc<dyn Fn(usize) -> Vec<crate::Canvas> + Send + Sync>;
 
 /// The system context, which is always available to all components.
 pub struct SystemContext {
+    pub(crate) image_scope: Option<crate::ImageScope>,
+    pub(crate) output: Option<crate::terminal::OutputSender>,
     should_exit: bool,
     mouse_capture: Option<bool>,
     keyboard_enhancement_flags: Option<crate::KeyboardEnhancementFlags>,
@@ -62,6 +64,8 @@ pub struct SystemContext {
 impl SystemContext {
     pub(crate) fn new() -> Self {
         Self {
+            image_scope: None,
+            output: None,
             should_exit: false,
             mouse_capture: None,
             keyboard_enhancement_flags: None,
@@ -95,6 +99,11 @@ impl SystemContext {
 
     pub(crate) fn begin_render_frame(&mut self) {
         self.alternate_screen = None;
+    }
+
+    /// Declares the image lifetime presented by this application, even in a text-only frame.
+    pub fn set_image_scope(&mut self, scope: Option<crate::ImageScope>) {
+        self.image_scope = scope;
     }
 
     /// Requests that the current render tree run inside the terminal's alternate screen.
@@ -141,8 +150,21 @@ impl SystemContext {
         self.keyboard_enhancement_flags
     }
 
-    /// Registers the history the inline renderer replays into native scrollback after purging
-    /// it, replacing any earlier registration. Without one, a purge leaves only the live canvas.
+    /// Reserves owned replay-source storage before preparing its callback.
+    /// Admission failures are reported by the render loop. Shared, already-budgeted
+    /// source allocations are excluded from `owned_bytes`.
+    pub fn prepare_scrollback_replay(
+        &mut self,
+        owned_bytes: usize,
+        prepare: impl FnOnce() -> ScrollbackReplay,
+    ) {
+        self.scrollback_replay = match &self.output {
+            Some(output) => output.prepare_replay(owned_bytes, prepare),
+            None => Some(prepare()),
+        };
+    }
+
+    /// Registers history to replay after an inline scrollback purge, replacing the earlier callback.
     pub fn set_scrollback_replay(&mut self, replay: ScrollbackReplay) {
         self.scrollback_replay = Some(replay);
     }

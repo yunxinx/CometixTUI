@@ -827,6 +827,7 @@ struct DrawContext<'a> {
     /// paints over whatever lies under it, so a subtree restored from the previous canvas
     /// would bring back an overlay that has since moved, shrunk or gone.
     overlays: Vec<CanvasRect>,
+    hit_regions: Vec<crate::HitRegion>,
     /// A component found itself drawn at a size other than the one it laid itself out at.
     layout_pass_requested: bool,
     /// A drawn node moved or changed height since it was last drawn, or a drawn node was
@@ -1311,6 +1312,12 @@ impl ComponentDrawer<'_> {
         self.context.deferred_no_select.clear();
     }
 
+    /// Attaches an immutable target to a screen rectangle in this frame's input projection.
+    /// Supply only visible, finite identities; this never retains a component tree.
+    pub fn add_hit_region(&mut self, region: crate::HitRegion) {
+        self.context.hit_regions.push(region);
+    }
+
     /// Gets the root canvas for crate-level post-render hooks.
     pub(crate) fn root_canvas_mut(&mut self) -> &mut Canvas {
         self.context.canvas
@@ -1761,6 +1768,7 @@ struct Tree<'a> {
 struct RenderOutput {
     canvas: Canvas,
     overlays: Vec<CanvasRect>,
+    hit_regions: Vec<crate::HitRegion>,
     did_clear_terminal_output: bool,
     alternate_screen_changed: bool,
     layout_pass_requested: bool,
@@ -1910,6 +1918,7 @@ impl<'a> Tree<'a> {
                     drawn_node_removed: false,
                     layout_invalidations: LayoutInvalidations::default(),
                 };
+                let output_context = self.system_context.output.clone();
                 let mut component_context_stack = ContextStack::root(&mut self.system_context);
                 // CC Ink dispatches hit-test/focus events from a single DOM root.
                 // Seed an equivalent root event context for the whole iocraft tree so
@@ -1927,11 +1936,16 @@ impl<'a> Tree<'a> {
                                 component_context_stack.with_context(
                                     Some(Context::owned(self.clock.clone())),
                                     |component_context_stack| {
-                                        self.root_component.update(
-                                            &mut context,
-                                            &mut wrapper_child_node_ids,
-                                            component_context_stack,
-                                            self.root_component_props.borrow(),
+                                        component_context_stack.with_context(
+                                            output_context.clone().map(Context::owned),
+                                            |component_context_stack| {
+                                                self.root_component.update(
+                                                    &mut context,
+                                                    &mut wrapper_child_node_ids,
+                                                    component_context_stack,
+                                                    self.root_component_props.borrow(),
+                                                );
+                                            },
                                         );
                                     },
                                 );
@@ -2165,13 +2179,14 @@ impl<'a> Tree<'a> {
             .unwrap_or(wrapper_layout.size.height as usize);
         let canvas_alloc_start = profile_enabled.then(std::time::Instant::now);
         let mut canvas = Canvas::new(canvas_width, canvas_height);
+        canvas.set_image_scope(self.system_context.image_scope.clone());
         let canvas_alloc = canvas_alloc_start.map_or(Duration::ZERO, |start| start.elapsed());
         let mut deferred_no_select = Vec::new();
         let root_layout = self
             .layout_engine
             .layout(self.root_component.node_id())
             .expect("we should be able to get the root layout");
-        let (overlays, layout_pass_requested, layout_shifted) = {
+        let (overlays, hit_regions, layout_pass_requested, layout_shifted) = {
             let mut drawer = ComponentDrawer {
                 node_id: self.root_component.node_id(),
                 node_position: Point {
@@ -2208,6 +2223,7 @@ impl<'a> Tree<'a> {
                     },
                     prev_overlays,
                     overlays: Vec::new(),
+                    hit_regions: Vec::new(),
                     layout_pass_requested: false,
                     layout_shifted: drawn_node_removed,
                 },
@@ -2218,6 +2234,7 @@ impl<'a> Tree<'a> {
             drawer.clear_deferred_no_select();
             (
                 drawer.context.overlays,
+                drawer.context.hit_regions,
                 drawer.context.layout_pass_requested,
                 drawer.context.layout_shifted,
             )
@@ -2237,6 +2254,7 @@ impl<'a> Tree<'a> {
         Ok(RenderOutput {
             canvas,
             overlays,
+            hit_regions,
             did_clear_terminal_output,
             alternate_screen_changed,
             layout_pass_requested,
@@ -2272,8 +2290,22 @@ impl<'a> Tree<'a> {
         &mut self,
         mut term: Terminal<'_>,
         throttle: Option<std::time::Duration>,
+        frame_profile: Option<FrameProfileCallback<'_>>,
+    ) -> io::Result<()> {
+        let result = self
+            .render_terminal_session(&mut term, throttle, frame_profile)
+            .await;
+        let finish = term.finish().await;
+        result.and(finish)
+    }
+
+    async fn render_terminal_session(
+        &mut self,
+        term: &mut Terminal<'_>,
+        throttle: Option<std::time::Duration>,
         mut frame_profile: Option<FrameProfileCallback<'_>>,
     ) -> io::Result<()> {
+        self.system_context.output = term.output_sender();
         term.start_event_stream()?;
         let mut prev_canvas: Option<Canvas> = None;
         let mut unpainted_canvas: Option<Canvas> = None;
@@ -2301,8 +2333,7 @@ impl<'a> Tree<'a> {
                     }
                     let timer = futures_timer::Delay::new(remaining);
                     if let futures::future::Either::Right((result, _)) =
-                        futures::future::select(timer, self.wait_for_change(&mut term).boxed())
-                            .await
+                        futures::future::select(timer, self.wait_for_change(term).boxed()).await
                     {
                         deferred_input = result?;
                     }
@@ -2419,6 +2450,7 @@ impl<'a> Tree<'a> {
                     output = next;
                     batch_events += 1;
                 }
+                output.did_clear_terminal_output |= term.take_output_clear();
                 term.set_scrollback_replay(self.system_context.scrollback_replay());
                 let terminal_diff_planning = term.canvas_diff_planning();
                 let (should_repaint, repaint_reason, changed_cells, diff_rows_scanned) =
@@ -2497,6 +2529,7 @@ impl<'a> Tree<'a> {
                     changed_cells,
                 );
                 let previous_damage = prev_canvas.as_ref().and_then(Canvas::damage_region);
+                let accepted;
                 if should_repaint {
                     repaint = Some(DebugRepaintInfo {
                         reason: repaint_reason,
@@ -2527,13 +2560,21 @@ impl<'a> Tree<'a> {
                     } else {
                         prev_canvas.as_ref()
                     };
-                    term.write_canvas_after_repaint_check(prev, &output.canvas)?;
+                    let mut draft = crate::FrameDraft::new(output.canvas.clone()).with_hits(output.hit_regions.clone());
+                    draft.views = Some(self.root_view_event_context.capture_hits());
+                    accepted = term.write_canvas_after_repaint_check(prev, draft)?;
                     // Position (or hide) the physical cursor after the frame has been
                     // committed, so IMEs and screen readers can anchor to the caret of
                     // a focused text input.
-                    term.position_cursor(output.canvas.cursor_declaration())?;
+                    if accepted { term.position_cursor(output.canvas.cursor_declaration())?; }
                     frame_phases.terminal_write =
                         write_start.map_or(Duration::ZERO, |start| start.elapsed());
+                }
+                else {
+                    let mut draft = crate::FrameDraft::new(output.canvas.clone()).with_hits(output.hit_regions.clone());
+                    draft.paint = false;
+                    draft.views = Some(self.root_view_event_context.capture_hits());
+                    accepted = term.write_canvas_after_repaint_check(prev_canvas.as_ref(), draft)?;
                 }
                 frame_phases.update = output.phase_profile.update;
                 frame_phases.layout = output.phase_profile.layout;
@@ -2553,7 +2594,7 @@ impl<'a> Tree<'a> {
                 // Canvas equality ignores damage so this does not wake idle
                 // renders by itself.
                 let canvas_swap_start = profile_enabled.then(std::time::Instant::now);
-                if should_repaint {
+                if should_repaint && accepted {
                     prev_canvas = Some(output.canvas);
                     unpainted_canvas = None;
                 } else {
@@ -2581,6 +2622,7 @@ impl<'a> Tree<'a> {
                     repaint,
                 });
             }
+            term.settle_mock_output().await?;
             let last_frame = std::time::Instant::now();
             if let Some(requested) = self.system_context.mouse_capture()
                 && mouse_capture_enabled != Some(requested)
@@ -2599,11 +2641,11 @@ impl<'a> Tree<'a> {
                 // Terminal ownership handoff: release modes, run the job, then
                 // reacquire and force a full repaint. The job itself decides
                 // whether to spawn a process, print, prompt, etc.
-                let release = term.release_terminal();
+                let release = term.release_terminal().await;
                 if let Some(job) = request.take_job() {
                     job(release);
                 }
-                term.reacquire_terminal()?;
+                term.reacquire_terminal().await?;
                 prev_canvas = None;
                 unpainted_canvas = None;
                 prev_terminal_size = None;
@@ -2622,7 +2664,7 @@ impl<'a> Tree<'a> {
             if let Some(result) = dispatched {
                 result?;
             } else {
-                deferred_input = self.wait_for_change(&mut term).await?;
+                deferred_input = self.wait_for_change(term).await?;
             }
             if deferred_input {
                 continue;
@@ -2668,7 +2710,7 @@ impl<'a> Tree<'a> {
                         let timer = futures_timer::Delay::new(remaining);
                         let timed_out = match futures::future::select(
                             timer,
-                            self.wait_for_change(&mut term).boxed(),
+                            self.wait_for_change(term).boxed(),
                         )
                         .await
                         {
@@ -2974,7 +3016,7 @@ pub(crate) fn mock_terminal_render_loop_with_profile<'a, E>(
 where
     E: ElementExt + 'a,
 {
-    let (term, output) = Terminal::mock(config);
+    let (term, output) = Terminal::mock_owned(config);
     MockTerminalRenderLoop {
         // No throttling for mock terminals: tests rely on deterministic, immediate
         // frame production.

@@ -58,6 +58,15 @@ impl SynchronizedOutput {
         }
     }
 
+    pub(super) fn restore(&mut self, writer: &mut dyn Write) -> io::Result<()> {
+        if self.transaction == Transaction::Idle {
+            self.depth = 0;
+            return Ok(());
+        }
+        self.depth = 1;
+        self.leave(writer)
+    }
+
     pub(super) fn enter(&mut self) {
         self.depth += 1;
     }

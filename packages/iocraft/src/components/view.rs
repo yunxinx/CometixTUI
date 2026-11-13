@@ -592,11 +592,13 @@ impl ViewFocusEvent {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 struct PendingClick {
     column: u16,
     row: u16,
     dragged: bool,
+    projection: Option<Arc<ViewHitProjection>>,
+    region: ViewEventRegion,
 }
 
 #[derive(Clone)]
@@ -718,7 +720,52 @@ pub(crate) struct ViewFocusParentContext {
     paste_handlers: Vec<SharedPasteHandler>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ViewHitProjection {
+    clicks: Vec<ViewHitRecord>,
+    hover: Vec<ViewHoverRecord>,
+}
+
+impl ViewHitProjection {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.clicks.capacity() * (size_of::<ViewHitRecord>() + 512)
+            + self.hover.capacity() * (size_of::<ViewHoverRecord>() + 512)
+    }
+}
+
 impl ViewFocusParentContext {
+    pub(crate) fn capture_hits(&self) -> Arc<ViewHitProjection> {
+        let freeze = |region: &Arc<Mutex<Option<ViewEventRegion>>>| {
+            Arc::new(Mutex::new(
+                *region.lock().expect("view geometry is not poisoned"),
+            ))
+        };
+        let clicks = self
+            .click_registry
+            .lock()
+            .expect("view registry is not poisoned")
+            .iter()
+            .map(|record| {
+                let mut record = record.clone();
+                record.region = freeze(&record.region);
+                record
+            })
+            .collect();
+        let hover = self
+            .hover_registry
+            .lock()
+            .expect("view registry is not poisoned")
+            .iter()
+            .map(|record| {
+                let mut record = record.clone();
+                record.region = freeze(&record.region);
+                record
+            })
+            .collect();
+        Arc::new(ViewHitProjection { clicks, hover })
+    }
+
     pub(crate) fn shared_root() -> Self {
         Self {
             shared_root_event_context: true,
@@ -1359,7 +1406,11 @@ impl Component for View {
                 return;
             }
             let TerminalEvent::FullscreenMouse(FullscreenMouseEvent {
-                column, row, kind, ..
+                column,
+                row,
+                kind,
+                frame,
+                ..
             }) = event
             else {
                 return;
@@ -1370,10 +1421,18 @@ impl Component for View {
             ) {
                 return;
             }
-            let records = hover_registry_for_event
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
+            let records = frame
+                .as_ref()
+                .and_then(|frame| frame.views.as_ref())
+                .map_or_else(
+                    || {
+                        hover_registry_for_event
+                            .lock()
+                            .expect("view registry is not poisoned")
+                            .clone()
+                    },
+                    |projection| projection.hover.clone(),
+                );
             if !records
                 .iter()
                 .any(|record| record.on_enter.is_some() || record.on_leave.is_some())
@@ -1787,24 +1846,37 @@ impl Component for View {
                     row,
                     kind,
                     cell_is_blank,
+                    frame,
                     ..
                 }) = event.event()
                 else {
                     return;
                 };
 
-                let region = *region_for_click
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let Some(region) = region else {
+                let records = frame
+                    .as_ref()
+                    .and_then(|frame| frame.views.as_ref())
+                    .map_or_else(
+                        || {
+                            click_registry
+                                .lock()
+                                .expect("view registry is not poisoned")
+                                .clone()
+                        },
+                        |projection| projection.clicks.clone(),
+                    );
+                let Some(region) =
+                    records
+                        .iter()
+                        .find(|record| record.id == view_id)
+                        .and_then(|record| {
+                            *record.region.lock().expect("view geometry is not poisoned")
+                        })
+                else {
                     return;
                 };
                 let rect = region.rect;
                 let inside = region.contains(*column, *row);
-                let records = click_registry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
                 let target_record = records
                     .iter()
                     .rev()
@@ -1823,6 +1895,8 @@ impl Component for View {
                                 column: *column,
                                 row: *row,
                                 dragged: false,
+                                projection: frame.as_ref().and_then(|frame| frame.views.clone()),
+                                region,
                             });
                         } else {
                             *pending = None;
@@ -1840,7 +1914,15 @@ impl Component for View {
                         if let Some(click) = click
                             && inside
                             && !click.dragged
+                            && click.region.rect == region.rect
+                            && click.region.visible_rect == region.visible_rect
                         {
+                            let records = click
+                                .projection
+                                .as_ref()
+                                .map_or(records.as_slice(), |projection| {
+                                    projection.clicks.as_slice()
+                                });
                             // Match CC Ink's dispatchClick: click-to-focus is part of
                             // the completed release-click, not the initial mouse down.
                             // A drag that started on a focusable view must not steal focus.
