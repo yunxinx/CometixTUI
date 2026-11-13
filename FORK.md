@@ -1,5 +1,7 @@
 # CometixTUI fork
 
+`real_editor_roundtrip_in_native_pty` exercises the production terminal adapter in native Unix PTYs and Windows ConPTY. It checks controlled Unicode editing, resize, dynamic screen transitions, and clean exit at terminal heights of one, two, and three rows. The Terminal PTY workflow retains the raw terminal transcripts for each platform.
+
 This fork extends [Haleclipse/CometixTUI](https://github.com/Haleclipse/CometixTUI) at `ec7c06155482815a4b4a99be5ad4c62675a632a1` with controlled-input support:
 
 - Raw input distinguishes CR (Enter), LF (Ctrl+J), and legacy ESC+CR (Alt+Enter), preserving modified CSI-u, modifyOtherKeys, and keypad Enter reports across input chunks. `enter_encodings_preserve_submission_and_newline_keys` covers the event bridge. Disambiguated keypad navigation and enhanced F1/F2/F4 reports keep their legacy key meanings; covered by `disambiguated_keypad_and_function_keys_keep_legacy_navigation` and the event-kind tests.

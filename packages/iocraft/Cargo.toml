@@ -46,3 +46,4 @@ macro_rules_attribute = "0.2.0"
 # XXX: Enables optional features when testing so CI covers them. This has no
 # version, so Cargo strips it when publishing.
 iocraft = { path = ".", features = ["serde"] }
+portable-pty = "0.9.0"

@@ -1,0 +1,28 @@
+name: Terminal PTY
+on:
+  push:
+    branches: [verify/terminal-commit-windows]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  terminal:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - name: Run native terminal checkpoint
+        run: cargo test -p iocraft --test terminal_pty -- --nocapture
+        env:
+          IOCRAFT_PTY_REPORT: ${{ github.workspace }}/terminal-pty-results
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: terminal-pty-${{ matrix.os }}
+          path: terminal-pty-results
+          if-no-files-found: error
