@@ -441,3 +441,85 @@ fn committed_hits_survive_backpressure_and_are_invalidated_by_handoff() {
         output.finish().await.unwrap();
     });
 }
+
+#[test]
+fn frame_capacity_backpressure_preserves_the_accepted_target_and_recovers() {
+    smol::block_on(async {
+        let capture = Capture::default();
+        let mut output = OutputSession::with_capacity(
+            Box::new(capture.clone()),
+            Box::new(io::sink()),
+            false,
+            false,
+            Some(false),
+            Output::Stdout,
+            OutputCapacity::new(144 * 1024, ()),
+        )
+        .unwrap();
+        barrier(&mut output).await;
+        capture.blocked.store(true, Ordering::Release);
+        output
+            .enqueue(Operation::Bytes(vec![b'p'; 24 * 1024], true))
+            .unwrap();
+        let target = |bytes| {
+            let mut operation = frame(Canvas::new(1, 1), 3);
+            if let Operation::Frame { draft, .. } = &mut operation {
+                draft.coverage =
+                    Some(SourceCoverage::new(Arc::new(vec![0u8; bytes])).with_owned_bytes(bytes));
+            }
+            operation
+        };
+        assert!(output.enqueue_frame(target(20 * 1024)).unwrap());
+        assert!(!output.enqueue_frame(target(40 * 1024)).unwrap());
+        capture.blocked.store(false, Ordering::Release);
+        barrier(&mut output).await;
+        let committed = output.sender().committed_frame().unwrap();
+        assert_eq!(
+            committed
+                .receipt
+                .coverage
+                .as_ref()
+                .unwrap()
+                .get::<Vec<u8>>()
+                .unwrap()
+                .len(),
+            20 * 1024
+        );
+        drop(committed);
+        assert!(output.enqueue_frame(target(40 * 1024)).unwrap());
+        barrier(&mut output).await;
+        assert_eq!(
+            output
+                .sender()
+                .committed_frame()
+                .unwrap()
+                .receipt
+                .coverage
+                .as_ref()
+                .unwrap()
+                .get::<Vec<u8>>()
+                .unwrap()
+                .len(),
+            40 * 1024
+        );
+        output.finish().await.unwrap();
+    });
+}
+
+#[test]
+fn dropped_history_receipt_does_not_hide_render_loop_admission_failure() {
+    smol::block_on(async {
+        let mut output = session(Capture::default());
+        let draft = HistoryDraft::new(Canvas::new(1, 1))
+            .with_coverage(SourceCoverage::new(Arc::new(())).with_owned_bytes(65 * 1024 * 1024));
+        drop(output.sender().append_history_with_errors(draft, true));
+        assert_eq!(
+            output.check().unwrap_err().kind(),
+            io::ErrorKind::OutOfMemory
+        );
+        assert_eq!(
+            output.finish().await.unwrap_err().kind(),
+            io::ErrorKind::OutOfMemory
+        );
+    });
+}

@@ -14,7 +14,7 @@ pub(super) struct ScreenTransitionPlan {
 }
 
 pub(super) type ReplayWriter<'a> =
-    dyn FnMut(&ScrollbackReplay, usize, Option<&mut dyn Write>) -> io::Result<()> + 'a;
+    dyn FnMut(&ScrollbackReplay, usize, bool, &mut dyn Write) -> io::Result<()> + 'a;
 
 pub(super) trait TerminalImpl: Write + Send {
     fn finish(&mut self) -> io::Result<()> {
@@ -844,16 +844,21 @@ impl TerminalImpl for StdTerminal<'_> {
         output: OutputContext,
     ) -> io::Result<()> {
         let mut prepared = Vec::new();
-        self.write_canvas_with_replay(prev, canvas, output, &mut |replay, width, writer| {
-            if let Some(writer) = writer {
-                for canvas in prepared.drain(..) {
-                    Canvas::write_ansi(&canvas, &mut *writer)?;
+        self.write_canvas_with_replay(
+            prev,
+            canvas,
+            output,
+            &mut |replay, width, prepare, writer| {
+                if !prepare {
+                    for canvas in prepared.drain(..) {
+                        Canvas::write_ansi(&canvas, &mut *writer)?;
+                    }
+                } else {
+                    prepared = replay(width);
                 }
-            } else {
-                prepared = replay(width);
-            }
-            Ok(())
-        })
+                Ok(())
+            },
+        )
     }
 
     fn write_canvas_with_replay(
@@ -1439,11 +1444,11 @@ impl<'a> StdTerminal<'a> {
             Some(TerminalClearReason::Resize | TerminalClearReason::Offscreen) => {
                 let replay = self.scrollback_replay.clone();
                 if let Some(replay) = &replay {
-                    write_history(replay, usize::from(next_width), None)?;
+                    write_history(replay, usize::from(next_width), true, &mut *self.dest)?;
                 }
                 self.clear_terminal()?;
                 if let Some(replay) = &replay {
-                    write_history(replay, usize::from(next_width), Some(&mut *self.dest))?;
+                    write_history(replay, usize::from(next_width), false, &mut *self.dest)?;
                 }
                 Ok(())
             }

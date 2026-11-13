@@ -136,7 +136,7 @@ fn real_editor_roundtrip_in_three_row_pty() {
 fn run_editor_in_native_pty(rows: u16, test_name: &str) {
     if std::env::var_os("IOCRAFT_PTY_CHILD").is_some() {
         println!();
-        smol::block_on(element!(Editor).render_loop()).unwrap();
+        smol::block_on(element!(Editor).render_loop().suspend_on_ctrl_z()).unwrap();
         return;
     }
     {
@@ -240,6 +240,29 @@ fn run_editor_in_native_pty(rows: u16, test_name: &str) {
                 .resize(30, usize::from(rows));
             pair.master.resize(PtySize { cols: 30, ..size }).unwrap();
             output.wait_for("A30:seed界");
+            #[cfg(unix)]
+            {
+                send_input(b"\x1a");
+                let process = i32::try_from(child.process_id().unwrap()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let mut status = 0;
+                    // SAFETY: process is this test's live child and status is writable.
+                    let waited = unsafe {
+                        libc::waitpid(process, &mut status, libc::WUNTRACED | libc::WNOHANG)
+                    };
+                    assert!(waited >= 0, "wait for terminal suspension");
+                    if waited == process && libc::WIFSTOPPED(status) {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "editor did not suspend");
+                    output.receive(Duration::from_millis(10));
+                }
+                // SAFETY: SIGCONT targets only the child created by this test.
+                assert_eq!(unsafe { libc::kill(process, libc::SIGCONT) }, 0);
+                output.wait_for("A30:seed界");
+            }
+
             send_input(b"\x14");
             output.wait_for("M30:seed界");
             output.wait_for_sequence(b"\x1b[?1049l");

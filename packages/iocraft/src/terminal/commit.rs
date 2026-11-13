@@ -235,7 +235,7 @@ impl OutputSession {
             move |worker| {
                 let destination = Box::new(ResumableWriter::new(destination, worker.clone()));
                 let alternate = Box::new(ResumableWriter::new(alternate, worker.clone()));
-                let mut backend = StdTerminal::new(
+                let backend = StdTerminal::new(
                     destination,
                     alternate,
                     fullscreen,
@@ -243,14 +243,16 @@ impl OutputSession {
                     keyboard_support,
                 )?;
                 #[cfg(unix)]
-                {
+                let backend = {
+                    let mut backend = backend;
                     worker
                         .pending
                         .lock()
                         .expect("output initialization is not poisoned")
                         .resume_signal = backend.resume_signal.take();
                     worker.completed.wake();
-                }
+                    backend
+                };
                 Ok(Box::new(backend))
             },
         )
@@ -403,7 +405,7 @@ impl OutputSession {
 
     pub(super) fn poll_output_or_resume(&mut self, context: &mut Context<'_>) -> Poll<()> {
         self.shared.completed.register(context.waker());
-        let mut pending = self
+        let pending = self
             .shared
             .pending
             .lock()
@@ -421,6 +423,8 @@ impl OutputSession {
         {
             return Poll::Ready(());
         }
+        #[cfg(unix)]
+        let mut pending = pending;
         #[cfg(unix)]
         if let Some(signal) = pending.resume_signal.as_mut() {
             return signal.poll_resumed(context);
@@ -906,8 +910,9 @@ impl OutputOwner {
                             self.previous.as_ref(),
                             &resolved,
                             synchronization.context(),
-                            &mut |replay, width, writer| {
-                                let Some(writer) = writer else {
+                            &mut |replay, width, prepare, writer| {
+                                if prepare {
+                                    synchronization.leave(writer)?;
                                     for mut history in replay(width) {
                                         history.output_allocations =
                                             history.reserve_output(&memory, false)?;
@@ -917,7 +922,7 @@ impl OutputOwner {
                                         prepared_history.push((history, plan));
                                     }
                                     return Ok(());
-                                };
+                                }
                                 let end = synchronization.leave(writer);
                                 let result = end.and_then(|()| {
                                     for (history, plan) in prepared_history.drain(..) {
