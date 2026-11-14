@@ -1098,32 +1098,60 @@ enum ModalPagerAction {
 }
 
 fn scroll_key_delta(event: &KeyEvent, viewport_height: u32, modal_pager_keys: bool) -> Option<i32> {
-    // Shift with an arrow, Home or End moves only a selection's focus, as CC
-    // Ink's `selectionFocusMoveForKey` does, whether or not a selection exists.
-    if SelectionController::selection_focus_move_for_key(event).is_some() {
-        return None;
-    }
-    if modal_pager_keys && let Some(action) = modal_pager_action(event) {
-        return Some(match action {
-            ModalPagerAction::LineUp => -1,
-            ModalPagerAction::LineDown => 1,
-            ModalPagerAction::HalfPageUp => -((viewport_height as i32 / 2).max(1)),
-            ModalPagerAction::HalfPageDown => (viewport_height as i32 / 2).max(1),
-            ModalPagerAction::FullPageUp => -(viewport_height as i32).max(1),
-            ModalPagerAction::FullPageDown => (viewport_height as i32).max(1),
-            ModalPagerAction::Top => i32::MIN / 2,
-            ModalPagerAction::Bottom => i32::MAX / 2,
-        });
-    }
+    ScrollNavigation::from_key(event, viewport_height, modal_pager_keys).map(
+        |intent| match intent {
+            ScrollNavigation::Rows(rows) => rows,
+            ScrollNavigation::Top => i32::MIN / 2,
+            ScrollNavigation::Bottom => i32::MAX / 2,
+        },
+    )
+}
 
-    match event.code {
-        KeyCode::Up => Some(-1),
-        KeyCode::Down => Some(1),
-        KeyCode::PageUp => Some(-(viewport_height as i32).max(1)),
-        KeyCode::PageDown => Some((viewport_height as i32).max(1)),
-        KeyCode::Home => Some(i32::MIN / 2),
-        KeyCode::End => Some(i32::MAX / 2),
-        _ => None,
+/// A navigation request whose destination is resolved by the scrolling content owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollNavigation {
+    /// Move through this many adjacent display rows.
+    Rows(i32),
+    /// Read from the beginning of the source.
+    Top,
+    /// Read through the end of the source.
+    Bottom,
+}
+
+impl ScrollNavigation {
+    /// Interprets scroll keys, preserving selection keys and optional modal pager bindings.
+    pub fn from_key(
+        event: &KeyEvent,
+        viewport_height: u32,
+        modal_pager_keys: bool,
+    ) -> Option<Self> {
+        // Shift with an arrow, Home or End moves only a selection's focus, as CC
+        // Ink's `selectionFocusMoveForKey` does, whether or not a selection exists.
+        if SelectionController::selection_focus_move_for_key(event).is_some() {
+            return None;
+        }
+        if modal_pager_keys && let Some(action) = modal_pager_action(event) {
+            return Some(match action {
+                ModalPagerAction::LineUp => Self::Rows(-1),
+                ModalPagerAction::LineDown => Self::Rows(1),
+                ModalPagerAction::HalfPageUp => Self::Rows(-((viewport_height as i32 / 2).max(1))),
+                ModalPagerAction::HalfPageDown => Self::Rows((viewport_height as i32 / 2).max(1)),
+                ModalPagerAction::FullPageUp => Self::Rows(-(viewport_height as i32).max(1)),
+                ModalPagerAction::FullPageDown => Self::Rows((viewport_height as i32).max(1)),
+                ModalPagerAction::Top => Self::Top,
+                ModalPagerAction::Bottom => Self::Bottom,
+            });
+        }
+
+        match event.code {
+            KeyCode::Up => Some(Self::Rows(-1)),
+            KeyCode::Down => Some(Self::Rows(1)),
+            KeyCode::PageUp => Some(Self::Rows(-(viewport_height as i32).max(1))),
+            KeyCode::PageDown => Some(Self::Rows((viewport_height as i32).max(1))),
+            KeyCode::Home => Some(Self::Top),
+            KeyCode::End => Some(Self::Bottom),
+            _ => None,
+        }
     }
 }
 
@@ -1564,6 +1592,33 @@ fn drain_scroll_delta_xterm_js(pending: i32, viewport_height: u16) -> ScrollDrai
     ScrollDrainResult {
         applied,
         remaining: if rem > 0 { sign * rem } else { 0 },
+    }
+}
+
+/// Wheel acceleration shared by scrolling containers and source-driven readers.
+#[derive(Clone, Debug)]
+pub struct ScrollWheel {
+    state: WheelAccelState,
+}
+
+impl Default for ScrollWheel {
+    fn default() -> Self {
+        Self {
+            state: WheelAccelState::from_env(),
+        }
+    }
+}
+
+impl ScrollWheel {
+    /// Returns the signed row request for a vertical wheel event, including host acceleration.
+    pub fn navigation(&mut self, event: &MouseEventKind) -> Option<ScrollNavigation> {
+        let direction = match event {
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::ScrollDown => 1,
+            _ => return None,
+        };
+        let step = self.state.compute_now(direction);
+        (step > 0).then_some(ScrollNavigation::Rows(step * i32::from(direction)))
     }
 }
 
@@ -2966,6 +3021,48 @@ mod tests {
             kind: KeyEventKind::Press,
         };
         assert_eq!(scroll_key_delta(&shift_page_down, 10, true), Some(10));
+    }
+
+    #[test]
+    fn source_navigation_preserves_bounds_page_sizes_and_selection_keys() {
+        let key = |code, modifiers| KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+        };
+        for (code, expected) in [
+            (KeyCode::Home, ScrollNavigation::Top),
+            (KeyCode::End, ScrollNavigation::Bottom),
+            (KeyCode::PageUp, ScrollNavigation::Rows(-11)),
+            (KeyCode::PageDown, ScrollNavigation::Rows(11)),
+        ] {
+            assert_eq!(
+                ScrollNavigation::from_key(&key(code, KeyModifiers::NONE), 11, false),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            ScrollNavigation::from_key(&key(KeyCode::Char('d'), KeyModifiers::CONTROL), 11, true),
+            Some(ScrollNavigation::Rows(5))
+        );
+        assert_eq!(
+            ScrollNavigation::from_key(&key(KeyCode::Char('g'), KeyModifiers::NONE), 11, true),
+            Some(ScrollNavigation::Top)
+        );
+        assert_eq!(
+            ScrollNavigation::from_key(&key(KeyCode::Char('G'), KeyModifiers::SHIFT), 11, true),
+            Some(ScrollNavigation::Bottom)
+        );
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Home, KeyCode::End] {
+            assert_eq!(
+                ScrollNavigation::from_key(&key(code, KeyModifiers::SHIFT), 11, true),
+                None
+            );
+        }
+        assert_eq!(
+            ScrollWheel::default().navigation(&MouseEventKind::Moved),
+            None
+        );
     }
 
     #[test]
