@@ -5,9 +5,8 @@ use iocraft::prelude::*;
 #[cfg(windows)]
 use portable_pty::ChildKiller;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -243,9 +242,60 @@ impl Drop for PtyDeadline {
 }
 
 struct Directory(PathBuf);
+
+impl Directory {
+    fn set_output_paused(&self, paused: bool) -> io::Result<()> {
+        let path = self.0.join("output-paused");
+        if paused {
+            std::fs::write(path, b"paused")
+        } else {
+            match std::fs::remove_file(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            }
+        }
+    }
+}
+
 impl Drop for Directory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct GatedOutput {
+    directory: PathBuf,
+    output: io::Stdout,
+    reported_block: bool,
+}
+
+impl GatedOutput {
+    fn check_writable(&mut self) -> io::Result<()> {
+        // ConPTY needs its output drained to deliver native input. Block at the writer boundary.
+        if self.directory.join("output-paused").try_exists()? {
+            if !self.reported_block {
+                std::fs::write(self.directory.join("output-blocked"), b"blocked")?;
+                self.reported_block = true;
+            }
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        if self.reported_block {
+            std::fs::remove_file(self.directory.join("output-blocked"))?;
+            self.reported_block = false;
+        }
+        Ok(())
+    }
+}
+
+impl Write for GatedOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.check_writable()?;
+        self.output.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.check_writable()?;
+        self.output.flush()
     }
 }
 
@@ -256,9 +306,16 @@ fn contents(path: &Path) -> Option<String> {
 #[test]
 fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
     if let Some(directory) = std::env::var_os("IOCRAFT_SCROLLBACK_CHILD") {
+        let directory = PathBuf::from(directory);
+        let output = GatedOutput {
+            directory: directory.clone(),
+            output: io::stdout(),
+            reported_block: false,
+        };
         smol::block_on(
-            element!(Replay(directory: PathBuf::from(directory)))
+            element!(Replay(directory: directory))
                 .render_loop()
+                .stdout(output)
                 .ignore_ctrl_c(),
         )
         .unwrap();
@@ -284,16 +341,11 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
         let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
         let terminal = Arc::new(Mutex::new(avt::Vt::new(40, usize::from(rows))));
         let mut decoder = pty_output::OutputDecoder::new(terminal.clone(), writer.clone());
-        let paused = Arc::new(AtomicBool::new(false));
         let bytes = Arc::new(Mutex::new(Vec::new()));
-        let reading = paused.clone();
         let captured = bytes.clone();
         let reader_thread = std::thread::spawn(move || {
             let mut buffer = [0; 256];
             loop {
-                while reading.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
                 let count = match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(count) => count,
@@ -328,14 +380,26 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             deadline.wait_for("startup", || directory.0.join("ready").exists());
-            paused.store(true, Ordering::Release);
+            deadline.wait_for("the initial editor frame", || {
+                terminal
+                    .lock()
+                    .unwrap()
+                    .view()
+                    .any(|line| line.text().contains("seed"))
+            });
+            directory.set_output_paused(true).unwrap();
+            deadline.at("requesting the first paused replay");
+            send_input(b"\x12");
+            deadline.wait_for("blocking the first replay output", || {
+                directory.0.join("output-blocked").exists()
+            });
             deadline.at("writing input while output is paused");
             send_input(b"\x1b[Ftyped");
             deadline.wait_for("accepting input while output is paused", || {
                 contents(&directory.0.join("input")).as_deref() == Some("seedtyped")
             });
-            // ConPTY control calls require the host to keep servicing cursor queries.
-            paused.store(false, Ordering::Release);
+            assert!(directory.0.join("output-blocked").exists());
+            directory.set_output_paused(false).unwrap();
             for cols in [25, 60, 35] {
                 deadline.at("resizing the host terminal");
                 terminal
@@ -346,7 +410,6 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
                 pair.master.resize(PtySize { cols, ..size }).unwrap();
                 std::thread::sleep(Duration::from_millis(90));
             }
-            paused.store(false, Ordering::Release);
             deadline.wait_for("committing resized history", || {
                 contents(&directory.0.join("completed"))
                     .is_some_and(|value| value.starts_with("35:"))
@@ -357,10 +420,12 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
             deadline.wait_for("receiving resized history", || {
                 String::from_utf8_lossy(&bytes.lock().unwrap()).contains(&marker)
             });
-            paused.store(true, Ordering::Release);
+            directory.set_output_paused(true).unwrap();
             deadline.at("requesting replay while output is paused");
             send_input(b"\x12");
-            std::thread::sleep(Duration::from_millis(100));
+            deadline.wait_for("blocking replay output before cancellation", || {
+                directory.0.join("output-blocked").exists()
+            });
             deadline.at("writing cancellation while output is paused");
             send_input(b"\x03Z");
             deadline.wait_for("accepting cancellation", || {
@@ -369,7 +434,8 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
             deadline.wait_for("accepting input after cancellation", || {
                 contents(&directory.0.join("input")).as_deref() == Some("seedtypedZ")
             });
-            paused.store(false, Ordering::Release);
+            assert!(directory.0.join("output-blocked").exists());
+            directory.set_output_paused(false).unwrap();
             deadline.at("requesting normal exit");
             send_input(b"\x11");
             deadline.wait_for("normal child exit", || child.try_wait().unwrap().is_some());
@@ -378,17 +444,18 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
             deadline.report_failure(error.as_ref());
             let progress = || {
                 format!(
-                    "ready={}, input={:?}, cancelled={}, completed={:?}",
+                    "ready={}, input={:?}, cancelled={}, completed={:?}, output_blocked={}",
                     directory.0.join("ready").exists(),
                     contents(&directory.0.join("input")),
                     directory.0.join("cancelled").exists(),
                     contents(&directory.0.join("completed")),
+                    directory.0.join("output-blocked").exists(),
                 )
             };
             let before = progress();
-            let _ = writeln!(std::io::stderr(), "before draining PTY output: {before}");
-            deadline.at("draining output after failure");
-            paused.store(false, Ordering::Release);
+            let _ = writeln!(std::io::stderr(), "before resuming output: {before}");
+            deadline.at("resuming output after failure");
+            let _ = directory.set_output_paused(false);
             let drain_deadline = Instant::now() + Duration::from_secs(2);
             while Instant::now() < drain_deadline
                 && !(directory.0.join("cancelled").exists()
@@ -396,13 +463,9 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
             {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            let _ = writeln!(
-                std::io::stderr(),
-                "after draining PTY output: {}",
-                progress()
-            );
+            let _ = writeln!(std::io::stderr(), "after resuming output: {}", progress());
         }
-        paused.store(false, Ordering::Release);
+        let _ = directory.set_output_paused(false);
         deadline.at("checking child exit before cleanup");
         if !matches!(child.try_wait(), Ok(Some(_))) {
             deadline.at("terminating the child");
