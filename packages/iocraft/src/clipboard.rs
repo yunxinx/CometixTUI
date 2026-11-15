@@ -4,6 +4,10 @@ use futures::future::BoxFuture;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod copy;
+pub use copy::{ClipboardBuffer, ClipboardCancellation, ClipboardRequest, ClipboardSummary};
+pub(crate) use copy::{CopyPreparation, write_copy};
+
 /// Host capabilities needed by the clipboard service, with no executor dependency.
 pub trait ClipboardBackend: Send + Sync + 'static {
     /// Starts the process immediately, returning its eventual exit status.

@@ -259,6 +259,26 @@ impl StdoutHandle {
         drop(self.set_clipboard_and_wait(text));
     }
 
+    /// Accepts a copy before polling its producer. The root owns preparation, helpers and
+    /// terminal output through completion, including across view unmount and terminal handoff.
+    /// Producers must drain started work on cancellation and return only complete text.
+    /// The producer owns accounting for its captured source and reconstruction workspace.
+    pub fn prepare_clipboard<F, Fut>(&self, prepare: F) -> crate::ClipboardRequest
+    where
+        F: FnOnce(crate::ClipboardBuffer) -> Fut + Send + 'static,
+        Fut: Future<Output = io::Result<crate::ClipboardBuffer>> + Send + 'static,
+    {
+        let (copy, receipt) =
+            crate::clipboard::CopyPreparation::new(prepare, self.clipboard.clone());
+        let root = self
+            .clipboard
+            .as_ref()
+            .and_then(Clipboard::output)
+            .unwrap_or(self);
+        enqueue(&root.state, Message::PrepareCopy(copy));
+        receipt
+    }
+
     /// Accepts an ordered copy before starting any helper. Completes after helpers and
     /// terminal output have finished; component unmount does not cancel an accepted root copy.
     pub fn set_clipboard_and_wait<S: ToString>(
@@ -1046,6 +1066,7 @@ mod tests {
         backend: Arc<DeferredClipboardBackend>,
         child_unmounted: Arc<std::sync::atomic::AtomicBool>,
         release: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        deferred_source: bool,
     }
     #[cfg(feature = "unstable-output-streams")]
     #[derive(Clone)]
@@ -1066,12 +1087,22 @@ mod tests {
     #[cfg(feature = "unstable-output-streams")]
     #[component]
     fn ClipboardTransientChild(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let proof = hooks.use_context::<LifetimeProof>().clone();
         let control = hooks.use_context::<ChildControl>().clone();
         let unmounted = control.unmounted.clone();
         hooks.use_hook(move || MarkChildUnmount(unmounted));
         let (stdout, _) = hooks.use_output();
         hooks.use_future(async move {
-            stdout.set_clipboard("A");
+            if proof.deferred_source {
+                let ready = proof.backend.release.lock().unwrap().take().unwrap();
+                drop(stdout.prepare_clipboard(move |mut buffer| async move {
+                    ready.await.unwrap();
+                    buffer.push_str("A")?;
+                    Ok(buffer)
+                }));
+            } else {
+                stdout.set_clipboard("A");
+            }
             let mut visible = control.visible;
             visible.set(false);
         });
@@ -1151,26 +1182,70 @@ mod tests {
     #[cfg(feature = "unstable-output-streams")]
     #[apply(test!)]
     async fn accepted_clipboard_survives_child_unmount() {
+        for deferred_source in [false, true] {
+            let output = AckProof {
+                bytes: Arc::new(Mutex::new(Vec::new())),
+                fail_control: false,
+            };
+            let (release, receiver) = oneshot::channel();
+            let proof = LifetimeProof {
+                deferred_source,
+                release: Arc::new(Mutex::new(Some(release))),
+                output: output.clone(),
+                backend: Arc::new(DeferredClipboardBackend {
+                    release: Mutex::new(Some(receiver)),
+                }),
+                child_unmounted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            element! {
+                ContextProvider(value: crate::Context::owned(proof)) { ClipboardRetainedRoot }
+            }
+            .render_loop()
+            .stdout(output)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[component]
+    fn PreparedCopyRoot(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let (stdout, _) = hooks.use_output();
+        hooks.use_effect(
+            move || {
+                let (release, ready) = oneshot::channel();
+                let first = stdout.prepare_clipboard(move |mut buffer| async move {
+                    ready.await.unwrap();
+                    buffer.push_str("first")?;
+                    Ok(buffer)
+                });
+                let second = stdout.prepare_clipboard(|mut buffer| async move {
+                    buffer.push_str("second")?;
+                    Ok(buffer)
+                });
+                release.send(()).unwrap();
+                drop((first, second));
+            },
+            (),
+        );
+        hooks.use_context_mut::<SystemContext>().exit();
+        element!(View)
+    }
+
+    #[cfg(feature = "unstable-output-streams")]
+    #[apply(test!)]
+    async fn deferred_copies_are_accepted_before_preparation_and_drained_on_exit() {
         let output = AckProof {
             bytes: Arc::new(Mutex::new(Vec::new())),
             fail_control: false,
         };
-        let (release, receiver) = oneshot::channel();
-        let proof = LifetimeProof {
-            release: Arc::new(Mutex::new(Some(release))),
-            output: output.clone(),
-            backend: Arc::new(DeferredClipboardBackend {
-                release: Mutex::new(Some(receiver)),
-            }),
-            child_unmounted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
-        element! {
-            ContextProvider(value: crate::Context::owned(proof)) { ClipboardRetainedRoot }
-        }
-        .render_loop()
-        .stdout(output)
-        .await
-        .unwrap();
+        element!(PreparedCopyRoot)
+            .render_loop()
+            .stdout(output.clone())
+            .await
+            .unwrap();
+        let bytes = output.bytes.lock().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.find("52;c;Zmlyc3Q=").unwrap() < text.find("52;c;c2Vjb25k").unwrap());
     }
     #[component]
     fn MixedCopyChild(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {

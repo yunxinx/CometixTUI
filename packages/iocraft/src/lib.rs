@@ -126,7 +126,10 @@ pub(crate) mod unicode_linebreak;
 mod flattened_exports {
     pub use crate::ansi::supports_hyperlinks;
     pub use crate::canvas::*;
-    pub use crate::clipboard::{Clipboard, ClipboardBackend};
+    pub use crate::clipboard::{
+        Clipboard, ClipboardBackend, ClipboardBuffer, ClipboardCancellation, ClipboardRequest,
+        ClipboardSummary,
+    };
     pub use crate::component::*;
     pub use crate::context::*;
     pub use crate::element::*;

@@ -75,6 +75,13 @@ impl Operation {
         control: &Arc<Allocation>,
     ) -> io::Result<Arc<Allocation>> {
         match self {
+            Self::PrintBatch(messages, _) => {
+                for message in messages {
+                    if let OutputMessage::PrepareCopy(copy) = message {
+                        copy.admit(memory);
+                    }
+                }
+            }
             Self::Frame { draft, .. } => {
                 draft.canvas.output_allocations = draft.canvas.reserve_output(memory, false)?;
                 draft.graphics = super::graphics::GraphicsPlan::reserve(&draft.canvas, memory)?;

@@ -9,6 +9,7 @@ pub(crate) enum OutputMessage {
     Stdout(String),
     StdoutNoNewline(String),
     StdoutClipboard(String, ClipboardMultiplexer),
+    PrepareCopy(crate::clipboard::CopyPreparation),
     Copy(
         String,
         Option<crate::Clipboard>,
@@ -22,6 +23,10 @@ pub(crate) enum OutputMessage {
 
 impl OutputMessage {
     pub(super) fn reject(self, error: &io::Error) {
+        if let Self::PrepareCopy(copy) = self {
+            copy.reject(error);
+            return;
+        }
         if let Self::Copy(_, _, receipt) | Self::StdoutControlAcknowledged(_, receipt) = self {
             let _ = receipt.send(Err(io::Error::new(error.kind(), error.to_string())));
         }
@@ -30,6 +35,7 @@ impl OutputMessage {
     pub(crate) fn retained_bytes(&self) -> usize {
         size_of::<Self>()
             + match self {
+                Self::PrepareCopy(copy) => copy.retained_bytes,
                 Self::Copy(text, _, _) => text.capacity().saturating_mul(2) + 4096,
                 Self::WindowTitle(text)
                 | Self::Stdout(text)
@@ -48,6 +54,7 @@ impl OutputMessage {
             OutputMessage::WindowTitle(_)
                 | OutputMessage::StdoutClipboard(..)
                 | OutputMessage::Copy(..)
+                | OutputMessage::PrepareCopy(..)
                 | OutputMessage::StdoutControl(_)
                 | OutputMessage::StdoutControlAcknowledged(..)
         )
@@ -177,26 +184,18 @@ pub(super) fn write_batch(
             OutputMessage::Stderr(text) => (text, false, true),
             OutputMessage::StderrNoNewline(text) => (text, false, false),
             OutputMessage::Copy(text, clipboard, receipt) => {
-                let prepared = clipboard
-                    .as_ref()
-                    .map(|clipboard| futures::executor::block_on(clipboard.prepare(&text)));
-                let result = crate::ansi::write_clipboard(
-                    terminal.dest(),
-                    &text,
-                    prepared
-                        .as_ref()
-                        .map_or(crate::ansi::MultiplexerPassthrough::None, |prepared| {
-                            prepared.multiplexer
-                        }),
-                    prepared.is_some_and(|prepared| prepared.is_kitty),
-                )
-                .and_then(|()| terminal.dest().flush());
+                let result =
+                    crate::clipboard::write_copy(terminal.dest(), &text, clipboard.as_ref());
                 let reported = result
                     .as_ref()
                     .copied()
                     .map_err(|error| io::Error::new(error.kind(), error.to_string()));
                 let _ = receipt.send(reported);
                 result?;
+                continue;
+            }
+            OutputMessage::PrepareCopy(copy) => {
+                copy.execute(terminal.dest())?;
                 continue;
             }
             OutputMessage::StdoutClipboard(text, multiplexer) => {
