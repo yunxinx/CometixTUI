@@ -2451,7 +2451,6 @@ impl<'a> Tree<'a> {
                     batch_events += 1;
                 }
                 output.did_clear_terminal_output |= term.take_output_clear();
-                term.set_scrollback_replay(self.system_context.scrollback_replay());
                 let terminal_diff_planning = term.canvas_diff_planning();
                 let (should_repaint, repaint_reason, changed_cells, diff_rows_scanned) =
                     if matches!(

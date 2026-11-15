@@ -42,13 +42,6 @@ pub(crate) struct AlternateScreenRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ExitOnCtrlCContext(pub bool);
 
-/// Renders the application history that precedes the inline canvas at a given terminal width.
-///
-/// The inline renderer prepares these rows before purging native scrollback after a width change
-/// or a change to offscreen rows. It then writes them oldest first above the live canvas.
-/// Each canvas is written as complete rows, so it carries its own spacing.
-pub type ScrollbackReplay = Arc<dyn Fn(usize) -> Vec<crate::Canvas> + Send + Sync>;
-
 /// The system context, which is always available to all components.
 pub struct SystemContext {
     pub(crate) image_scope: Option<crate::ImageScope>,
@@ -58,7 +51,6 @@ pub struct SystemContext {
     keyboard_enhancement_flags: Option<crate::KeyboardEnhancementFlags>,
     alternate_screen: Option<AlternateScreenRequest>,
     terminal_handoff: Option<TerminalHandoffRequest>,
-    scrollback_replay: Option<ScrollbackReplay>,
 }
 
 impl SystemContext {
@@ -71,7 +63,6 @@ impl SystemContext {
             keyboard_enhancement_flags: None,
             alternate_screen: None,
             terminal_handoff: None,
-            scrollback_replay: None,
         }
     }
 
@@ -148,29 +139,6 @@ impl SystemContext {
 
     pub(crate) fn keyboard_enhancement_flags(&self) -> Option<crate::KeyboardEnhancementFlags> {
         self.keyboard_enhancement_flags
-    }
-
-    /// Reserves owned replay-source storage before preparing its callback.
-    /// Admission failures are reported by the render loop. Shared, already-budgeted
-    /// source allocations are excluded from `owned_bytes`.
-    pub fn prepare_scrollback_replay(
-        &mut self,
-        owned_bytes: usize,
-        prepare: impl FnOnce() -> ScrollbackReplay,
-    ) {
-        self.scrollback_replay = match &self.output {
-            Some(output) => output.prepare_replay(owned_bytes, prepare),
-            None => Some(prepare()),
-        };
-    }
-
-    /// Registers history to replay after an inline scrollback purge, replacing the earlier callback.
-    pub fn set_scrollback_replay(&mut self, replay: ScrollbackReplay) {
-        self.scrollback_replay = Some(replay);
-    }
-
-    pub(crate) fn scrollback_replay(&self) -> Option<ScrollbackReplay> {
-        self.scrollback_replay.clone()
     }
 }
 

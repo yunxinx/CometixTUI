@@ -6,10 +6,12 @@ use futures::FutureExt;
 struct Capture {
     bytes: Arc<Mutex<Vec<u8>>>,
     blocked: Arc<AtomicBool>,
+    attempted: Arc<AtomicBool>,
 }
 
 impl Write for Capture {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.attempted.store(true, Ordering::Release);
         if self.blocked.load(Ordering::Acquire) {
             return Err(io::ErrorKind::WouldBlock.into());
         }
@@ -42,7 +44,6 @@ fn frame(canvas: Canvas, rows: u16) -> Operation {
         draft: Box::new(FrameDraft::new(canvas)),
         size: Some((20, rows)),
         screen: None,
-        replay: None,
         receipt: None,
     }
 }
@@ -70,6 +71,7 @@ fn handoff_stops_retirement_until_reacquired() {
     smol::block_on(async {
         let capture = Capture::default();
         let mut output = session(capture.clone());
+        let baseline = output.sender().main_screen_revision();
         let scope = ImageScope::default();
         let mut canvas = Canvas::new(20, 2);
         canvas.set_image_scope(Some(scope.clone()));
@@ -98,6 +100,7 @@ fn handoff_stops_retirement_until_reacquired() {
         let (sender, receiver) = oneshot::channel();
         output.enqueue(Operation::Reacquire(sender)).unwrap();
         receiver.await.unwrap().unwrap();
+        assert!(output.sender().main_screen_revision() > baseline);
         output.finish().await.unwrap();
         let bytes = capture.bytes.lock().unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
@@ -525,66 +528,40 @@ fn dropped_history_receipt_does_not_hide_render_loop_admission_failure() {
 }
 
 #[test]
-fn automatic_replay_prepares_before_purging_and_balances_synchronization() {
+fn superseded_history_does_not_purge_or_advance_coverage() {
     smol::block_on(async {
-        for exceeds_capacity in [false, true] {
-            let capture = Capture::default();
-            let mut output = OutputSession::with_capacity(
-                Box::new(capture.clone()),
-                Box::new(io::sink()),
-                false,
-                false,
-                Some(false),
-                Output::Stdout,
-                OutputCapacity::new(256 * 1024, ()),
-            )
-            .unwrap();
-            let mut first = Canvas::new(20, 6);
-            first.subview_mut(0, 0, 0, 0, 20, 6).set_text(
-                0,
-                0,
-                "initial",
-                CanvasTextStyle::default(),
-            );
-            output.enqueue(frame(first, 3)).unwrap();
-            barrier(&mut output).await;
-            let prefix = capture.bytes.lock().unwrap().len();
-            let mut next = frame(Canvas::new(21, 6), 3);
-            if let Operation::Frame { size, replay, .. } = &mut next {
-                *size = Some((21, 3));
-                *replay = Some(Arc::new(move |_| {
-                    if exceeds_capacity {
-                        return vec![Canvas::new(4000, 100)];
-                    }
-                    let mut history = Canvas::new(21, 1);
-                    history.subview_mut(0, 0, 0, 0, 21, 1).set_text(
-                        0,
-                        0,
-                        "restored-history",
-                        CanvasTextStyle::default(),
-                    );
-                    vec![history]
-                }));
-            }
-            output.enqueue(next).unwrap();
-            let result = output.finish().await;
-            let bytes = capture.bytes.lock().unwrap();
-            let emitted = std::str::from_utf8(&bytes[prefix..]).unwrap();
-            if exceeds_capacity {
-                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::OutOfMemory);
-                assert!(
-                    !emitted.contains(clear_terminal_sequence()),
-                    "failed preparation preserves scrollback"
-                );
-            } else {
-                result.unwrap();
-                assert!(emitted.contains(clear_terminal_sequence()));
-                assert_eq!(emitted.matches("restored-history").count(), 1);
-                assert_eq!(
-                    emitted.matches("\x1b[?2026h").count(),
-                    emitted.matches("\x1b[?2026l").count()
-                );
-            }
+        let capture = Capture::default();
+        let mut output = session(capture.clone());
+        barrier(&mut output).await;
+        capture.attempted.store(false, Ordering::Release);
+        capture.blocked.store(true, Ordering::Release);
+        output.enqueue(frame(Canvas::new(20, 1), 3)).unwrap();
+        while !capture.attempted.load(Ordering::Acquire) {
+            smol::Timer::after(Duration::from_millis(1)).await;
         }
+        let target = HistoryTarget::default();
+        let old = output.sender().append_history(
+            HistoryDraft::new(Canvas::new(20, 1))
+                .with_target(target.clone())
+                .replace_scrollback()
+                .with_coverage(SourceCoverage::new(Arc::new(1_u64))),
+        );
+        target.cancel();
+        let mut canvas = Canvas::new(20, 1);
+        canvas
+            .subview_mut(0, 0, 0, 0, 20, 1)
+            .set_text(0, 0, "latest", CanvasTextStyle::default());
+        let latest = output.sender().append_history(
+            HistoryDraft::new(canvas).with_coverage(SourceCoverage::new(Arc::new(2_u64))),
+        );
+        capture.blocked.store(false, Ordering::Release);
+        assert_eq!(old.await.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        let receipt = latest.await.unwrap();
+        assert_eq!(receipt.coverage.unwrap().get::<u64>(), Some(&2));
+        output.finish().await.unwrap();
+        let bytes = capture.bytes.lock().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(!text.contains("\x1b[3J"));
+        assert_eq!(text.matches("latest").count(), 1);
     });
 }

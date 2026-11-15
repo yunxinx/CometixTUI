@@ -13,9 +13,6 @@ pub(super) struct ScreenTransitionPlan {
     pub(super) writes_output: bool,
 }
 
-pub(super) type ReplayWriter<'a> =
-    dyn FnMut(&ScrollbackReplay, usize, bool, &mut dyn Write) -> io::Result<()> + 'a;
-
 pub(super) trait TerminalImpl: Write + Send {
     fn finish(&mut self) -> io::Result<()> {
         self.flush()
@@ -176,7 +173,6 @@ pub(super) trait TerminalImpl: Write + Send {
     fn apply_screen_transition(&mut self, _plan: ScreenTransitionPlan) -> io::Result<bool> {
         Ok(false)
     }
-    fn set_scrollback_replay(&mut self, _replay: Option<crate::context::ScrollbackReplay>) {}
     fn clear_canvas_would_write(&self) -> bool {
         true
     }
@@ -206,15 +202,6 @@ pub(super) trait TerminalImpl: Write + Send {
         canvas: &Canvas,
         output: OutputContext,
     ) -> io::Result<()>;
-    fn write_canvas_with_replay(
-        &mut self,
-        prev: Option<&Canvas>,
-        canvas: &Canvas,
-        output: OutputContext,
-        _write_history: &mut ReplayWriter<'_>,
-    ) -> io::Result<()> {
-        self.write_canvas(prev, canvas, output)
-    }
     fn event_stream(&mut self) -> io::Result<BoxStream<'static, io::Result<TerminalEvent>>>;
     fn dest(&mut self) -> &mut dyn Write;
     fn alt(&mut self) -> &mut dyn Write;
@@ -390,8 +377,6 @@ pub(super) struct StdTerminal<'a> {
     /// precede the canvas in the main screen, so establish a clean retained
     /// baseline before trusting sparse row diffs.
     pub(super) inline_force_full_rewrite_next_diff: bool,
-    /// History written back into native scrollback after an automatic inline purge.
-    pub(super) scrollback_replay: Option<crate::context::ScrollbackReplay>,
     #[cfg(unix)]
     pub(super) resume_signal: Option<ResumeSignalListener>,
 }
@@ -642,10 +627,6 @@ impl TerminalImpl for StdTerminal<'_> {
         }
     }
 
-    fn set_scrollback_replay(&mut self, replay: Option<crate::context::ScrollbackReplay>) {
-        self.scrollback_replay = replay;
-    }
-
     fn position_cursor(
         &mut self,
         declaration: Option<crate::canvas::CursorDeclaration>,
@@ -843,31 +824,6 @@ impl TerminalImpl for StdTerminal<'_> {
         canvas: &Canvas,
         output: OutputContext,
     ) -> io::Result<()> {
-        let mut prepared = Vec::new();
-        self.write_canvas_with_replay(
-            prev,
-            canvas,
-            output,
-            &mut |replay, width, prepare, writer| {
-                if !prepare {
-                    for canvas in prepared.drain(..) {
-                        Canvas::write_ansi(&canvas, &mut *writer)?;
-                    }
-                } else {
-                    prepared = replay(width);
-                }
-                Ok(())
-            },
-        )
-    }
-
-    fn write_canvas_with_replay(
-        &mut self,
-        prev: Option<&Canvas>,
-        canvas: &Canvas,
-        output: OutputContext,
-        write_history: &mut ReplayWriter<'_>,
-    ) -> io::Result<()> {
         if self.fullscreen && self.size.is_some_and(|(_, rows)| rows == 0) {
             self.prev_canvas_height = canvas.height() as _;
             self.prev_size_on_write = self.size;
@@ -974,7 +930,7 @@ impl TerminalImpl for StdTerminal<'_> {
         }
 
         if self.inline_force_full_rewrite_next_diff || self.inline_resize_requires_full_rewrite() {
-            self.clear_inline_for_full_rewrite(prev.height(), canvas.height(), write_history)?;
+            self.clear_canvas()?;
             self.prev_canvas_height = canvas.height() as _;
             self.prev_size_on_write = self.size;
             self.write_inline_canvas_without_final_newline(canvas)?;
@@ -991,7 +947,7 @@ impl TerminalImpl for StdTerminal<'_> {
                 return Ok(());
             }
 
-            self.clear_inline_for_full_rewrite(prev.height(), canvas.height(), write_history)?;
+            self.clear_canvas()?;
             self.prev_canvas_height = canvas.height() as _;
             self.prev_size_on_write = self.size;
             self.write_inline_canvas_without_final_newline(canvas)?;
@@ -1005,7 +961,7 @@ impl TerminalImpl for StdTerminal<'_> {
         let new_height = canvas.height();
 
         if self.inline_shrink_requires_full_rewrite(prev_height, new_height) {
-            self.clear_inline_for_full_rewrite(prev_height, new_height, write_history)?;
+            self.clear_canvas()?;
             self.prev_canvas_height = canvas.height() as _;
             self.prev_size_on_write = self.size;
             self.write_inline_canvas_without_final_newline(canvas)?;
@@ -1049,7 +1005,7 @@ impl TerminalImpl for StdTerminal<'_> {
                 if prev.row_eq(canvas, y) {
                     continue;
                 }
-                self.clear_inline_for_full_rewrite(prev_height, new_height, write_history)?;
+                self.clear_canvas()?;
                 self.prev_canvas_height = canvas.height() as _;
                 self.prev_size_on_write = self.size;
                 self.write_inline_canvas_without_final_newline(canvas)?;
@@ -1281,7 +1237,6 @@ impl<'a> StdTerminal<'a> {
             inline_bottom_gap: 0,
             inline_pending_wrap: false,
             inline_force_full_rewrite_next_diff: false,
-            scrollback_replay: None,
             // Best-effort: if signal registration fails, the terminal still works —
             // it just won't self-heal after suspend/resume.
             #[cfg(unix)]
@@ -1400,60 +1355,6 @@ impl<'a> StdTerminal<'a> {
         }
         self.dest.write_all(b"\x1b[r\x1b[H")?;
         Ok(())
-    }
-
-    /// Maps to CC `ink/log-update.ts#LogUpdate.render` automatic resize /
-    /// offscreen full-reset branches and `fullResetSequence_CAUSES_FLICKER`.
-    /// Explicit `clear_canvas()` remains screen-only; only width-change and
-    /// offscreen automatic fallbacks purge native scrollback, and both replay
-    /// the registered history before the canvas is rewritten.
-    fn clear_inline_for_full_rewrite(
-        &mut self,
-        prev_height: usize,
-        next_height: usize,
-        write_history: &mut ReplayWriter<'_>,
-    ) -> io::Result<()> {
-        let (Some((prev_width, prev_viewport_height)), Some((next_width, next_viewport_height))) =
-            (self.prev_size_on_write, self.size)
-        else {
-            return self.clear_canvas();
-        };
-        if prev_width == 0
-            || prev_viewport_height == 0
-            || next_width == 0
-            || next_viewport_height == 0
-        {
-            return self.clear_canvas();
-        }
-        // A height-only change is not a resize reset: the rows the terminal moved
-        // across the scrollback boundary are judged by the offscreen rule. The
-        // smaller of the two viewports decides it, so a canvas that overflowed
-        // either one counts as already partly in scrollback.
-        let viewport_height = prev_viewport_height.min(next_viewport_height) as usize;
-        let prev = TerminalFrameBounds {
-            screen_height: prev_height,
-            viewport_width: prev_width as usize,
-            viewport_height,
-        };
-        let next = TerminalFrameBounds {
-            screen_height: next_height,
-            viewport_width: next_width as usize,
-            viewport_height,
-        };
-        match should_clear_terminal_screen(prev, next) {
-            Some(TerminalClearReason::Resize | TerminalClearReason::Offscreen) => {
-                let replay = self.scrollback_replay.clone();
-                if let Some(replay) = &replay {
-                    write_history(replay, usize::from(next_width), true, &mut *self.dest)?;
-                }
-                self.clear_terminal()?;
-                if let Some(replay) = &replay {
-                    write_history(replay, usize::from(next_width), false, &mut *self.dest)?;
-                }
-                Ok(())
-            }
-            Some(TerminalClearReason::Clear) | None => self.clear_canvas(),
-        }
     }
 
     fn inline_resize_requires_full_rewrite(&self) -> bool {

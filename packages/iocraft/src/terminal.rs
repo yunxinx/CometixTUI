@@ -4,7 +4,6 @@ use crate::{
         SelectionController, SelectionFocusMove, SelectionHoverOutcome, SelectionPressOutcome,
         SelectionReleaseOutcome,
     },
-    context::ScrollbackReplay,
     element::Output,
 };
 use crossterm::{
@@ -631,14 +630,6 @@ impl<'a> Terminal<'a> {
             .write_canvas(prev, canvas, self.synchronized_output.context())
     }
 
-    pub(crate) fn set_scrollback_replay(&mut self, replay: Option<ScrollbackReplay>) {
-        if let OutputBackend::Worker(output) = &mut self.inner {
-            output.replay = replay;
-            return;
-        }
-        self.inner.set_scrollback_replay(replay);
-    }
-
     /// Puts back the main-screen rows a shorter terminal cut below a displaced cursor, from
     /// the previous inline frame.
     pub(crate) fn restore_inline_rows_after_height_shrink(
@@ -665,7 +656,6 @@ impl<'a> Terminal<'a> {
                 draft: Box::new(draft),
                 size: output.size,
                 screen: output.screen,
-                replay: output.replay.clone(),
                 receipt: None,
             });
         }

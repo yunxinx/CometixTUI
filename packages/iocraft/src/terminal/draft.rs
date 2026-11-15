@@ -180,8 +180,25 @@ impl FrameDraft {
     }
 }
 
+/// Cancellation shared by the finite batches of one application history target.
+#[derive(Clone, Default)]
+pub struct HistoryTarget(Arc<std::sync::atomic::AtomicBool>);
+
+impl HistoryTarget {
+    /// Supersedes batches that have not started. In-flight writes still finish and return receipts.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// A finite set of history rows with immutable image attachments.
 pub struct HistoryDraft {
+    pub(crate) target: Option<HistoryTarget>,
+    pub(crate) replace: bool,
     pub(crate) canvas: Canvas,
     pub(super) graphics: super::graphics::GraphicsPlan,
     pub(crate) coverage: Option<SourceCoverage>,
@@ -191,10 +208,24 @@ impl HistoryDraft {
     /// Takes ownership of prepared rows. Wire image IDs are assigned during output.
     pub fn new(canvas: Canvas) -> Self {
         Self {
+            target: None,
+            replace: false,
             canvas,
             graphics: Default::default(),
             coverage: None,
         }
+    }
+
+    /// Discards native history immediately before this admitted batch starts writing.
+    pub fn replace_scrollback(mut self) -> Self {
+        self.replace = true;
+        self
+    }
+
+    /// Binds this batch to a target. A superseded unstarted batch returns `Interrupted`.
+    pub fn with_target(mut self, target: HistoryTarget) -> Self {
+        self.target = Some(target);
+        self
     }
 
     /// Associates the rows with application-owned source coverage.

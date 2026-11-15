@@ -70,7 +70,6 @@ impl TerminalOutput {
             draft: Box::new(draft),
             size: self.session.size,
             screen,
-            replay: None,
             receipt: Some(sender),
         });
         Box::pin(async move {

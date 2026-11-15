@@ -594,8 +594,6 @@ fn new_test_writer() -> (TestWriter, Arc<Mutex<Vec<u8>>>) {
 
 #[test]
 fn test_std_terminal() {
-    // There's unfortunately not much here we can really test, but we'll do our best.
-    // TODO: Is there a library we can use to emulate terminal input/output?
     let mut terminal = Terminal::new(
         Box::new(std::io::stdout()),
         Box::new(std::io::stderr()),
@@ -1067,7 +1065,6 @@ fn new_fullscreen_term(
         inline_bottom_gap: 0,
         inline_pending_wrap: false,
         inline_force_full_rewrite_next_diff: false,
-        scrollback_replay: None,
         #[cfg(unix)]
         resume_signal: None,
     }
@@ -1107,7 +1104,6 @@ fn new_inline_term_with_size(
         inline_bottom_gap: 0,
         inline_pending_wrap: false,
         inline_force_full_rewrite_next_diff: false,
-        scrollback_replay: None,
         #[cfg(unix)]
         resume_signal: None,
     }
@@ -1135,8 +1131,8 @@ fn inline_diff_vt(prev: &Canvas, next: &Canvas, term_size: (u16, u16)) -> (Vec<u
 fn assert_inline_full_reset(diff: &[u8], context: &str) {
     let diff = String::from_utf8_lossy(diff);
     assert!(
-        diff.contains(clear_terminal_sequence()),
-        "{context} should use the host terminal's full reset sequence: {diff:?}"
+        !diff.contains("\x1b[3J") && (diff.contains("\x1b[J") || diff.contains("\x1b[2J")),
+        "{context} must clear the live canvas while preserving native history: {diff:?}"
     );
     assert!(
         !diff.contains("\x1b[?1049h") && !diff.contains("\x1b[?1049l"),
@@ -3675,10 +3671,6 @@ impl TerminalImpl for ScriptedTerminal {
         self.inner.apply_screen_transition(plan)
     }
 
-    fn set_scrollback_replay(&mut self, replay: Option<crate::context::ScrollbackReplay>) {
-        self.inner.set_scrollback_replay(replay);
-    }
-
     fn position_cursor(
         &mut self,
         declaration: Option<crate::canvas::CursorDeclaration>,
@@ -4466,37 +4458,19 @@ fn test_inline_resize_forces_full_rewrite_even_when_canvas_identical() {
 }
 
 #[test]
-fn test_inline_width_resize_replays_scrollback_between_purge_and_canvas() {
+fn test_inline_width_resize_preserves_history_until_explicit_replacement() {
     let mut canvas = Canvas::new(10, 1);
     canvas
         .subview_mut(0, 0, 0, 0, 10, 1)
         .set_text(0, 0, "live", CanvasTextStyle::default());
-
     let (dest, diff_buf) = new_test_writer();
     let mut term = new_inline_term_with_size(dest, canvas.height() as _, (10, 5));
     term.prev_size_on_write = Some((12, 5));
-    term.scrollback_replay = Some(Arc::new(|width| {
-        let mut history = Canvas::new(width, 1);
-        history.subview_mut(0, 0, 0, 0, width, 1).set_text(
-            0,
-            0,
-            &format!("old@{width}"),
-            CanvasTextStyle::default(),
-        );
-        vec![history]
-    }));
     term.write_canvas(Some(&canvas), &canvas, OutputContext::default())
         .unwrap();
-
     let diff = String::from_utf8_lossy(&diff_buf.lock().unwrap()).to_string();
-    let purge = diff
-        .find(clear_terminal_sequence())
-        .expect("width change resets the terminal");
-    let history = diff
-        .find("old@10")
-        .expect("history replays at the new width");
-    let live = diff.rfind("live").expect("canvas is rewritten");
-    assert!(purge < history && history < live, "{diff:?}");
+    assert!(!diff.contains("\x1b[3J"), "{diff:?}");
+    assert!(diff.contains("live"));
 }
 
 #[test]

@@ -19,7 +19,6 @@ pub(super) enum Operation {
         draft: Box<FrameDraft>,
         size: Option<(u16, u16)>,
         screen: Option<crate::context::AlternateScreenRequest>,
-        replay: Option<ScrollbackReplay>,
         receipt: Option<oneshot::Sender<io::Result<FrameCommit>>>,
     },
     Control(String, Option<oneshot::Sender<io::Result<()>>>),
@@ -160,6 +159,7 @@ struct Pending {
     admission: Admission,
     admission_error: Option<(io::ErrorKind, String)>,
     visual_revision: u64,
+    main_screen_revision: u64,
     capacity_revision: u64,
     active: bool,
     resumed: bool,
@@ -190,7 +190,6 @@ pub(super) struct OutputSession {
     pub(super) screen: Option<crate::context::AlternateScreenRequest>,
     pub(super) base_fullscreen: bool,
     pub(super) raw_mode: bool,
-    pub(super) replay: Option<ScrollbackReplay>,
     pub(super) raw_mode_supported: bool,
     pub(super) mock: bool,
     observed_visual_revision: u64,
@@ -299,6 +298,7 @@ impl OutputSession {
                 admission: Admission::Open,
                 admission_error: None,
                 visual_revision: 0,
+                main_screen_revision: 0,
                 capacity_revision: 0,
                 active: false,
                 resumed: false,
@@ -360,7 +360,6 @@ impl OutputSession {
             screen: None,
             base_fullscreen: fullscreen,
             raw_mode: false,
-            replay: None,
             raw_mode_supported,
             mock,
             output,
@@ -536,24 +535,12 @@ impl OutputSession {
 }
 
 impl OutputSender {
-    pub(crate) fn prepare_replay(
-        &self,
-        bytes: usize,
-        prepare: impl FnOnce() -> ScrollbackReplay,
-    ) -> Option<ScrollbackReplay> {
-        match self.shared.memory.reserve(bytes) {
-            Ok(allocation) => {
-                let replay = prepare();
-                Some(Arc::new(move |width| {
-                    let _allocation = &allocation;
-                    replay(width)
-                }))
-            }
-            Err(error) => {
-                self.fail_admission(&error);
-                None
-            }
-        }
+    pub(crate) fn main_screen_revision(&self) -> u64 {
+        self.shared
+            .pending
+            .lock()
+            .expect("output baseline is not poisoned")
+            .main_screen_revision
     }
 
     pub(crate) fn committed_frame(&self) -> Option<Arc<CommittedFrame>> {
@@ -866,7 +853,18 @@ impl OutputOwner {
         match operation {
             Operation::Query(query) => query(self.backend.dest())?,
             Operation::History(draft, receipt) => {
-                let result = self.write_history(&draft.canvas, draft.graphics);
+                if draft
+                    .target
+                    .as_ref()
+                    .is_some_and(HistoryTarget::is_cancelled)
+                {
+                    let _ = receipt.send(Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "history target was replaced",
+                    )));
+                    return Ok(());
+                }
+                let result = self.write_history(&draft.canvas, draft.graphics, draft.replace);
                 let reported = match &result {
                     Ok(()) => Ok(CommitReceipt {
                         sequence: self.sequence,
@@ -894,14 +892,12 @@ impl OutputOwner {
                 mut draft,
                 size,
                 screen,
-                replay,
                 receipt,
             } => {
                 let canvas = &draft.canvas;
                 if let Some((width, height)) = size {
                     self.backend.set_size_from_resize_event(width, height);
                 }
-                self.backend.set_scrollback_replay(replay);
                 let result: io::Result<()> = (|| {
                     if let Some(previous) = &self.previous {
                         self.backend
@@ -932,41 +928,10 @@ impl OutputOwner {
                     self.synchronization.enter();
                     let write = (|| {
                         self.synchronization.start(self.backend.dest())?;
-                        let synchronization = &mut self.synchronization;
-                        let graphics = &mut self.graphics;
-                        let memory = self.shared.memory.clone();
-                        let mut prepared_history = Vec::new();
-                        self.backend.write_canvas_with_replay(
+                        self.backend.write_canvas(
                             self.previous.as_ref(),
                             &resolved,
-                            synchronization.context(),
-                            &mut |replay, width, prepare, writer| {
-                                if prepare {
-                                    let result = synchronization.leave(writer).and_then(|()| {
-                                        for mut history in replay(width) {
-                                            history.output_allocations =
-                                                history.reserve_output(&memory, false)?;
-                                            let plan = super::graphics::GraphicsPlan::reserve(
-                                                &history, &memory,
-                                            )?;
-                                            prepared_history.push((history, plan));
-                                        }
-                                        Ok(())
-                                    });
-                                    synchronization.enter();
-                                    return result;
-                                }
-                                let end = synchronization.leave(writer);
-                                let result = end.and_then(|()| {
-                                    for (history, plan) in prepared_history.drain(..) {
-                                        graphics.append_archival(&history, writer, Some(plan))?;
-                                    }
-                                    Ok(())
-                                });
-                                synchronization.enter();
-                                result?;
-                                synchronization.start(writer)
-                            },
+                            self.synchronization.context(),
                         )?;
                         self.backend.position_cursor(canvas.cursor_declaration())
                     })();
@@ -1078,6 +1043,14 @@ impl OutputOwner {
             }
             Operation::Resume => {
                 self.backend.reinitialize_after_resume()?;
+                let mut pending = self
+                    .shared
+                    .pending
+                    .lock()
+                    .expect("output baseline is not poisoned");
+                pending.main_screen_revision += 1;
+                pending.visual_revision += 1;
+                drop(pending);
                 self.graphics.invalidate();
                 self.previous = None;
                 self.saved_main = None;
@@ -1138,6 +1111,8 @@ impl OutputOwner {
                         .expect("output admission is not poisoned");
                     if pending.admission == Admission::Reacquiring {
                         pending.admission = Admission::Open;
+                        pending.main_screen_revision += 1;
+                        pending.visual_revision += 1;
                     }
                 }
                 let _ = receipt.send(reported);
@@ -1151,6 +1126,7 @@ impl OutputOwner {
         &mut self,
         canvas: &Canvas,
         plan: super::graphics::GraphicsPlan,
+        replace: bool,
     ) -> io::Result<()> {
         if self.backend.is_fullscreen() {
             return Err(io::Error::new(
@@ -1158,7 +1134,9 @@ impl OutputOwner {
                 "history rows require the main screen",
             ));
         }
-        if self.previous.is_some() {
+        if replace {
+            self.backend.clear_terminal()?;
+        } else if self.previous.is_some() {
             self.backend.clear_canvas()?;
         }
         self.graphics

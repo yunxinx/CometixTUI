@@ -135,6 +135,17 @@ pub struct StdoutHandle {
 }
 
 impl StdoutHandle {
+    /// Changes after resume or terminal handoff invalidates the main-screen baseline.
+    /// Applications can rebuild finite history even when the source and viewport are unchanged.
+    pub fn main_screen_revision(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("output handle is not poisoned")
+            .session
+            .as_ref()
+            .map_or(0, |session| session.main_screen_revision())
+    }
+
     /// Reads the last complete local frame without retaining its canvas or component tree.
     pub fn committed_frame(&self) -> Option<Arc<crate::CommittedFrame>> {
         let session = self
