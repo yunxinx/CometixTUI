@@ -2,6 +2,8 @@
 mod pty_output;
 
 use iocraft::prelude::*;
+#[cfg(windows)]
+use portable_pty::ChildKiller;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -147,12 +149,96 @@ fn Replay(mut hooks: Hooks, props: &ReplayProps) -> impl Into<AnyElement<'static
     }
 }
 
-#[track_caller]
-fn wait_for(mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !ready() {
-        assert!(Instant::now() < deadline, "PTY validation made no progress");
-        std::thread::sleep(Duration::from_millis(5));
+struct PtyDeadline {
+    stage: Arc<Mutex<&'static str>>,
+    #[cfg(windows)]
+    child: Arc<Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>>,
+    completed: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    rows: u16,
+}
+
+impl PtyDeadline {
+    fn new(rows: u16) -> Self {
+        let stage = Arc::new(Mutex::new("preparing the scenario"));
+        let current = stage.clone();
+        #[cfg(windows)]
+        let child = Arc::new(Mutex::new(None::<Box<dyn ChildKiller + Send + Sync>>));
+        #[cfg(windows)]
+        let timed_out_child = child.clone();
+        let (completed, completion) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            if completion.recv_timeout(Duration::from_secs(90))
+                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                let stage = *current.lock().unwrap();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "scrollback PTY ({rows} rows) timed out during {stage}"
+                );
+                // Windows handles retain identity after reaping; Unix killers retain only a PID.
+                // On Unix, exiting closes the controlling PTY and signals its foreground group.
+                #[cfg(windows)]
+                if let Some(child) = timed_out_child.lock().unwrap().as_mut() {
+                    let _ = child.kill();
+                }
+                // Native ConPTY calls can block outside Rust's polling deadlines.
+                std::process::exit(1);
+            }
+        });
+        Self {
+            stage,
+            #[cfg(windows)]
+            child,
+            completed,
+            thread: Some(thread),
+            rows,
+        }
+    }
+
+    fn at(&self, stage: &'static str) {
+        *self.stage.lock().unwrap() = stage;
+    }
+
+    #[cfg(windows)]
+    fn track_child(&self, child: Box<dyn ChildKiller + Send + Sync>) {
+        *self.child.lock().unwrap() = Some(child);
+    }
+
+    #[track_caller]
+    fn wait_for(&self, stage: &'static str, mut ready: impl FnMut() -> bool) {
+        self.at(stage);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "PTY validation made no progress during {stage}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn report_failure(&self, error: &(dyn std::any::Any + Send)) {
+        let stage = *self.stage.lock().unwrap();
+        let message = error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| error.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic");
+        let _ = writeln!(
+            std::io::stderr(),
+            "scrollback PTY ({} rows) failed during {stage}: {message}",
+            self.rows
+        );
+    }
+}
+
+impl Drop for PtyDeadline {
+    fn drop(&mut self) {
+        let _ = self.completed.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -179,6 +265,7 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
         return;
     }
     for rows in 1..=3 {
+        let deadline = PtyDeadline::new(rows);
         let directory = Directory(
             std::env::temp_dir().join(format!("iocraft-scrollback-{}-{rows}", std::process::id())),
         );
@@ -189,8 +276,11 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
             pixel_width: 0,
             pixel_height: 0,
         };
+        deadline.at("opening the native PTY");
         let pair = native_pty_system().openpty(size).unwrap();
+        deadline.at("cloning the PTY output reader");
         let mut reader = pair.master.try_clone_reader().unwrap();
+        deadline.at("taking the PTY input writer");
         let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
         let terminal = Arc::new(Mutex::new(avt::Vt::new(40, usize::from(rows))));
         let mut decoder = pty_output::OutputDecoder::new(terminal.clone(), writer.clone());
@@ -225,7 +315,11 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
         ]);
         command.env("IOCRAFT_SCROLLBACK_CHILD", &directory.0);
         command.env("TERM", "xterm-256color");
+        deadline.at("spawning the child");
         let mut child = pair.slave.spawn_command(command).unwrap();
+        #[cfg(windows)]
+        deadline.track_child(child.clone_killer());
+        deadline.at("releasing the slave PTY");
         drop(pair.slave);
         let send_input = |bytes: &[u8]| {
             let mut writer = writer.lock().unwrap();
@@ -233,45 +327,70 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
             writer.flush().unwrap();
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            wait_for(|| directory.0.join("ready").exists());
+            deadline.wait_for("startup", || directory.0.join("ready").exists());
             paused.store(true, Ordering::Release);
+            deadline.at("writing input while output is paused");
             send_input(b"\x1b[Ftyped");
-            wait_for(|| contents(&directory.0.join("input")).as_deref() == Some("seedtyped"));
+            deadline.wait_for("accepting input while output is paused", || {
+                contents(&directory.0.join("input")).as_deref() == Some("seedtyped")
+            });
             // ConPTY control calls require the host to keep servicing cursor queries.
             paused.store(false, Ordering::Release);
             for cols in [25, 60, 35] {
+                deadline.at("resizing the host terminal");
                 terminal
                     .lock()
                     .unwrap()
                     .resize(usize::from(cols), usize::from(rows));
+                deadline.at("resizing the native PTY");
                 pair.master.resize(PtySize { cols, ..size }).unwrap();
                 std::thread::sleep(Duration::from_millis(90));
             }
             paused.store(false, Ordering::Release);
-            wait_for(|| {
+            deadline.wait_for("committing resized history", || {
                 contents(&directory.0.join("completed"))
                     .is_some_and(|value| value.starts_with("35:"))
             });
             let completed = contents(&directory.0.join("completed")).unwrap();
             let generation = completed.split_once(':').unwrap().1;
             let marker = format!("history-{generation}-4095");
-            wait_for(|| String::from_utf8_lossy(&bytes.lock().unwrap()).contains(&marker));
+            deadline.wait_for("receiving resized history", || {
+                String::from_utf8_lossy(&bytes.lock().unwrap()).contains(&marker)
+            });
             paused.store(true, Ordering::Release);
+            deadline.at("requesting replay while output is paused");
             send_input(b"\x12");
             std::thread::sleep(Duration::from_millis(100));
+            deadline.at("writing cancellation while output is paused");
             send_input(b"\x03Z");
-            wait_for(|| directory.0.join("cancelled").exists());
-            wait_for(|| contents(&directory.0.join("input")).as_deref() == Some("seedtypedZ"));
+            deadline.wait_for("accepting cancellation", || {
+                directory.0.join("cancelled").exists()
+            });
+            deadline.wait_for("accepting input after cancellation", || {
+                contents(&directory.0.join("input")).as_deref() == Some("seedtypedZ")
+            });
             paused.store(false, Ordering::Release);
+            deadline.at("requesting normal exit");
             send_input(b"\x11");
-            wait_for(|| child.try_wait().unwrap().is_some());
+            deadline.wait_for("normal child exit", || child.try_wait().unwrap().is_some());
         }));
+        if let Err(error) = &result {
+            deadline.report_failure(error.as_ref());
+        }
         paused.store(false, Ordering::Release);
-        let _ = child.kill();
+        deadline.at("checking child exit before cleanup");
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            deadline.at("terminating the child");
+            let _ = child.kill();
+        }
+        deadline.at("reaping the child");
         let _ = child.wait();
         drop(writer);
+        deadline.at("closing the native PTY");
         drop(pair.master);
+        deadline.at("joining the output reader");
         reader_thread.join().unwrap();
+        deadline.at("checking captured output");
         if let Err(error) = result {
             std::panic::resume_unwind(error);
         }
