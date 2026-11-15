@@ -41,8 +41,10 @@ impl OutputDecoder {
                 self.query_offset = 0;
                 // ConPTY's inherited cursor requires a host reply during startup and resize.
                 let cursor = terminal.cursor();
+                // ConPTY treats an isolated ESC[ write as Alt+[, so format the complete reply first.
+                let response = format!("\x1b[{};{}R", cursor.row + 1, cursor.col + 1);
                 let mut input = self.input.lock().unwrap();
-                write!(input, "\x1b[{};{}R", cursor.row + 1, cursor.col + 1).unwrap();
+                input.write_all(response.as_bytes()).unwrap();
                 input.flush().unwrap();
             }
         }
