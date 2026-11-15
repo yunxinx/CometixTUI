@@ -41,6 +41,9 @@ struct ReplayProps {
 fn Replay(mut hooks: Hooks, props: &ReplayProps) -> impl Into<AnyElement<'static>> {
     let (width, height) = hooks.use_terminal_size();
     let mut text = hooks.use_state(|| String::from("seed"));
+    let handle = hooks.use_ref_default::<TextInputHandle>();
+    let mut fullscreen = hooks.use_state(|| false);
+    let mut viewer = hooks.use_state(|| false);
     let mut target = hooks.use_state(|| Target {
         width,
         generation: 0,
@@ -59,12 +62,30 @@ fn Replay(mut hooks: Hooks, props: &ReplayProps) -> impl Into<AnyElement<'static
     }
     let mut application = hooks.use_app();
     let directory = props.directory.clone();
-    hooks.use_terminal_events(move |event| {
-        if let TerminalEvent::Key(key) = event
+    hooks.use_propagated_terminal_events(move |event| {
+        if let TerminalEvent::Key(key) = event.event()
             && key.kind == KeyEventKind::Press
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
             match key.code {
+                KeyCode::Char('f') => {
+                    fullscreen.set(!fullscreen.get());
+                    target.read().token.cancel();
+                    target.write().cancelled = true;
+                }
+                KeyCode::Char('o') => {
+                    viewer.set(!viewer.get());
+                    target.read().token.cancel();
+                    target.write().cancelled = true;
+                }
+                KeyCode::Char('g') => {
+                    let directory = directory.clone();
+                    drop(application.suspend_terminal(move || {
+                        std::io::stdout().write_all(b"handoff-owner\r\n").unwrap();
+                        std::io::stdout().flush().unwrap();
+                        std::fs::write(directory.join("handoff"), b"released").unwrap();
+                    }));
+                }
                 KeyCode::Char('c') => {
                     target.read().token.cancel();
                     target.write().cancelled = true;
@@ -81,8 +102,9 @@ fn Replay(mut hooks: Hooks, props: &ReplayProps) -> impl Into<AnyElement<'static
                     });
                 }
                 KeyCode::Char('q') => application.exit(),
-                _ => {}
+                _ => return,
             }
+            event.stop_propagation();
         }
     });
     let (stdout, _) = hooks.use_output();
@@ -136,15 +158,25 @@ fn Replay(mut hooks: Hooks, props: &ReplayProps) -> impl Into<AnyElement<'static
     });
     let directory = props.directory.clone();
     std::fs::write(directory.join("ready"), b"ready").unwrap();
-    element! {
+    let editor = element! {
         View(width: width, height: height, flex_direction: FlexDirection::Column) {
-            TextInput(value: text.to_string(), has_focus: true, multiline: true, auto_grow: true, max_height: height,
+            TextInput(handle, value: text.to_string(), has_focus: true, multiline: true, auto_grow: true, max_height: height,
                 physical_cursor: true,
                 on_change: move |value: String| {
                     std::fs::write(directory.join("input"), value.as_bytes()).unwrap();
                     text.set(value);
                 })
         }
+    }.into_any();
+    let content = if viewer.get() {
+        element! { View(width, height) { Text(content: "frozen-view") } }.into_any()
+    } else {
+        editor
+    };
+    if fullscreen.get() || viewer.get() {
+        element! { AlternateScreen { #(content) } }.into_any()
+    } else {
+        content
     }
 }
 
@@ -447,6 +479,56 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
             deadline.wait_for("receiving resized history", || {
                 String::from_utf8_lossy(&bytes.lock().unwrap()).contains(&marker)
             });
+            send_input(b"\x06");
+            deadline.wait_for("entering fullscreen", || {
+                contents(&directory.0.join("application-output.ansi"))
+                    .is_some_and(|text| text.contains("\x1b[?1049h"))
+            });
+            let entries = contents(&directory.0.join("application-output.ansi"))
+                .unwrap()
+                .matches("\x1b[?1049h")
+                .count();
+            send_input(b"\x0f");
+            deadline.wait_for("opening the frozen view within fullscreen", || {
+                terminal
+                    .lock()
+                    .unwrap()
+                    .view()
+                    .any(|line| line.text().contains("frozen-view"))
+            });
+            send_input(b"\x0f");
+            deadline.wait_for("restoring the fullscreen editor", || {
+                terminal
+                    .lock()
+                    .unwrap()
+                    .view()
+                    .any(|line| line.text().contains("seedtyped"))
+            });
+            assert_eq!(
+                contents(&directory.0.join("application-output.ansi"))
+                    .unwrap()
+                    .matches("\x1b[?1049h")
+                    .count(),
+                entries
+            );
+            send_input(b"\x07");
+            deadline.wait_for("fullscreen terminal handoff", || {
+                directory.0.join("handoff").exists()
+            });
+            deadline.wait_for("reacquiring fullscreen after handoff", || {
+                contents(&directory.0.join("application-output.ansi"))
+                    .is_some_and(|text| text.matches("\x1b[?1049h").count() > entries)
+                    && terminal
+                        .lock()
+                        .unwrap()
+                        .view()
+                        .any(|line| line.text().contains("seedtyped"))
+            });
+            send_input(b"\x06");
+            deadline.wait_for("returning to the main screen", || {
+                contents(&directory.0.join("application-output.ansi"))
+                    .is_some_and(|text| text.matches("\x1b[?1049l").count() >= 2)
+            });
             directory.set_output_paused(true).unwrap();
             deadline.at("requesting replay while output is paused");
             send_input(b"\x12");
@@ -454,7 +536,7 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
                 directory.0.join("output-blocked").exists()
             });
             deadline.at("writing cancellation while output is paused");
-            send_input(b"\x03Z");
+            send_input(b"\x06\x0f\x0f\x06\x03Z");
             deadline.wait_for("accepting cancellation", || {
                 directory.0.join("cancelled").exists()
             });
