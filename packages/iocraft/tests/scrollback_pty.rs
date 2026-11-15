@@ -376,6 +376,31 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
         }));
         if let Err(error) = &result {
             deadline.report_failure(error.as_ref());
+            let progress = || {
+                format!(
+                    "ready={}, input={:?}, cancelled={}, completed={:?}",
+                    directory.0.join("ready").exists(),
+                    contents(&directory.0.join("input")),
+                    directory.0.join("cancelled").exists(),
+                    contents(&directory.0.join("completed")),
+                )
+            };
+            let before = progress();
+            let _ = writeln!(std::io::stderr(), "before draining PTY output: {before}");
+            deadline.at("draining output after failure");
+            paused.store(false, Ordering::Release);
+            let drain_deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < drain_deadline
+                && !(directory.0.join("cancelled").exists()
+                    && contents(&directory.0.join("input")).as_deref() == Some("seedtypedZ"))
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let _ = writeln!(
+                std::io::stderr(),
+                "after draining PTY output: {}",
+                progress()
+            );
         }
         paused.store(false, Ordering::Release);
         deadline.at("checking child exit before cleanup");
