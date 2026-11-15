@@ -266,6 +266,8 @@ impl Drop for Directory {
 struct GatedOutput {
     directory: PathBuf,
     output: io::Stdout,
+    capture: io::BufWriter<std::fs::File>,
+    captured_bytes: usize,
     reported_block: bool,
 }
 
@@ -290,17 +292,38 @@ impl GatedOutput {
 impl Write for GatedOutput {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.check_writable()?;
-        self.output.write(bytes)
+        let count = self.output.write(bytes)?;
+        self.captured_bytes += count;
+        assert!(
+            self.captured_bytes <= 4 * 1024 * 1024,
+            "bounded application output capture"
+        );
+        // ConPTY can consume control sequences instead of forwarding the original bytes.
+        self.capture.write_all(&bytes[..count])?;
+        Ok(count)
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.check_writable()?;
-        self.output.flush()
+        self.output.flush()?;
+        self.capture.flush()
     }
 }
 
 fn contents(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
+}
+
+fn assert_graphics_and_balanced_updates(bytes: &[u8]) {
+    let text = String::from_utf8_lossy(bytes);
+    assert!(
+        text.contains("a=t,f=100"),
+        "history includes native graphics"
+    );
+    assert_eq!(
+        text.matches("\x1b[?2026h").count(),
+        text.matches("\x1b[?2026l").count()
+    );
 }
 
 #[test]
@@ -310,6 +333,10 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
         let output = GatedOutput {
             directory: directory.clone(),
             output: io::stdout(),
+            capture: io::BufWriter::new(
+                std::fs::File::create(directory.join("application-output.ansi")).unwrap(),
+            ),
+            captured_bytes: 0,
             reported_block: false,
         };
         smol::block_on(
@@ -438,7 +465,14 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
             directory.set_output_paused(false).unwrap();
             deadline.at("requesting normal exit");
             send_input(b"\x11");
-            deadline.wait_for("normal child exit", || child.try_wait().unwrap().is_some());
+            deadline.wait_for("normal child exit", || {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "{status:?}");
+                    true
+                } else {
+                    false
+                }
+            });
         }));
         if let Err(error) = &result {
             deadline.report_failure(error.as_ref());
@@ -482,22 +516,26 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
         if let Err(error) = result {
             std::panic::resume_unwind(error);
         }
+        let application_output =
+            std::fs::read(directory.0.join("application-output.ansi")).unwrap();
+        assert_graphics_and_balanced_updates(&application_output);
         let bytes = bytes.lock().unwrap();
-        let text = String::from_utf8_lossy(&bytes);
-        assert!(
-            text.contains("a=t,f=100"),
-            "history includes native graphics"
-        );
-        assert_eq!(
-            text.matches("\x1b[?2026h").count(),
-            text.matches("\x1b[?2026l").count()
-        );
+        #[cfg(unix)]
+        assert_graphics_and_balanced_updates(&bytes);
         if let Some(report) = std::env::var_os("IOCRAFT_PTY_REPORT") {
             let report = PathBuf::from(report);
             std::fs::create_dir_all(&report).unwrap();
             std::fs::write(
                 report.join(format!("scrollback-{}-{rows}.ansi", std::env::consts::OS)),
                 &*bytes,
+            )
+            .unwrap();
+            std::fs::write(
+                report.join(format!(
+                    "scrollback-{}-{rows}-application.ansi",
+                    std::env::consts::OS
+                )),
+                application_output,
             )
             .unwrap();
         }
