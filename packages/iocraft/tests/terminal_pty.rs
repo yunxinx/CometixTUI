@@ -1,3 +1,6 @@
+#[path = "support/pty_output.rs"]
+mod pty_output;
+
 use iocraft::prelude::*;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
@@ -165,8 +168,7 @@ fn run_editor_in_native_pty(rows: u16, test_name: &str) {
         let (sender, receiver) = std::sync::mpsc::channel();
         let reader_thread = std::thread::spawn(move || {
             let mut bytes = [0; 4096];
-            let mut pending_utf8 = Vec::new();
-            let mut query_offset = 0;
+            let mut decoder = pty_output::OutputDecoder::new(reader_terminal, reply_writer);
             let mut total_bytes = 0;
             while let Ok(count) = reader.read(&mut bytes) {
                 if count == 0 {
@@ -174,45 +176,12 @@ fn run_editor_in_native_pty(rows: u16, test_name: &str) {
                 }
                 total_bytes += count;
                 assert!(total_bytes <= 2 * 1024 * 1024, "PTY capture is bounded");
-                pending_utf8.extend_from_slice(&bytes[..count]);
-                let length = match std::str::from_utf8(&pending_utf8) {
-                    Ok(text) => text.len(),
-                    Err(error) if error.error_len().is_none() => error.valid_up_to(),
-                    Err(error) => panic!("invalid terminal UTF-8: {error}"),
-                };
-                {
-                    let mut terminal = reader_terminal.lock().unwrap();
-                    for character in std::str::from_utf8(&pending_utf8[..length])
-                        .unwrap()
-                        .chars()
-                    {
-                        terminal.feed(character);
-                        const CURSOR_QUERY: &[u8] = b"\x1b[6n";
-                        if character == char::from(CURSOR_QUERY[query_offset]) {
-                            query_offset += 1;
-                        } else {
-                            query_offset = usize::from(character == '\x1b');
-                        }
-                        if query_offset == CURSOR_QUERY.len() {
-                            query_offset = 0;
-                            // ConPTY's inherited cursor requires a live host reply, including during resize.
-                            let cursor = terminal.cursor();
-                            let mut writer = reply_writer.lock().unwrap();
-                            let response = format!("\x1b[{};{}R", cursor.row + 1, cursor.col + 1);
-                            writer.write_all(response.as_bytes()).unwrap();
-                            writer.flush().unwrap();
-                        }
-                    }
-                }
-                pending_utf8.drain(..length);
+                decoder.feed(&bytes[..count]);
                 if sender.send(bytes[..count].to_vec()).is_err() {
                     break;
                 }
             }
-            assert!(
-                pending_utf8.is_empty(),
-                "PTY ended inside a UTF-8 character"
-            );
+            decoder.finish();
         });
         let mut child = pair
             .slave

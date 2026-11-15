@@ -1,3 +1,6 @@
+#[path = "support/pty_output.rs"]
+mod pty_output;
+
 use iocraft::prelude::*;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
@@ -188,8 +191,10 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
         };
         let pair = native_pty_system().openpty(size).unwrap();
         let mut reader = pair.master.try_clone_reader().unwrap();
-        let mut writer = pair.master.take_writer().unwrap();
-        let paused = Arc::new(AtomicBool::new(true));
+        let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+        let terminal = Arc::new(Mutex::new(avt::Vt::new(40, usize::from(rows))));
+        let mut decoder = pty_output::OutputDecoder::new(terminal.clone(), writer.clone());
+        let paused = Arc::new(AtomicBool::new(false));
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let reading = paused.clone();
         let captured = bytes.clone();
@@ -203,12 +208,14 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
                     Ok(0) | Err(_) => break,
                     Ok(count) => count,
                 };
+                decoder.feed(&buffer[..count]);
                 let mut bytes = captured.lock().unwrap();
                 bytes.extend_from_slice(&buffer[..count]);
                 assert!(bytes.len() <= 4 * 1024 * 1024, "bounded PTY capture");
                 drop(bytes);
                 std::thread::sleep(Duration::from_millis(1));
             }
+            decoder.finish();
         });
         let mut command = CommandBuilder::new(std::env::current_exe().unwrap());
         command.args([
@@ -220,12 +227,23 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
         command.env("TERM", "xterm-256color");
         let mut child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
+        let send_input = |bytes: &[u8]| {
+            let mut writer = writer.lock().unwrap();
+            writer.write_all(bytes).unwrap();
+            writer.flush().unwrap();
+        };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             wait_for(|| directory.0.join("ready").exists());
-            writer.write_all(b"\x1b[Ftyped").unwrap();
-            writer.flush().unwrap();
+            paused.store(true, Ordering::Release);
+            send_input(b"\x1b[Ftyped");
             wait_for(|| contents(&directory.0.join("input")).as_deref() == Some("seedtyped"));
+            // ConPTY control calls require the host to keep servicing cursor queries.
+            paused.store(false, Ordering::Release);
             for cols in [25, 60, 35] {
+                terminal
+                    .lock()
+                    .unwrap()
+                    .resize(usize::from(cols), usize::from(rows));
                 pair.master.resize(PtySize { cols, ..size }).unwrap();
                 std::thread::sleep(Duration::from_millis(90));
             }
@@ -239,16 +257,13 @@ fn scrollback_input_resize_graphics_and_cancel_in_a_slow_pty() {
             let marker = format!("history-{generation}-4095");
             wait_for(|| String::from_utf8_lossy(&bytes.lock().unwrap()).contains(&marker));
             paused.store(true, Ordering::Release);
-            writer.write_all(b"\x12").unwrap();
-            writer.flush().unwrap();
+            send_input(b"\x12");
             std::thread::sleep(Duration::from_millis(100));
-            writer.write_all(b"\x03Z").unwrap();
-            writer.flush().unwrap();
+            send_input(b"\x03Z");
             wait_for(|| directory.0.join("cancelled").exists());
             wait_for(|| contents(&directory.0.join("input")).as_deref() == Some("seedtypedZ"));
             paused.store(false, Ordering::Release);
-            writer.write_all(b"\x11").unwrap();
-            writer.flush().unwrap();
+            send_input(b"\x11");
             wait_for(|| child.try_wait().unwrap().is_some());
         }));
         paused.store(false, Ordering::Release);
