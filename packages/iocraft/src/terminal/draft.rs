@@ -141,7 +141,6 @@ pub struct FrameDraft {
     pub(crate) allocations: super::OutputAllocations,
     pub(crate) coverage: Option<SourceCoverage>,
     pub(crate) alternate: bool,
-    pub(crate) paint: bool,
     pub(crate) hits: Vec<HitRegion>,
     pub(crate) views: Option<Arc<crate::components::ViewHitProjection>>,
 }
@@ -155,7 +154,6 @@ impl FrameDraft {
             allocations: Default::default(),
             coverage: None,
             alternate: false,
-            paint: true,
             hits: Vec::new(),
             views: None,
         }

@@ -2571,7 +2571,6 @@ impl<'a> Tree<'a> {
                 }
                 else {
                     let mut draft = crate::FrameDraft::new(output.canvas.clone()).with_hits(output.hit_regions.clone());
-                    draft.paint = false;
                     draft.views = Some(self.root_view_event_context.capture_hits());
                     accepted = term.write_canvas_after_repaint_check(prev_canvas.as_ref(), draft)?;
                 }

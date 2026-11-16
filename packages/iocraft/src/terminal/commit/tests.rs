@@ -565,3 +565,248 @@ fn superseded_history_does_not_purge_or_advance_coverage() {
         assert_eq!(text.matches("latest").count(), 1);
     });
 }
+
+#[test]
+fn identical_editor_frames_preserve_the_terminal_cursor() {
+    smol::block_on(async {
+        for alternate in [false, true] {
+            let capture = Capture::default();
+            let mut output = TerminalOutput::new(capture.clone(), 20, 8).unwrap();
+            let mut editor = element!(View(width: 20, height: 3) {
+                TextInput(value: "draft界", has_focus: true, physical_cursor: true, multiline: true)
+            });
+            let mut canvas = editor.render(Some(20));
+            canvas.clear_damage();
+            assert!(canvas.cursor_declaration().is_some());
+            let mut moved = canvas.clone();
+            moved.declare_cursor(1, 1, true);
+            for canvas in [canvas, moved] {
+                for repeat in 0..3 {
+                    let draft = FrameDraft::new(canvas.clone());
+                    output
+                        .present(if alternate {
+                            draft.alternate_screen()
+                        } else {
+                            draft
+                        })
+                        .await
+                        .unwrap();
+                    let bytes = std::mem::take(&mut *capture.bytes.lock().unwrap());
+                    if repeat > 0 {
+                        assert!(
+                            bytes.is_empty(),
+                            "unchanged editor output moved the IME anchor: {bytes:?}"
+                        );
+                    } else {
+                        assert!(!bytes.is_empty(), "a changed caret must reach the terminal");
+                    }
+                }
+            }
+            output.finish().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn history_batch_preserves_the_editor_until_its_atomic_replacement() {
+    smol::block_on(async {
+        for (replace, graphics) in [(false, false), (true, false), (false, true), (true, true)] {
+            let capture = Capture::default();
+            let mut output = TerminalOutput::new(capture.clone(), 20, 8).unwrap();
+            let mut editor = element!(View(width: 20, height: 3) {
+                TextInput(value: "draft界", has_focus: true, physical_cursor: true, multiline: true)
+            });
+            output
+                .present(FrameDraft::new(editor.render(Some(20))))
+                .await
+                .unwrap();
+            capture.bytes.lock().unwrap().clear();
+            let mut history = Canvas::new(20, 2);
+            history.subview_mut(0, 0, 0, 0, 20, 2).set_text(
+                0,
+                0,
+                "history",
+                CanvasTextStyle::default(),
+            );
+            if graphics {
+                let image =
+                    CanvasImage::new(Arc::new(Source(ImageScope::default())), 1, 1).unwrap();
+                history
+                    .subview_mut(0, 0, 0, 0, 20, 2)
+                    .set_image(0, 1, &image);
+            }
+            let draft = HistoryDraft::new(history);
+            output
+                .append_history(if replace {
+                    draft.replace_scrollback()
+                } else {
+                    draft
+                })
+                .await
+                .unwrap();
+            let bytes = capture.bytes.lock().unwrap().clone();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            let begin = text
+                .find("\x1b[?2026h")
+                .expect("history replacement has a presentation boundary");
+            assert!(
+                !text[..begin].contains("\x1b["),
+                "history clear is visible before replacement: {text:?}"
+            );
+            assert_eq!(
+                text[..begin].contains("\x1b_Ga=t"),
+                graphics,
+                "image upload precedes visible replacement"
+            );
+            assert!(
+                text.ends_with("\x1b[?2026l"),
+                "editor restoration must complete the same update: {text:?}"
+            );
+            assert_eq!(text.matches("\x1b[?2026h").count(), 1);
+            assert!(text.contains("history"));
+            assert!(text.contains("draft界"));
+            output.finish().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn finishing_alternate_screen_removes_the_hidden_interactive_frame() {
+    smol::block_on(async {
+        let capture = Capture::default();
+        let mut output = TerminalOutput::new(capture.clone(), 20, 8).unwrap();
+        let mut history = element!(Text(content: "saved history"));
+        output
+            .append_history(HistoryDraft::new(history.render(Some(20))))
+            .await
+            .unwrap();
+        let mut main = element!(View(width: 20, flex_direction: FlexDirection::Column) {
+            Text(content: "transient menu")
+            TextInput(value: "draft", has_focus: true, physical_cursor: true)
+        });
+        output
+            .present(FrameDraft::new(main.render(Some(20))))
+            .await
+            .unwrap();
+        let mut alternate = element!(Text(content: "fullscreen reply"));
+        output
+            .present(FrameDraft::new(alternate.render(Some(20))).alternate_screen())
+            .await
+            .unwrap();
+        output.finish().await.unwrap();
+        let bytes = capture.bytes.lock().unwrap().clone();
+        let mut terminal = avt::Vt::builder().size(20, 8).scrollback_limit(100).build();
+        terminal.feed_str(std::str::from_utf8(&bytes).unwrap());
+        let text = terminal
+            .lines()
+            .map(|line| line.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("saved history"),
+            "committed history survives exit: {text:?}"
+        );
+        assert!(
+            !text.contains("transient menu"),
+            "hidden interactive frame reappeared on exit: {text:?}"
+        );
+        assert!(!text.contains("draft"));
+        assert!(!text.contains("fullscreen reply"));
+    });
+}
+
+#[test]
+fn screen_transitions_publish_the_frame_and_cursor_atomically() {
+    smol::block_on(async {
+        let capture = Capture::default();
+        let mut output = TerminalOutput::new(capture.clone(), 20, 8).unwrap();
+        let mut editor = element!(View(width: 20, height: 3) {
+            TextInput(value: "draft界", has_focus: true, physical_cursor: true, multiline: true)
+        });
+        let canvas = editor.render(Some(20));
+        output
+            .present(FrameDraft::new(canvas.clone()))
+            .await
+            .unwrap();
+        for alternate in [true, false] {
+            capture.bytes.lock().unwrap().clear();
+            let draft = FrameDraft::new(canvas.clone());
+            output
+                .present(if alternate {
+                    draft.alternate_screen()
+                } else {
+                    draft
+                })
+                .await
+                .unwrap();
+            let bytes = capture.bytes.lock().unwrap().clone();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(
+                text.starts_with("\x1b[?2026h"),
+                "screen transition precedes its frame: {text:?}"
+            );
+            assert!(text.ends_with("\x1b[?2026l"));
+            assert_eq!(text.matches("\x1b[?2026h").count(), 1);
+            assert!(text.contains(if alternate {
+                "\x1b[?1049h"
+            } else {
+                "\x1b[?1049l"
+            }));
+            assert!(
+                text.contains(if alternate { "\x1b[1;8H" } else { "\x1b[8G" }),
+                "declared input caret must be restored: {text:?}"
+            );
+        }
+        output.finish().await.unwrap();
+    });
+}
+
+#[test]
+fn identical_damaged_frame_repairs_terminal_cells() {
+    smol::block_on(async {
+        for alternate in [false, true] {
+            let capture = Capture::default();
+            let mut output = TerminalOutput::new(capture.clone(), 20, 8).unwrap();
+            let mut editor = element!(View(width: 20, height: 3) {
+                TextInput(value: "draft", has_focus: true, physical_cursor: true, multiline: true)
+            });
+            let mut canvas = editor.render(Some(20));
+            canvas.clear_damage();
+            let draft = |canvas| {
+                let draft = FrameDraft::new(canvas);
+                if alternate {
+                    draft.alternate_screen()
+                } else {
+                    draft
+                }
+            };
+            output.present(draft(canvas.clone())).await.unwrap();
+            let mut terminal = avt::Vt::new(20, 8);
+            terminal.feed_str(std::str::from_utf8(&capture.bytes.lock().unwrap()).unwrap());
+            terminal.feed_str("\x1b[s\x1b[1;1HWRONG\x1b[u");
+            capture.bytes.lock().unwrap().clear();
+            let mut damaged = canvas.clone();
+            damaged.mark_damage(DamageRegion {
+                x: 0,
+                y: 0,
+                width: 5,
+                height: 1,
+            });
+            output.present(draft(damaged)).await.unwrap();
+            let repair = capture.bytes.lock().unwrap().clone();
+            terminal.feed_str(std::str::from_utf8(&repair).unwrap());
+            assert!(
+                terminal.line(0).text().starts_with("draft"),
+                "damage must restore otherwise-identical text: {repair:?}"
+            );
+            output.present(draft(canvas.clone())).await.unwrap();
+            capture.bytes.lock().unwrap().clear();
+            output.present(draft(canvas)).await.unwrap();
+            assert!(
+                capture.bytes.lock().unwrap().is_empty(),
+                "settled undamaged frames leave the caret untouched"
+            );
+            output.finish().await.unwrap();
+        }
+    });
+}

@@ -326,7 +326,7 @@ impl OutputSession {
                         synchronization: SynchronizedOutput::new(
                             !mock && is_synchronized_output_supported(),
                         ),
-                        graphics: super::graphics::Graphics::new(worker.memory.clone()),
+                        graphics: super::graphics::Graphics::new(),
                         appended_newline: None,
                         sequence: 0,
                     };
@@ -652,7 +652,6 @@ impl OutputSender {
         if let (Operation::Frame { draft, .. }, Some((Operation::Frame { draft: old, .. }, _))) =
             (&mut operation, &replaced)
         {
-            draft.paint |= old.paint;
             draft.canvas.inherit_unpainted_changes(&old.canvas);
         }
         if matches!(&operation, Operation::Release(_)) {
@@ -898,17 +897,27 @@ impl OutputOwner {
                 if let Some((width, height)) = size {
                     self.backend.set_size_from_resize_event(width, height);
                 }
+                self.synchronization.enter();
+                let mut next_canvas = None;
                 let result: io::Result<()> = (|| {
                     if let Some(previous) = &self.previous {
+                        if self.backend.restore_inline_rows_would_write() {
+                            self.synchronization.start(self.backend.dest())?;
+                        }
                         self.backend
                             .restore_inline_rows_after_height_shrink(previous)?;
                     }
+                    let mut screen_changed = false;
                     if !self.base_fullscreen {
                         let plan = self.backend.plan_screen_transition(screen);
+                        if plan.writes_output {
+                            self.synchronization.start(self.backend.dest())?;
+                        }
                         if matches!(plan.transition, ScreenTransition::Leave) {
                             self.graphics.leave_alternate(self.backend.dest())?;
                         }
-                        if self.backend.apply_screen_transition(plan)? {
+                        screen_changed = self.backend.apply_screen_transition(plan)?;
+                        if screen_changed {
                             if self.backend.is_fullscreen() {
                                 self.saved_main = self.previous.take();
                             } else {
@@ -922,25 +931,31 @@ impl OutputOwner {
                         self.backend.dest(),
                         std::mem::take(&mut draft.graphics),
                     )?;
-                    if !draft.paint && self.previous.as_ref() == Some(&resolved) {
-                        return self.backend.flush();
+                    if !screen_changed
+                        && self
+                            .backend
+                            .frame_is_current(self.previous.as_ref(), &resolved)
+                    {
+                        return Ok(());
                     }
-                    self.synchronization.enter();
-                    let write = (|| {
-                        self.synchronization.start(self.backend.dest())?;
-                        self.backend.write_canvas(
-                            self.previous.as_ref(),
-                            &resolved,
-                            self.synchronization.context(),
-                        )?;
-                        self.backend.position_cursor(canvas.cursor_declaration())
-                    })();
-                    let end = self.synchronization.leave(self.backend.dest());
-                    write.and(end)?;
-                    self.backend.flush()?;
-                    self.previous = Some(resolved);
+                    self.synchronization.start(self.backend.dest())?;
+                    self.backend.write_canvas(
+                        self.previous.as_ref(),
+                        &resolved,
+                        self.synchronization.context(),
+                    )?;
+                    self.backend.position_cursor(canvas.cursor_declaration())?;
+                    next_canvas = Some(resolved);
                     Ok(())
                 })();
+                let end = self.synchronization.leave(self.backend.dest());
+                let result = result.and(end).and_then(|()| {
+                    self.backend.flush()?;
+                    if let Some(canvas) = next_canvas {
+                        self.previous = Some(canvas);
+                    }
+                    Ok(())
+                });
                 if result.is_ok() {
                     let mut snapshot = EventCellSnapshot::from_canvas(&draft.canvas);
                     snapshot.frame = Some(Arc::new(CommittedFrame {
@@ -1134,20 +1149,27 @@ impl OutputOwner {
                 "history rows require the main screen",
             ));
         }
-        if replace {
-            self.backend.clear_terminal()?;
-        } else if self.previous.is_some() {
-            self.backend.clear_canvas()?;
-        }
         self.graphics
-            .append_archival(canvas, self.backend.dest(), Some(plan))?;
-        if let Some(previous) = &self.previous {
-            self.backend
-                .write_canvas(None, previous, OutputContext::default())?;
-            self.backend
-                .position_cursor(previous.cursor_declaration())?;
-        }
-        self.backend.flush()
+            .append_archival(canvas, &mut self.backend, plan, |backend, resolved| {
+                self.synchronization.enter();
+                let write = (|| {
+                    self.synchronization.start(backend.dest())?;
+                    if replace {
+                        backend.clear_terminal()?;
+                    } else if self.previous.is_some() {
+                        backend.clear_canvas()?;
+                    }
+                    resolved.write_ansi(backend.dest())?;
+                    if let Some(previous) = &self.previous {
+                        backend.write_canvas(None, previous, self.synchronization.context())?;
+                        backend.position_cursor(previous.cursor_declaration())?;
+                    }
+                    Ok(())
+                })();
+                let end = self.synchronization.leave(backend.dest());
+                write.and(end)?;
+                backend.flush()
+            })
     }
 }
 

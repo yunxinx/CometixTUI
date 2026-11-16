@@ -196,6 +196,10 @@ pub(super) trait TerminalImpl: Write + Send {
     fn write_canvas_would_write(&self, _prev: Option<&Canvas>, _canvas: &Canvas) -> bool {
         true
     }
+
+    fn frame_is_current(&self, _previous: Option<&Canvas>, _canvas: &Canvas) -> bool {
+        false
+    }
     fn write_canvas(
         &mut self,
         prev: Option<&Canvas>,
@@ -608,18 +612,9 @@ impl TerminalImpl for StdTerminal<'_> {
                 self.set_mouse_capture(saved.is_some_and(|saved| saved.mouse_capture))?;
                 self.keyboard.disable(&mut self.dest)?;
                 self.dest.queue(terminal::LeaveAlternateScreen)?;
-                self.fullscreen = false;
-                self.dynamic_alternate_saved_main_screen = None;
+                self.restore_main_screen_output_state();
                 if self.raw_mode_enabled {
                     self.keyboard.enable(&mut self.dest)?;
-                }
-                self.reset_retained_output_state();
-                if let Some(saved) = saved {
-                    self.prev_canvas_height = saved.prev_canvas_height;
-                    self.prev_size_on_write = saved.prev_size_on_write;
-                    self.inline_bottom_gap = saved.inline_bottom_gap;
-                    self.inline_force_full_rewrite_next_diff =
-                        saved.inline_force_full_rewrite_next_diff;
                 }
                 self.dest.flush()?;
                 Ok(true)
@@ -768,7 +763,8 @@ impl TerminalImpl for StdTerminal<'_> {
         if self.fullscreen && self.size.is_some_and(|(_, rows)| rows == 0) {
             return false;
         }
-        if self.inline_full_rewrite_deferred(prev, canvas) {
+        let defer_full_rewrite = self.inline_full_rewrite_deferred(prev, canvas);
+        if defer_full_rewrite && self.frame_is_current(prev, canvas) {
             return false;
         }
         if self.inline_pending_wrap || self.cursor_displacement_rows > 0 {
@@ -795,7 +791,9 @@ impl TerminalImpl for StdTerminal<'_> {
             });
         }
 
-        if self.inline_force_full_rewrite_next_diff || self.inline_resize_requires_full_rewrite() {
+        if (self.inline_force_full_rewrite_next_diff && !defer_full_rewrite)
+            || self.inline_resize_requires_full_rewrite()
+        {
             return self.prev_canvas_height > 0 || canvas.height() > 0;
         }
         if canvas.should_force_full_repaint() {
@@ -818,6 +816,14 @@ impl TerminalImpl for StdTerminal<'_> {
         })
     }
 
+    fn frame_is_current(&self, previous: Option<&Canvas>, canvas: &Canvas) -> bool {
+        self.prev_size_on_write == self.size
+            && !canvas.should_force_full_repaint()
+            && !canvas.has_damage()
+            && previous.is_none_or(|previous| !previous.has_damage())
+            && previous == Some(canvas)
+    }
+
     fn write_canvas(
         &mut self,
         prev: Option<&Canvas>,
@@ -829,7 +835,8 @@ impl TerminalImpl for StdTerminal<'_> {
             self.prev_size_on_write = self.size;
             return Ok(());
         }
-        if self.inline_full_rewrite_deferred(prev, canvas) {
+        let defer_full_rewrite = self.inline_full_rewrite_deferred(prev, canvas);
+        if defer_full_rewrite && self.frame_is_current(prev, canvas) {
             return Ok(());
         }
         if let Some(prev) = prev {
@@ -929,7 +936,9 @@ impl TerminalImpl for StdTerminal<'_> {
             return Ok(());
         }
 
-        if self.inline_force_full_rewrite_next_diff || self.inline_resize_requires_full_rewrite() {
+        if (self.inline_force_full_rewrite_next_diff && !defer_full_rewrite)
+            || self.inline_resize_requires_full_rewrite()
+        {
             self.clear_canvas()?;
             self.prev_canvas_height = canvas.height() as _;
             self.prev_size_on_write = self.size;
@@ -1603,8 +1612,8 @@ impl<'a> StdTerminal<'a> {
 
     /// Whether an inline frame repeats what the screen holds, the same canvas at the size it
     /// was written at, while the full rewrite owed to the first diff is still pending. The
-    /// rewrite waits for a frame that changes something, so returning from a dynamic
-    /// alternate screen to an unchanged main screen writes nothing.
+    /// rewrite waits for changed content. Damage can repaint reachable rows in place
+    /// without duplicating the identical rows already in native scrollback.
     fn inline_full_rewrite_deferred(&self, prev: Option<&Canvas>, canvas: &Canvas) -> bool {
         !self.fullscreen
             && self.inline_force_full_rewrite_next_diff
@@ -1698,6 +1707,18 @@ impl<'a> StdTerminal<'a> {
 }
 
 impl StdTerminal<'_> {
+    fn restore_main_screen_output_state(&mut self) {
+        let saved = self.dynamic_alternate_saved_main_screen.take();
+        self.fullscreen = false;
+        self.reset_retained_output_state();
+        if let Some(saved) = saved {
+            self.prev_canvas_height = saved.prev_canvas_height;
+            self.prev_size_on_write = saved.prev_size_on_write;
+            self.inline_bottom_gap = saved.inline_bottom_gap;
+            self.inline_force_full_rewrite_next_diff = saved.inline_force_full_rewrite_next_diff;
+        }
+    }
+
     fn apply_window_title(&mut self) -> io::Result<()> {
         let Some(title) = &self.window_title else {
             return Ok(());
@@ -1737,7 +1758,14 @@ impl StdTerminal<'_> {
         result = result.and(attempt(&mut || self.restore_window_title()));
         if self.fullscreen {
             result = result.and(attempt(&mut || {
-                self.dest.queue(terminal::LeaveAlternateScreen).map(|_| ())
+                self.dest.queue(terminal::LeaveAlternateScreen)?;
+                let has_main_frame = self.dynamic_alternate_saved_main_screen.is_some();
+                self.restore_main_screen_output_state();
+                if has_main_frame {
+                    self.clear_canvas()?;
+                    self.prev_canvas_height = 0;
+                }
+                Ok(())
             }));
         } else if self.prev_canvas_height > 0 {
             result = result.and(attempt(&mut || self.dest.write_all(b"\r\n")));

@@ -105,16 +105,14 @@ impl GraphicsPlan {
 
 pub(super) struct Graphics {
     screens: [ScreenImages; 2],
-    memory: Arc<OutputMemory>,
 }
 
 impl Graphics {
-    pub(super) fn new(memory: Arc<OutputMemory>) -> Self {
+    pub(super) fn new() -> Self {
         let seed = std::collections::hash_map::RandomState::new().hash_one(()) as u32;
         let start = (seed & 0x7fff_fffe) | 0x0100_0000;
         Self {
             screens: [ScreenImages::new(start), ScreenImages::new(start + 1)],
-            memory,
         }
     }
 
@@ -227,23 +225,19 @@ impl Graphics {
         Ok(resolved)
     }
 
-    pub(super) fn append_archival(
+    pub(super) fn append_archival<W: Write>(
         &mut self,
         canvas: &Canvas,
-        output: &mut dyn Write,
-        plan: Option<GraphicsPlan>,
+        output: &mut W,
+        plan: GraphicsPlan,
+        present: impl FnOnce(&mut W, &Canvas) -> io::Result<()>,
     ) -> io::Result<()> {
-        let plan = match plan {
-            Some(plan) => plan,
-            None => GraphicsPlan::reserve(canvas, &self.memory)?,
-        };
         // The live frame's bindings must survive a history batch inserted above it.
         // Archived bindings are released locally after flush; their IDs stay in the scope range.
         let live = std::mem::take(&mut self.screens[0].hot);
         let result = (|| {
             let resolved = self.prepare(canvas, false, output, plan)?;
-            resolved.write_ansi(&mut *output)?;
-            output.flush()
+            present(output, &resolved)
         })();
         if result.is_ok() {
             self.screens[0].hot = live;

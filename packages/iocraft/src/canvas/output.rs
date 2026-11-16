@@ -191,10 +191,10 @@ impl CanvasSubviewMut<'_> {
 
     /// Copies a rectangular region from `src` without marking terminal-output damage.
     ///
-    /// This is the clean-blit counterpart to [`Self::blit_region_from`]. Use it
-    /// only when the restored cells are known to match the previous terminal
-    /// frame; otherwise the terminal writer may skip a repaint that is required
-    /// to repair stale physical output.
+    /// Copied cells and overlays still participate in normal frame comparison.
+    /// Use this when the retained terminal frame remains a valid baseline.
+    /// Repairing physical output that differs from that baseline requires
+    /// explicit damage, as declared by [`Self::blit_region_from`].
     #[allow(clippy::too_many_arguments)]
     pub fn blit_region_from_clean(
         &mut self,

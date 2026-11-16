@@ -158,6 +158,7 @@ pub(super) struct MockTerminal {
     dummy_dest: io::Sink,
     dummy_alt: io::Sink,
     size: Option<(u16, u16)>,
+    written_size: Option<(u16, u16)>,
     pub(super) fullscreen: bool,
     raw_mode_enabled: bool,
     resumed: bool,
@@ -176,6 +177,7 @@ impl MockTerminal {
                 dummy_dest: io::sink(),
                 dummy_alt: io::sink(),
                 size,
+                written_size: None,
                 fullscreen,
                 raw_mode_enabled: false,
                 resumed: false,
@@ -281,6 +283,14 @@ impl TerminalImpl for MockTerminal {
         Ok(())
     }
 
+    fn frame_is_current(&self, previous: Option<&Canvas>, canvas: &Canvas) -> bool {
+        self.written_size == self.size
+            && !canvas.should_force_full_repaint()
+            && !canvas.has_damage()
+            && previous.is_none_or(|previous| !previous.has_damage())
+            && previous == Some(canvas)
+    }
+
     fn write_canvas(
         &mut self,
         _prev: Option<&Canvas>,
@@ -288,6 +298,7 @@ impl TerminalImpl for MockTerminal {
         _output: OutputContext,
     ) -> io::Result<()> {
         let _ = self.output.unbounded_send(canvas.clone());
+        self.written_size = self.size;
         Ok(())
     }
 
