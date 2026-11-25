@@ -387,6 +387,7 @@ pub(super) struct StdTerminal<'a> {
     /// precede the canvas in the main screen, so establish a clean retained
     /// baseline before trusting sparse row diffs.
     pub(super) inline_force_full_rewrite_next_diff: bool,
+    pub(super) retains_inline_rows_on_height_shrink: bool,
     #[cfg(unix)]
     pub(super) resume_signal: Option<ResumeSignalListener>,
 }
@@ -748,6 +749,12 @@ impl TerminalImpl for StdTerminal<'_> {
         let Some((prev_rows, rows)) = self.inline_height_shrink_below_cursor() else {
             return Ok(());
         };
+        if self.retains_inline_rows_on_height_shrink {
+            // Kitty trims trailing blank rows before moving the live prefix into scrollback.
+            // The retained suffix is already on screen, so CNL can reach the canvas bottom.
+            self.inline_bottom_gap = self.inline_bottom_gap.saturating_sub(prev_rows - rows);
+            return self.restore_cursor_baseline();
+        }
         // A declaration above the old viewport was clamped to its top. Only
         // replay rows that were below that physical cursor, not older history.
         let tail_rows = self.cursor_displacement_rows.min(
@@ -1257,6 +1264,8 @@ impl<'a> StdTerminal<'a> {
             inline_bottom_gap: 0,
             inline_pending_wrap: false,
             inline_force_full_rewrite_next_diff: false,
+            retains_inline_rows_on_height_shrink: input_is_terminal
+                && capability::retains_inline_rows_on_height_shrink(),
             // Best-effort: if signal registration fails, the terminal still works —
             // it just won't self-heal after suspend/resume.
             #[cfg(unix)]

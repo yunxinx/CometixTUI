@@ -1261,7 +1261,13 @@ impl OutputOwner {
                         backend.clear_canvas()?;
                     }
                     if archive.height() > 0 {
-                        archive.write_ansi(backend.dest())?;
+                        // The encoder writes individual cells. Coalesce them before they
+                        // reach the terminal descriptor during the synchronized update.
+                        let mut buffered = io::BufWriter::with_capacity(8192, backend.dest());
+                        let write = archive.write_ansi(&mut buffered);
+                        // write_ansi flushes on success. Discard any unwritten suffix on failure.
+                        let _ = buffered.into_parts();
+                        write?;
                     }
                     if let Some(live) = live {
                         backend.write_canvas_after_history(live, self.synchronization.context())?;

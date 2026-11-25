@@ -1785,6 +1785,7 @@ struct RenderOutput {
     hit_regions: Vec<crate::HitRegion>,
     did_clear_terminal_output: bool,
     alternate_screen_changed: bool,
+    main_screen_frame_deferred: bool,
     layout_pass_requested: bool,
     phase_profile: RenderPhaseProfile,
 }
@@ -1834,6 +1835,7 @@ impl<'a> Tree<'a> {
             profile_enabled,
             prev_canvas,
             &prev_overlays,
+            false,
         )?;
         // Layout effects: a component that lays itself out at the size it was drawn at
         // (`TextInput` wraps its value to its width) requests another pass when that size
@@ -1855,6 +1857,7 @@ impl<'a> Tree<'a> {
             profile_enabled,
             Some(&first.canvas),
             &first.overlays,
+            first.did_clear_terminal_output || first.alternate_screen_changed,
         )?;
         self.overlays = std::mem::take(&mut output.overlays);
         output.did_clear_terminal_output |= first.did_clear_terminal_output;
@@ -1886,6 +1889,7 @@ impl<'a> Tree<'a> {
         profile_enabled: bool,
         prev_canvas: Option<&Canvas>,
         prev_overlays: &[CanvasRect],
+        publication_required: bool,
     ) -> io::Result<RenderOutput> {
         self.system_context.begin_render_frame();
         let update_start = profile_enabled.then(std::time::Instant::now);
@@ -2009,8 +2013,18 @@ impl<'a> Tree<'a> {
         let miss_full = std::cell::Cell::new(0usize);
         let dirty_before = layout_stats
             .then(|| count_dirty_layout_nodes(&self.layout_engine, self.wrapper_node_id));
+        did_clear_terminal_output |= terminal
+            .as_deref_mut()
+            .is_some_and(Terminal::take_output_clear);
+        let main_screen_frame_deferred = self.system_context.main_screen_frame_deferred()
+            && !publication_required
+            && !did_clear_terminal_output
+            && terminal
+                .as_deref()
+                .is_some_and(|term| !term.is_always_fullscreen());
         let alternate_screen_changed = terminal
             .as_deref_mut()
+            .filter(|_| !main_screen_frame_deferred)
             .map(|term| {
                 term.set_dynamic_alternate_screen(self.system_context.alternate_screen_request())
             })
@@ -2020,7 +2034,7 @@ impl<'a> Tree<'a> {
             .as_ref()
             .and_then(|term| term.size().map(|(_, rows)| rows as usize));
         let fullscreen_size = terminal.as_ref().and_then(|term| {
-            if term.is_fullscreen() {
+            if term.is_fullscreen() && !main_screen_frame_deferred {
                 term.size()
                     .map(|(cols, rows)| (cols as usize, rows as usize))
             } else {
@@ -2271,6 +2285,7 @@ impl<'a> Tree<'a> {
             hit_regions,
             did_clear_terminal_output,
             alternate_screen_changed,
+            main_screen_frame_deferred,
             layout_pass_requested,
             phase_profile: RenderPhaseProfile {
                 update: update_duration,
@@ -2404,6 +2419,7 @@ impl<'a> Tree<'a> {
             let mut frame_phases = RenderFramePhases::default();
             let mut repaint = None;
             let sync_wrap_start = profile_enabled.then(std::time::Instant::now);
+            let retrying_history = self.system_context.has_pending_history();
             term.synchronized_update(|mut term| {
                 // This frame may switch to an alternate screen, which keeps the main screen
                 // as it stands: first put back the rows a shorter terminal cut below the
@@ -2435,6 +2451,7 @@ impl<'a> Tree<'a> {
                 while prev_canvas.is_some()
                     && !output.did_clear_terminal_output
                     && !output.alternate_screen_changed
+                    && (term.is_fullscreen() || !self.system_context.has_pending_history())
                     && !self.system_context.should_exit()
                     && !self.system_context.has_terminal_handoff()
                     && !term.received_ctrl_c()
@@ -2464,7 +2481,20 @@ impl<'a> Tree<'a> {
                     output = next;
                     batch_events += 1;
                 }
-                output.did_clear_terminal_output |= term.take_output_clear();
+                frame_phases.update = output.phase_profile.update;
+                frame_phases.layout = output.phase_profile.layout;
+                frame_phases.draw = output.phase_profile.draw;
+                frame_phases.layout_measures = output.phase_profile.layout_measures;
+                frame_phases.canvas_alloc = output.phase_profile.canvas_alloc;
+                frame_phases.settle_rounds = output.phase_profile.settle_rounds;
+                frame_phases.layout_nodes = self.layout_engine.total_node_count();
+                frame_phases.canvas_width = output.canvas.width();
+                frame_phases.canvas_height = output.canvas.height();
+                if output.main_screen_frame_deferred {
+                    unpainted_canvas = Some(output.canvas);
+                    prev_terminal_size = terminal_size;
+                    return Ok(());
+                }
                 let terminal_diff_planning = term.canvas_diff_planning();
                 let (should_repaint, repaint_reason, changed_cells, diff_rows_scanned) =
                     if matches!(
@@ -2599,17 +2629,8 @@ impl<'a> Tree<'a> {
                     frame_phases.event_snapshot =
                         snapshot_start.map_or(Duration::ZERO, |start| start.elapsed());
                 }
-                frame_phases.update = output.phase_profile.update;
-                frame_phases.layout = output.phase_profile.layout;
-                frame_phases.draw = output.phase_profile.draw;
-                frame_phases.layout_measures = output.phase_profile.layout_measures;
-                frame_phases.canvas_alloc = output.phase_profile.canvas_alloc;
-                frame_phases.settle_rounds = output.phase_profile.settle_rounds;
-                frame_phases.layout_nodes = self.layout_engine.total_node_count();
                 frame_phases.diff_rows_scanned = diff_rows_scanned;
                 frame_phases.changed_cells = changed_cells;
-                frame_phases.canvas_width = output.canvas.width();
-                frame_phases.canvas_height = output.canvas.height();
                 output.canvas.clear_force_full_repaint();
                 // Keep damage on the retained previous canvas. CC Ink's
                 // diffEach unions prev.damage with next.damage so cleanup
@@ -2673,6 +2694,10 @@ impl<'a> Tree<'a> {
             }
             if self.system_context.should_exit() || term.received_ctrl_c() {
                 break;
+            }
+            // Source changes reconciled during backpressure may be waiting for this slot.
+            if retrying_history && !self.system_context.has_pending_history() {
+                continue;
             }
             // An output clear or screen transition can end the input batch. Its paint
             // is now committed, so the retained input can observe this render's state.

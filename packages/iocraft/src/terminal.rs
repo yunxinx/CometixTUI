@@ -557,6 +557,10 @@ impl<'a> Terminal<'a> {
         self.inner.is_fullscreen()
     }
 
+    pub(crate) fn is_always_fullscreen(&self) -> bool {
+        self.base_fullscreen
+    }
+
     pub fn set_dynamic_alternate_screen(
         &mut self,
         request: Option<crate::context::AlternateScreenRequest>,

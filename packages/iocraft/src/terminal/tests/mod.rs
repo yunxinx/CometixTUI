@@ -1065,6 +1065,7 @@ fn new_fullscreen_term(
         inline_bottom_gap: 0,
         inline_pending_wrap: false,
         inline_force_full_rewrite_next_diff: false,
+        retains_inline_rows_on_height_shrink: false,
         #[cfg(unix)]
         resume_signal: None,
     }
@@ -1104,6 +1105,7 @@ fn new_inline_term_with_size(
         inline_bottom_gap: 0,
         inline_pending_wrap: false,
         inline_force_full_rewrite_next_diff: false,
+        retains_inline_rows_on_height_shrink: false,
         #[cfg(unix)]
         resume_signal: None,
     }
@@ -4613,6 +4615,53 @@ fn test_inline_height_shrink_restores_rows_below_cursor() {
             );
         }
     }
+}
+
+#[test]
+fn inline_height_shrink_diffs_the_tail_already_retained_by_the_host() {
+    let (destination, buffer) = new_test_writer();
+    let mut terminal = new_inline_term_with_size(destination, 6, (10, 3));
+    terminal.prev_size_on_write = Some((10, 6));
+    terminal.retains_inline_rows_on_height_shrink = true;
+    terminal.cursor_displacement_rows = 2;
+    let cursor = Some(crate::canvas::CursorDeclaration {
+        x: 2,
+        y: 3,
+        visible: true,
+    });
+    let mut previous = Canvas::new(10, 6);
+    for row in 0..6 {
+        previous.subview_mut(0, 0, 0, 0, 10, 6).set_text(
+            0,
+            row,
+            &format!("row{row}"),
+            CanvasTextStyle::default(),
+        );
+    }
+    let mut current = previous.clone();
+    current
+        .subview_mut(0, 0, 0, 0, 10, 6)
+        .set_text(0, 5, "updated", CanvasTextStyle::default());
+    terminal
+        .restore_inline_rows_after_height_shrink(&previous)
+        .unwrap();
+    terminal
+        .write_canvas(Some(&previous), &current, OutputContext::default())
+        .unwrap();
+    terminal.position_cursor(cursor).unwrap();
+    let bytes = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    assert!(!bytes.contains("\r\n"), "{bytes:?}");
+
+    // The host has retained the newest rows and clamped the physical caret to its last row.
+    let mut screen = avt::Vt::new(10, 3);
+    screen.feed_str("row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4\r\nrow5");
+    screen.feed_str(&bytes);
+    let lines = screen
+        .lines()
+        .map(|line| line.text().trim_end().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(lines, ["row0", "row1", "row2", "row3", "row4", "updated"]);
+    assert_eq!((screen.cursor().col, screen.cursor().row), (2, 0));
 }
 
 #[test]

@@ -47,6 +47,7 @@ pub struct SystemContext {
     pub(crate) image_scope: Option<crate::ImageScope>,
     pub(crate) output: Option<crate::terminal::OutputSender>,
     pub(crate) pending_history: Option<Box<crate::HistoryDraft>>,
+    defer_main_screen_frame: bool,
     should_exit: bool,
     mouse_capture: Option<bool>,
     keyboard_enhancement_flags: Option<crate::KeyboardEnhancementFlags>,
@@ -60,6 +61,7 @@ impl SystemContext {
             image_scope: None,
             output: None,
             pending_history: None,
+            defer_main_screen_frame: false,
             should_exit: false,
             mouse_capture: None,
             keyboard_enhancement_flags: None,
@@ -92,6 +94,32 @@ impl SystemContext {
 
     pub(crate) fn begin_render_frame(&mut self) {
         self.alternate_screen = None;
+        self.defer_main_screen_frame = false;
+    }
+
+    /// Defers publishing this render to the main screen.
+    ///
+    /// Components still reconcile and process input. An already displayed alternate screen
+    /// stays visible until the first published main-screen frame. An explicit screen clear or
+    /// a render targeting the alternate screen still publishes. Terminal handoff and exit
+    /// proceed normally.
+    pub fn defer_main_screen_frame(&mut self) {
+        self.defer_main_screen_frame = true;
+    }
+
+    pub(crate) fn main_screen_frame_deferred(&self) -> bool {
+        self.defer_main_screen_frame && self.alternate_screen.is_none()
+    }
+
+    /// Returns whether an attached history draft is still waiting for output admission.
+    ///
+    /// Incremental producers can wait for this slot to clear before advancing their source
+    /// again. Cancelled drafts no longer occupy the slot. Admission preserves output order;
+    /// it does not wait for the terminal to receive the bytes.
+    pub fn has_pending_history(&self) -> bool {
+        self.pending_history
+            .as_deref()
+            .is_some_and(|history| !history.is_cancelled())
     }
 
     /// Declares the image lifetime presented by this application, even in a text-only frame.

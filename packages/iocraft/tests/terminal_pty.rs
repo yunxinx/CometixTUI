@@ -232,6 +232,65 @@ impl Hook for AttachHistory {
     }
 }
 
+#[derive(Default)]
+struct AttachReplay {
+    submitted: Option<u8>,
+    requested: u8,
+    pending: bool,
+}
+
+impl Hook for AttachReplay {
+    fn post_component_update(&mut self, updater: &mut ComponentUpdater) {
+        if self.pending || self.submitted == Some(self.requested) {
+            return;
+        }
+        let label = match self.requested {
+            0 => "history-older".to_owned(),
+            index => format!("history-update-{index}"),
+        };
+        let canvas = element!(Text(content: label)).render(Some(24));
+        let draft = HistoryDraft::new(canvas);
+        updater.append_history_after_frame(if self.requested == 3 {
+            draft.replace_scrollback()
+        } else {
+            draft
+        });
+        self.submitted = Some(self.requested);
+    }
+}
+
+#[component]
+fn BoundedHistory(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let (width, height) = hooks.use_terminal_size();
+    let mut history_revision = hooks.use_state(|| 0_u8);
+    let mut application = hooks.use_app();
+    hooks.use_terminal_events(move |event| {
+        if let TerminalEvent::Key(key) = event
+            && key.kind == KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Char('a') => history_revision += 1,
+                KeyCode::Char('q') => application.exit(),
+                _ => {}
+            }
+        }
+    });
+    let pending = hooks.use_context::<SystemContext>().has_pending_history();
+    let history = hooks.use_hook(AttachReplay::default);
+    history.requested = history_revision.get();
+    history.pending = pending;
+    let value = if history_revision.get() == 3 {
+        "replay-ready"
+    } else {
+        "editor-seed"
+    };
+    element! {
+        View(width, height, flex_direction: FlexDirection::Column) {
+            TextInput(value, has_focus: true, physical_cursor: true)
+        }
+    }
+}
+
 #[component]
 fn MainWithHistory(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     hooks.use_hook(AttachHistory::default);
@@ -311,6 +370,52 @@ fn attached_history_and_picker_update_preserve_native_scrollback_in_a_pty() {
                     "history-retained-4",
                 ]
             );
+        },
+    );
+}
+
+#[test]
+fn attached_history_preserves_successive_appends_and_atomic_replacement_in_a_pty() {
+    run_in_native_pty(
+        3,
+        "attached_history_preserves_successive_appends_and_atomic_replacement_in_a_pty",
+        || element!(BoundedHistory).into_any(),
+        |output, send_input, _, _, _| {
+            output.wait_for("editor-seed");
+            send_input(b"aa");
+            output.wait_for_sequence(b"history-update-2");
+            let append = String::from_utf8_lossy(&output.transcript);
+            assert_eq!(append.matches("history-update-1").count(), 1);
+            assert_eq!(append.matches("history-update-2").count(), 1);
+            assert!(!append.contains("\x1b[3J"));
+
+            send_input(b"a");
+            output.wait_for("replay-ready");
+            #[cfg(unix)]
+            {
+                output.wait_for_sequence(b"history-update-3");
+                let start = "\x1b[?2026h";
+                let end = "\x1b[?2026l";
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let bytes = String::from_utf8_lossy(&output.transcript);
+                    let (before, after) = bytes.split_once("\x1b[3J").unwrap();
+                    assert!(before.ends_with("\x1b[2J"));
+                    assert!(before.rsplit_once(start).unwrap().1.ends_with("\x1b[2J"));
+                    if let Some((transaction, remaining)) = after.split_once(end) {
+                        assert!(!transaction.contains(start));
+                        assert_eq!(transaction.matches("history-update-3").count(), 1);
+                        assert_eq!(transaction.matches("replay-ready").count(), 1);
+                        assert!(!remaining.contains("\x1b[3J"));
+                        let cursor = output.terminal.lock().unwrap().cursor();
+                        assert!(cursor.visible);
+                        assert_eq!((cursor.col, cursor.row), ("replay-ready".len(), 0));
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "replacement stayed open");
+                    output.receive(Duration::from_millis(25));
+                }
+            }
         },
     );
 }

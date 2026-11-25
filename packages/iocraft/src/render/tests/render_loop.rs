@@ -310,6 +310,57 @@ async fn test_resize_burst_paints_once_after_settling() {
 }
 
 #[component]
+fn DeferredMainFrame(
+    mut hooks: Hooks,
+    props: &DeferredMainFrameProps,
+) -> impl Into<AnyElement<'static>> {
+    let mut stage = hooks.use_state(|| 0);
+    hooks.use_terminal_events(move |event| {
+        if matches!(event, TerminalEvent::Key(key) if key.kind == KeyEventKind::Press) {
+            stage += 1;
+        }
+    });
+    let mut system = hooks.use_context_mut::<SystemContext>();
+    match stage.get() {
+        0 if props.start_alternate => system.request_alternate_screen(false),
+        1 => system.defer_main_screen_frame(),
+        2 => system.exit(),
+        _ => {}
+    }
+    element!(Text(content: format!("stage: {stage}")))
+}
+
+#[derive(Default, Props)]
+struct DeferredMainFrameProps {
+    start_alternate: bool,
+}
+
+#[apply(test!)]
+async fn deferred_main_frame_keeps_processing_input_until_publication_resumes() {
+    for start_alternate in [false, true] {
+        let events = futures::stream::unfold(0, |count| async move {
+            if count == 2 {
+                return None;
+            }
+            if count == 1 {
+                smol::Timer::after(Duration::from_millis(30)).await;
+            }
+            let event = TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char('x')));
+            Some((event, count + 1))
+        });
+        let canvases: Vec<_> = element!(DeferredMainFrame(start_alternate))
+            .mock_terminal_render_loop(MockTerminalConfig::with_events(events))
+            .collect()
+            .await;
+        let visible = canvases
+            .iter()
+            .map(|canvas| canvas.to_string().trim_end().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(visible, ["stage: 0", "stage: 2"]);
+    }
+}
+
+#[component]
 fn ResizeSubmitOwner(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let (mut value, mut submitted) = *hooks.use_context::<(State<String>, State<String>)>();
     hooks.use_propagated_terminal_events(move |event| {

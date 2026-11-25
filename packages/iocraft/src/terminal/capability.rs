@@ -46,6 +46,16 @@ pub fn is_synchronized_output_supported() -> bool {
     is_synchronized_output_supported_with_env(|key| env::var(key).ok())
 }
 
+pub(super) fn retains_inline_rows_on_height_shrink() -> bool {
+    if env::var_os("TMUX").is_some() || env::var_os("STY").is_some() {
+        return false;
+    }
+    xtversion_name().map_or_else(
+        || env::var("TERM").is_ok_and(|term| term == "xterm-kitty"),
+        |name| name.starts_with("kitty("),
+    )
+}
+
 pub(super) fn detect_terminal_from_env(
     mut env_lookup: impl FnMut(&str) -> Option<String>,
 ) -> Option<String> {
