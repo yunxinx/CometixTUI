@@ -213,6 +213,13 @@ pub(super) trait TerminalImpl: Write + Send {
         canvas: &Canvas,
         output: OutputContext,
     ) -> io::Result<()>;
+    fn write_canvas_after_history(
+        &mut self,
+        canvas: &Canvas,
+        output: OutputContext,
+    ) -> io::Result<()> {
+        self.write_canvas(None, canvas, output)
+    }
     fn event_stream(&mut self) -> io::Result<BoxStream<'static, io::Result<TerminalEvent>>>;
     fn dest(&mut self) -> &mut dyn Write;
     fn alt(&mut self) -> &mut dyn Write;
@@ -1082,6 +1089,17 @@ impl TerminalImpl for StdTerminal<'_> {
                 .saturating_add((prev_height - new_height).min(u16::MAX as usize) as u16);
         }
         self.prev_canvas_height = new_height as _;
+        Ok(())
+    }
+
+    fn write_canvas_after_history(
+        &mut self,
+        canvas: &Canvas,
+        output: OutputContext,
+    ) -> io::Result<()> {
+        self.write_canvas(None, canvas, output)?;
+        // The explicit history batch establishes the baseline before this full paint.
+        self.inline_force_full_rewrite_next_diff = false;
         Ok(())
     }
 

@@ -2,7 +2,7 @@
 mod pty_output;
 
 use iocraft::prelude::*;
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -141,65 +141,11 @@ fn real_editor_roundtrip_in_three_row_pty() {
 }
 
 fn run_editor_in_native_pty(rows: u16, test_name: &str) {
-    if std::env::var_os("IOCRAFT_PTY_CHILD").is_some() {
-        println!();
-        smol::block_on(element!(Editor).render_loop().suspend_on_ctrl_z()).unwrap();
-        return;
-    }
-    {
-        let size = PtySize {
-            rows,
-            cols: 24,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-        let pair = native_pty_system()
-            .openpty(size)
-            .expect("native PTY is required");
-        let mut command = CommandBuilder::new(std::env::current_exe().unwrap());
-        command.args(["--exact", test_name, "--nocapture", "--test-threads=1"]);
-        command.env("IOCRAFT_PTY_CHILD", "1");
-        command.env("TERM", "xterm-256color");
-        let mut reader = pair.master.try_clone_reader().unwrap();
-        let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
-        let terminal = Arc::new(Mutex::new(avt::Vt::new(24, usize::from(rows))));
-        let reader_terminal = terminal.clone();
-        let reply_writer = writer.clone();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let reader_thread = std::thread::spawn(move || {
-            let mut bytes = [0; 4096];
-            let mut decoder = pty_output::OutputDecoder::new(reader_terminal, reply_writer);
-            let mut total_bytes = 0;
-            while let Ok(count) = reader.read(&mut bytes) {
-                if count == 0 {
-                    break;
-                }
-                total_bytes += count;
-                assert!(total_bytes <= 2 * 1024 * 1024, "PTY capture is bounded");
-                decoder.feed(&bytes[..count]);
-                if sender.send(bytes[..count].to_vec()).is_err() {
-                    break;
-                }
-            }
-            decoder.finish();
-        });
-        let mut child = pair
-            .slave
-            .spawn_command(command)
-            .expect("spawn real Cometix editor");
-        drop(pair.slave);
-        let mut output = Output {
-            receiver,
-            terminal,
-            transcript: Vec::new(),
-            closed: false,
-        };
-        let send_input = |bytes: &[u8]| {
-            let mut writer = writer.lock().unwrap();
-            writer.write_all(bytes).unwrap();
-            writer.flush().unwrap();
-        };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    run_in_native_pty(
+        rows,
+        test_name,
+        || element!(Editor).into_any(),
+        |output, send_input, _child, master, size| {
             output.wait_for("M24:seed");
             send_input("\x1b[F界".as_bytes());
             output.wait_for("M24:seed界");
@@ -211,12 +157,12 @@ fn run_editor_in_native_pty(rows: u16, test_name: &str) {
                 .lock()
                 .unwrap()
                 .resize(30, usize::from(rows));
-            pair.master.resize(PtySize { cols: 30, ..size }).unwrap();
+            master.resize(PtySize { cols: 30, ..size }).unwrap();
             output.wait_for("A30:seed界");
             #[cfg(unix)]
             {
                 send_input(b"\x1a");
-                let process = i32::try_from(child.process_id().unwrap()).unwrap();
+                let process = i32::try_from(_child.process_id().unwrap()).unwrap();
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
                     let mut status = 0;
@@ -268,6 +214,184 @@ fn run_editor_in_native_pty(rows: u16, test_name: &str) {
             output.wait_for_sequence(
                 b"TEST_EDITOR:25:\"ABCDEFGHIJKLMNOPQRSTUVWXY\\nabcdefghijklmnopqrstuvwxyz\"",
             );
+        },
+    );
+}
+
+#[derive(Default)]
+struct AttachHistory {
+    submitted: bool,
+}
+
+impl Hook for AttachHistory {
+    fn post_component_update(&mut self, updater: &mut ComponentUpdater) {
+        if !std::mem::replace(&mut self.submitted, true) {
+            let canvas = element!(Text(content: "history-older")).render(Some(24));
+            updater.append_history_after_frame(HistoryDraft::new(canvas));
+        }
+    }
+}
+
+#[component]
+fn MainWithHistory(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    hooks.use_hook(AttachHistory::default);
+    let mut selected = hooks.use_state(|| false);
+    hooks.use_terminal_events(move |event| {
+        if let TerminalEvent::Key(key) = event
+            && key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Down
+        {
+            selected.set(true);
+        }
+    });
+    element! {
+        View(flex_direction: FlexDirection::Column) {
+            Text(content: "history-retained-1")
+            Text(content: "history-retained-2")
+            Text(content: "history-retained-3")
+            Text(content: "history-retained-4")
+            Text(content: if selected.get() { "picker-second" } else { "picker-first" })
+        }
+    }
+}
+
+#[component]
+fn HistorySwitch(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let mut alternate = hooks.use_state(|| true);
+    let mut app = hooks.use_app();
+    let mut system = hooks.use_context_mut::<SystemContext>();
+    hooks.use_terminal_events(move |event| {
+        if let TerminalEvent::Key(key) = event
+            && key.kind == KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Char('t') => alternate.set(false),
+                KeyCode::Char('q') => app.exit(),
+                _ => {}
+            }
+        }
+    });
+    if alternate.get() {
+        system.request_alternate_screen(false);
+        element!(Text(content: "alternate-first")).into_any()
+    } else {
+        element!(MainWithHistory).into_any()
+    }
+}
+
+#[test]
+fn attached_history_and_picker_update_preserve_native_scrollback_in_a_pty() {
+    run_in_native_pty(
+        3,
+        "attached_history_and_picker_update_preserve_native_scrollback_in_a_pty",
+        || {
+            println!("history-shell");
+            element!(HistorySwitch).into_any()
+        },
+        |output, send_input, _, _, _| {
+            output.wait_for("alternate-first");
+            send_input(b"t");
+            output.wait_for("picker-first");
+            send_input(b"\x1b[B");
+            output.wait_for("picker-second");
+            let terminal = output.terminal.lock().unwrap();
+            let transcript: Vec<_> = terminal
+                .lines()
+                .map(|line| line.text().trim_end().to_owned())
+                .filter(|line| line.starts_with("history-"))
+                .collect();
+            assert_eq!(
+                transcript,
+                [
+                    "history-shell",
+                    "history-older",
+                    "history-retained-1",
+                    "history-retained-2",
+                    "history-retained-3",
+                    "history-retained-4",
+                ]
+            );
+        },
+    );
+}
+
+fn run_in_native_pty(
+    rows: u16,
+    test_name: &str,
+    component: impl FnOnce() -> AnyElement<'static>,
+    scenario: impl FnOnce(&mut Output, &dyn Fn(&[u8]), &mut dyn Child, &dyn MasterPty, PtySize),
+) {
+    if std::env::var_os("IOCRAFT_PTY_CHILD").is_some() {
+        println!();
+        smol::block_on(component().render_loop().suspend_on_ctrl_z()).unwrap();
+        return;
+    }
+    {
+        let size = PtySize {
+            rows,
+            cols: 24,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let pair = native_pty_system()
+            .openpty(size)
+            .expect("native PTY is required");
+        let mut command = CommandBuilder::new(std::env::current_exe().unwrap());
+        command.args(["--exact", test_name, "--nocapture", "--test-threads=1"]);
+        command.env("IOCRAFT_PTY_CHILD", "1");
+        command.env("TERM", "xterm-256color");
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+        let terminal = Arc::new(Mutex::new(
+            avt::Vt::builder()
+                .size(24, usize::from(rows))
+                .scrollback_limit(100)
+                .build(),
+        ));
+        let reader_terminal = terminal.clone();
+        let reply_writer = writer.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader_thread = std::thread::spawn(move || {
+            let mut bytes = [0; 4096];
+            let mut decoder = pty_output::OutputDecoder::new(reader_terminal, reply_writer);
+            let mut total_bytes = 0;
+            while let Ok(count) = reader.read(&mut bytes) {
+                if count == 0 {
+                    break;
+                }
+                total_bytes += count;
+                assert!(total_bytes <= 2 * 1024 * 1024, "PTY capture is bounded");
+                decoder.feed(&bytes[..count]);
+                if sender.send(bytes[..count].to_vec()).is_err() {
+                    break;
+                }
+            }
+            decoder.finish();
+        });
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .expect("spawn real Cometix editor");
+        drop(pair.slave);
+        let mut output = Output {
+            receiver,
+            terminal,
+            transcript: Vec::new(),
+            closed: false,
+        };
+        let send_input = |bytes: &[u8]| {
+            let mut writer = writer.lock().unwrap();
+            writer.write_all(bytes).unwrap();
+            writer.flush().unwrap();
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scenario(
+                &mut output,
+                &send_input,
+                child.as_mut(),
+                pair.master.as_ref(),
+                size,
+            );
             send_input(b"q");
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
@@ -292,7 +416,10 @@ fn run_editor_in_native_pty(rows: u16, test_name: &str) {
         if let Some(report) = report {
             std::fs::create_dir_all(&report).unwrap();
             std::fs::write(
-                report.join(format!("{}-{rows}-rows.ansi", std::env::consts::OS)),
+                report.join(format!(
+                    "{}-{test_name}-{rows}-rows.ansi",
+                    std::env::consts::OS
+                )),
                 &output.transcript,
             )
             .unwrap();

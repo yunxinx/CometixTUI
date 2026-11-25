@@ -507,11 +507,11 @@ impl<'a, 'b, 'c, 'w> ComponentUpdater<'a, 'b, 'c, 'w> {
         }
     }
 
-    /// Schedules a history draft after the next committed main-screen frame.
+    /// Schedules native history with the next committed main-screen frame.
     ///
     /// Layout passes and input reconciliation may replace the unadmitted draft.
-    /// The latest draft is carried with the main-screen frame through backpressure
-    /// and restores that frame's canvas and cursor when writing history.
+    /// The latest draft is carried through backpressure and presented above that
+    /// frame in the same terminal update.
     pub fn append_history_after_frame(&mut self, draft: crate::HistoryDraft) {
         if self.context.terminal.is_some() {
             self.component_context_stack

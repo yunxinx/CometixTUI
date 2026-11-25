@@ -896,7 +896,7 @@ impl OutputOwner {
             .expect("a terminal session cannot exhaust commit sequences");
         match operation {
             Operation::Query(query) => query(self.backend.dest())?,
-            Operation::History(draft, receipt) => {
+            Operation::History(mut draft, receipt) => {
                 if draft.is_cancelled() {
                     let _ = receipt.send(Err(io::Error::new(
                         io::ErrorKind::Interrupted,
@@ -904,11 +904,12 @@ impl OutputOwner {
                     )));
                     return Ok(());
                 }
-                let result = self.write_history(draft.canvas, draft.graphics, draft.replace);
+                let coverage = draft.coverage.take();
+                let result = self.write_history(*draft, None);
                 let reported = match &result {
                     Ok(()) => Ok(CommitReceipt {
                         sequence: self.sequence,
-                        coverage: draft.coverage,
+                        coverage,
                     }),
                     Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
                 };
@@ -985,21 +986,25 @@ impl OutputOwner {
                         self.backend.dest(),
                         graphics,
                     )?;
-                    if !screen_changed
-                        && self
-                            .backend
-                            .frame_is_current(self.previous.as_ref(), &resolved)
-                    {
-                        return Ok(());
+                    if let Some(history) = history.filter(|history| !history.is_cancelled()) {
+                        self.write_history(*history, Some(&resolved))?;
+                    } else {
+                        if !screen_changed
+                            && self
+                                .backend
+                                .frame_is_current(self.previous.as_ref(), &resolved)
+                        {
+                            return Ok(());
+                        }
+                        self.synchronization.start(self.backend.dest())?;
+                        self.backend.write_canvas(
+                            self.previous.as_ref(),
+                            &resolved,
+                            self.synchronization.context(),
+                        )?;
+                        self.backend
+                            .position_cursor(resolved.cursor_declaration())?;
                     }
-                    self.synchronization.start(self.backend.dest())?;
-                    self.backend.write_canvas(
-                        self.previous.as_ref(),
-                        &resolved,
-                        self.synchronization.context(),
-                    )?;
-                    self.backend
-                        .position_cursor(resolved.cursor_declaration())?;
                     cells_changed = self.backend.mouse_events_possible()
                         && (screen_changed
                             || self.previous.as_ref().is_none_or(|previous| {
@@ -1016,9 +1021,6 @@ impl OutputOwner {
                         .commit(self.backend.is_fullscreen(), self.backend.dest())?;
                     if let Some(canvas) = next_canvas {
                         self.previous = Some(canvas);
-                    }
-                    if let Some(history) = history.filter(|history| !history.is_cancelled()) {
-                        self.write_history(history.canvas, history.graphics, history.replace)?;
                     }
                     Ok(())
                 });
@@ -1235,9 +1237,8 @@ impl OutputOwner {
 
     fn write_history(
         &mut self,
-        canvas: Canvas,
-        plan: super::graphics::GraphicsPlan,
-        replace: bool,
+        draft: HistoryDraft,
+        replacement_frame: Option<&Canvas>,
     ) -> io::Result<()> {
         if self.backend.is_fullscreen() {
             return Err(io::Error::new(
@@ -1245,27 +1246,34 @@ impl OutputOwner {
                 "history rows require the main screen",
             ));
         }
-        self.graphics
-            .append_archival(canvas, &mut self.backend, plan, |backend, resolved| {
+        let live = replacement_frame.or(self.previous.as_ref());
+        self.graphics.append_archival(
+            draft.canvas,
+            &mut self.backend,
+            draft.graphics,
+            |backend, archive| {
                 self.synchronization.enter();
                 let write = (|| {
                     self.synchronization.start(backend.dest())?;
-                    if replace {
+                    if draft.replace {
                         backend.clear_terminal()?;
                     } else if self.previous.is_some() {
                         backend.clear_canvas()?;
                     }
-                    resolved.write_ansi(backend.dest())?;
-                    if let Some(previous) = &self.previous {
-                        backend.write_canvas(None, previous, self.synchronization.context())?;
-                        backend.position_cursor(previous.cursor_declaration())?;
+                    if archive.height() > 0 {
+                        archive.write_ansi(backend.dest())?;
+                    }
+                    if let Some(live) = live {
+                        backend.write_canvas_after_history(live, self.synchronization.context())?;
+                        backend.position_cursor(live.cursor_declaration())?;
                     }
                     Ok(())
                 })();
                 let end = self.synchronization.leave(backend.dest());
                 write.and(end)?;
                 backend.flush()
-            })
+            },
+        )
     }
 }
 

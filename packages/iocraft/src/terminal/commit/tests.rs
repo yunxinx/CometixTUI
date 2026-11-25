@@ -855,8 +855,9 @@ fn attached_history_follows_main_screen_transition_under_backpressure() {
         let latest = text.find("latest input").unwrap();
         let history_begin = text[..archived].rfind("\x1b[?2026h").unwrap();
         let history_end = text[archived..].find("\x1b[?2026l").unwrap() + archived;
-        assert!(leave < history_begin && history_end < latest);
+        assert!(history_begin < leave && leave < archived && history_end < latest);
         assert!(text[archived..history_end].contains("returning"));
+        assert_eq!(text.matches("returning").count(), 1);
         output.finish().await.unwrap();
     });
 }
