@@ -2,6 +2,53 @@ use super::super::*;
 use crate::prelude::*;
 
 #[test]
+fn test_fullscreen_diff_skips_shared_and_blank_rows_but_repairs_damage() {
+    let mut source = Canvas::new(20, 4);
+    source.subview_mut(0, 0, 0, 0, 20, 4).set_text(
+        0,
+        0,
+        "shared 界 row",
+        CanvasTextStyle::default(),
+    );
+    let mut previous = Canvas::new(20, 4);
+    let mut next = Canvas::new(20, 4);
+    assert!(previous.try_blit_region_from_baseline(&source, 0, 0, 20, 1));
+    assert!(next.try_blit_region_from_baseline(&source, 0, 0, 20, 1));
+    assert!(
+        terminal_fullscreen_canvas_diff_patches(
+            Some(&previous),
+            &next,
+            TerminalFullscreenCanvasDiffOptions::default(),
+        )
+        .is_empty()
+    );
+
+    next.mark_damage(DamageRegion {
+        x: 8,
+        y: 0,
+        width: 1,
+        height: 1,
+    });
+    let patches = terminal_fullscreen_canvas_diff_patches(
+        Some(&previous),
+        &next,
+        TerminalFullscreenCanvasDiffOptions::default(),
+    );
+    assert!(terminal_patches_to_ansi(&patches, true).starts_with("\x1b[1;8H界 row"));
+
+    let blank = Canvas::new(20, 4);
+    let patches = terminal_fullscreen_canvas_diff_patches(
+        Some(&previous),
+        &blank,
+        TerminalFullscreenCanvasDiffOptions::default(),
+    );
+    let mut terminal = avt::Vt::new(20, 4);
+    terminal.feed_str("shared 界 row");
+    terminal.feed_str(&terminal_patches_to_ansi(&patches, true));
+    assert_eq!(terminal.line(0).text(), "                    ");
+}
+
+#[test]
 fn test_fullscreen_frame_width_shrink_clears_removed_columns() {
     for packed in [false, true] {
         for terminal_width in [10, 14] {

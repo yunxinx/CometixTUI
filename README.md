@@ -185,7 +185,7 @@ Two diagnostic variables, each a comma-separated list of tokens, read once per p
 |---|---|---|
 | `IOCRAFT_DISABLE` | `push-wake` | Poll every component every frame instead of only the woken paths |
 | | `retained-blit` | Re-draw memo-retained subtrees instead of blitting them from the previous canvas |
-| | `damage-skip` | Diff every row instead of only the rows a canvas write marked |
+| | `damage-skip` | Compare independent unwritten blank rows cell by cell |
 | | `measure-memo` | Run every measure function Taffy asks for instead of answering repeat probes from the node's memo |
 | `IOCRAFT_DEBUG` | `settle` | Print each component whose render-phase state write re-ran the update |
 | | `cells` | Count changed cells per frame for the render profile |

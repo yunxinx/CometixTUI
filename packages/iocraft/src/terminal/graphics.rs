@@ -3,7 +3,7 @@ use crate::{CanvasImage, CanvasImageCell, CanvasTextStyle, ImageScope};
 use std::collections::BTreeMap;
 use std::hash::BuildHasher;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct PlacementKey {
     source: usize,
     columns: u16,
@@ -25,7 +25,6 @@ struct Presentation {
     id: u32,
     wanted: bool,
     committed: bool,
-    _allocation: Arc<Allocation>,
 }
 
 struct ScreenImages {
@@ -80,26 +79,35 @@ impl ScreenImages {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct GraphicsPlan {
-    allocations: OutputAllocations,
-    presentations: Vec<Arc<Allocation>>,
+    // Each unique placement is ordered by its first row in the canvas.
+    placements: Vec<(usize, CanvasImage)>,
 }
 
 impl GraphicsPlan {
-    pub(super) fn reserve(canvas: &Canvas, memory: &Arc<OutputMemory>) -> io::Result<Self> {
-        let allocations = canvas.reserve_output(memory, true)?;
-        let mut sources = std::collections::BTreeSet::new();
-        let mut presentations = Vec::new();
-        for (_, _, cell) in canvas.image_cells() {
-            if sources.insert(PlacementKey::new(&cell.image)) {
-                presentations.push(memory.reserve(512)?);
+    pub(super) fn collect(canvas: &Canvas) -> io::Result<Self> {
+        const MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
+        let mut sources = std::collections::HashSet::new();
+        let mut seen_placements = std::collections::HashSet::new();
+        let mut placements = Vec::new();
+        let mut bytes = 0usize;
+        for (_, row, cell) in canvas.image_cells() {
+            let key = PlacementKey::new(&cell.image);
+            if sources.insert(key.source) {
+                bytes = bytes.saturating_add(cell.image.source.encoded_png().len());
+                if bytes > MAX_ENCODED_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "image sources exceed output limits",
+                    ));
+                }
+            }
+            if seen_placements.insert(key) {
+                placements.push((row, cell.image.clone()));
             }
         }
-        Ok(Self {
-            allocations,
-            presentations,
-        })
+        Ok(Self { placements })
     }
 }
 
@@ -118,25 +126,30 @@ impl Graphics {
 
     pub(super) fn prepare(
         &mut self,
-        canvas: &Canvas,
+        mut canvas: Canvas,
         alternate: bool,
+        visible_rows: usize,
         output: &mut dyn Write,
-        mut plan: GraphicsPlan,
+        plan: GraphicsPlan,
     ) -> io::Result<Canvas> {
         let screen = &mut self.screens[usize::from(alternate)];
+        let visible = plan
+            .placements
+            .partition_point(|(row, _)| *row < visible_rows);
+        let images = &plan.placements[..visible];
         let mut scope = canvas.image_scope().cloned();
-        for (_, _, cell) in canvas.image_cells() {
-            if cell.image.source.scope().is_active() {
+        for (_, image) in images {
+            if image.source.scope().is_active() {
                 if scope
                     .as_ref()
-                    .is_some_and(|scope| scope != cell.image.source.scope())
+                    .is_some_and(|scope| scope != image.source.scope())
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "a frame has one image scope",
                     ));
                 }
-                scope = Some(cell.image.source.scope().clone());
+                scope = Some(image.source.scope().clone());
             }
         }
         if let (Some(current), Some(next)) = (&screen.scope, &scope)
@@ -155,20 +168,15 @@ impl Graphics {
         for presentation in screen.hot.values_mut() {
             presentation.wanted = false;
         }
-        for (_, _, cell) in canvas.image_cells() {
-            if !cell.image.source.scope().is_active() {
+        for (_, image) in images {
+            if !image.source.scope().is_active() {
                 continue;
             }
-            let image = &cell.image;
             let key = PlacementKey::new(image);
             if let Some(presentation) = screen.hot.get_mut(&key) {
                 presentation.wanted = true;
                 continue;
             }
-            let allocation = plan
-                .presentations
-                .pop()
-                .expect("admission reserves every possible presentation");
             let id = screen.next_id;
             screen.next_id = id.checked_add(2).ok_or_else(|| {
                 io::Error::new(
@@ -209,25 +217,24 @@ impl Graphics {
                     id,
                     wanted: true,
                     committed: false,
-                    _allocation: allocation,
                 },
             );
             screen.pending_id = None;
         }
-        let mut resolved = canvas.clone();
-        resolved.output_allocations = plan.allocations;
-        resolved.resolve_images(
-            |cell| match screen.hot.get(&PlacementKey::new(&cell.image)) {
-                Some(presentation) => placeholder(cell, presentation.id),
-                None => (" ".into(), CanvasTextStyle::default()),
-            },
-        );
-        Ok(resolved)
+        if !images.is_empty() {
+            canvas.resolve_images(visible_rows, |cell| {
+                match screen.hot.get(&PlacementKey::new(&cell.image)) {
+                    Some(presentation) => placeholder(cell, presentation.id),
+                    None => (" ".into(), CanvasTextStyle::default()),
+                }
+            });
+        }
+        Ok(canvas)
     }
 
     pub(super) fn append_archival<W: Write>(
         &mut self,
-        canvas: &Canvas,
+        canvas: Canvas,
         output: &mut W,
         plan: GraphicsPlan,
         present: impl FnOnce(&mut W, &Canvas) -> io::Result<()>,
@@ -236,7 +243,8 @@ impl Graphics {
         // Archived bindings are released locally after flush; their IDs stay in the scope range.
         let live = std::mem::take(&mut self.screens[0].hot);
         let result = (|| {
-            let resolved = self.prepare(canvas, false, output, plan)?;
+            let rows = canvas.height();
+            let resolved = self.prepare(canvas, false, rows, output, plan)?;
             present(output, &resolved)
         })();
         if result.is_ok() {
@@ -249,15 +257,22 @@ impl Graphics {
 
     pub(super) fn commit(&mut self, alternate: bool, output: &mut dyn Write) -> io::Result<()> {
         let screen = &mut self.screens[usize::from(alternate)];
-        for presentation in screen.hot.values_mut() {
-            if presentation.wanted {
-                presentation.committed = true;
-            } else if alternate {
+        if alternate {
+            for presentation in screen
+                .hot
+                .values()
+                .filter(|presentation| !presentation.wanted)
+            {
                 delete(output, presentation.id)?;
             }
         }
-        screen.hot.retain(|_, presentation| presentation.wanted);
-        screen.drain_retired(output)
+        screen.drain_retired(output)?;
+        output.flush()?;
+        screen.hot.retain(|_, presentation| {
+            presentation.committed = presentation.wanted;
+            presentation.wanted
+        });
+        Ok(())
     }
 
     pub(super) fn retirement_pending(&self, _alternate: bool) -> bool {

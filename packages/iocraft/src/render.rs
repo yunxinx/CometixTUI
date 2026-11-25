@@ -142,7 +142,7 @@ pub struct RenderFramePhases {
     pub changed_cell_scan: Duration,
     /// Time spent evaluating repaint guards, including retained canvas equality.
     pub repaint_check: Duration,
-    /// Terminal diff/write/cursor-positioning time.
+    /// Time spent submitting the terminal frame, including I/O for direct backends.
     pub terminal_write: Duration,
     /// Number of retained-canvas rows scanned by the active diff planner.
     pub diff_rows_scanned: usize,
@@ -156,8 +156,8 @@ pub struct RenderFramePhases {
     /// counterpart of CC ink's per-frame `yogaMeasured` counter. A jump here
     /// on an otherwise idle frame means Taffy's measure cache missed.
     pub layout_measures: usize,
-    /// Time spent rebuilding the mouse-event cell snapshot from the committed
-    /// canvas (O(canvas) today; a candidate for damage-driven updates).
+    /// Time spent maintaining mouse-event cells on a direct backend. The
+    /// output worker updates its projection after the frame is written.
     pub event_snapshot: Duration,
     /// Time spent allocating/zeroing the frame's fresh canvas (O(canvas)).
     pub canvas_alloc: Duration,
@@ -504,6 +504,20 @@ impl<'a, 'b, 'c, 'w> ComponentUpdater<'a, 'b, 'c, 'w> {
                 self.record_terminal_result(result);
             }
             self.context.did_clear_terminal_output = true;
+        }
+    }
+
+    /// Schedules a history draft after the next committed main-screen frame.
+    ///
+    /// Layout passes and input reconciliation may replace the unadmitted draft.
+    /// The latest draft is carried with the main-screen frame through backpressure
+    /// and restores that frame's canvas and cursor when writing history.
+    pub fn append_history_after_frame(&mut self, draft: crate::HistoryDraft) {
+        if self.context.terminal.is_some() {
+            self.component_context_stack
+                .get_context_mut::<SystemContext>()
+                .expect("terminal rendering has a system context")
+                .pending_history = Some(Box::new(draft));
         }
     }
 
@@ -2528,7 +2542,6 @@ impl<'a> Tree<'a> {
                     changed_cells,
                 );
                 let previous_damage = prev_canvas.as_ref().and_then(Canvas::damage_region);
-                let accepted;
                 if should_repaint {
                     repaint = Some(DebugRepaintInfo {
                         reason: repaint_reason,
@@ -2538,41 +2551,53 @@ impl<'a> Tree<'a> {
                         canvas_width: output.canvas.width(),
                         canvas_height: output.canvas.height(),
                     });
-                    let write_start = profile_enabled.then(std::time::Instant::now);
-                    // The main screen keeps the inline frame while an alternate screen
-                    // is shown; leaving it diffs against that frame instead of writing
-                    // a second copy below it.
-                    let resumed_main_screen = if output.alternate_screen_changed {
-                        if term.is_fullscreen() {
-                            main_screen_canvas = prev_canvas.take();
-                            None
-                        } else {
-                            main_screen_canvas.take()
-                        }
-                    } else {
+                }
+                let write_start = profile_enabled.then(std::time::Instant::now);
+                // Leaving the alternate screen diffs against the saved inline frame.
+                let resumed_main_screen = if output.alternate_screen_changed {
+                    if term.is_fullscreen() {
+                        main_screen_canvas = prev_canvas.take();
                         None
-                    };
-                    let prev = if output.did_clear_terminal_output {
-                        None
-                    } else if output.alternate_screen_changed {
-                        resumed_main_screen.as_ref()
                     } else {
-                        prev_canvas.as_ref()
-                    };
-                    let mut draft = crate::FrameDraft::new(output.canvas.clone()).with_hits(output.hit_regions.clone());
-                    draft.views = Some(self.root_view_event_context.capture_hits());
-                    accepted = term.write_canvas_after_repaint_check(prev, draft)?;
+                        main_screen_canvas.take()
+                    }
+                } else {
+                    None
+                };
+                let prev = if output.did_clear_terminal_output {
+                    None
+                } else if output.alternate_screen_changed {
+                    resumed_main_screen.as_ref()
+                } else {
+                    prev_canvas.as_ref()
+                };
+                let mut draft = crate::FrameDraft::new(output.canvas.clone())
+                    .with_hits(std::mem::take(&mut output.hit_regions));
+                draft.views = Some(self.root_view_event_context.capture_hits());
+                let main_screen = !term.is_fullscreen();
+                if main_screen {
+                    draft.history = self.system_context.pending_history.clone();
+                }
+                let accepted = term.write_canvas_after_repaint_check(prev, draft, should_repaint)?;
+                if main_screen && accepted {
+                    self.system_context.pending_history = None;
+                }
+                if should_repaint && accepted {
                     // Position (or hide) the physical cursor after the frame has been
                     // committed, so IMEs and screen readers can anchor to the caret of
                     // a focused text input.
-                    if accepted { term.position_cursor(output.canvas.cursor_declaration())?; }
-                    frame_phases.terminal_write =
-                        write_start.map_or(Duration::ZERO, |start| start.elapsed());
+                    term.position_cursor(output.canvas.cursor_declaration())?;
                 }
-                else {
-                    let mut draft = crate::FrameDraft::new(output.canvas.clone()).with_hits(output.hit_regions.clone());
-                    draft.views = Some(self.root_view_event_context.capture_hits());
-                    accepted = term.write_canvas_after_repaint_check(prev_canvas.as_ref(), draft)?;
+                frame_phases.terminal_write =
+                    write_start.map_or(Duration::ZERO, |start| start.elapsed());
+                if should_repaint && accepted {
+                    let snapshot_start = profile_enabled.then(std::time::Instant::now);
+                    term.set_event_cell_snapshot(
+                        if output.alternate_screen_changed { None } else { prev },
+                        &output.canvas,
+                    );
+                    frame_phases.event_snapshot =
+                        snapshot_start.map_or(Duration::ZERO, |start| start.elapsed());
                 }
                 frame_phases.update = output.phase_profile.update;
                 frame_phases.layout = output.phase_profile.layout;
@@ -2602,12 +2627,6 @@ impl<'a> Tree<'a> {
                 }
                 frame_phases.canvas_swap =
                     canvas_swap_start.map_or(Duration::ZERO, |start| start.elapsed());
-                if let Some(canvas) = unpainted_canvas.as_ref().or(prev_canvas.as_ref()) {
-                    let snapshot_start = profile_enabled.then(std::time::Instant::now);
-                    term.set_event_cell_snapshot(canvas);
-                    frame_phases.event_snapshot =
-                        snapshot_start.map_or(Duration::ZERO, |start| start.elapsed());
-                }
                 prev_terminal_size = terminal_size;
                 Ok(())
             })?;
@@ -2627,6 +2646,9 @@ impl<'a> Tree<'a> {
             {
                 if requested {
                     term.enable_mouse_capture()?;
+                    if let Some(canvas) = &prev_canvas {
+                        term.set_event_cell_snapshot(Some(canvas), canvas);
+                    }
                 } else {
                     term.disable_mouse_capture()?;
                 }

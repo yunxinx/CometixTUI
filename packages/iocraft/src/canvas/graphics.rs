@@ -24,7 +24,7 @@ impl PartialEq for ImageScope {
     }
 }
 
-/// Immutable image data whose allocation remains charged while any canvas references it.
+/// Immutable image data shared by the canvases that reference it.
 pub trait CanvasImageSource: std::fmt::Debug + Send + Sync + 'static {
     /// The PNG encoded as standard base64, without line breaks.
     fn encoded_png(&self) -> &str;
@@ -101,19 +101,31 @@ impl Canvas {
     }
     /// Visits visible image cells with their canvas coordinates and original placement coordinates.
     pub fn image_cells(&self) -> impl Iterator<Item = (usize, usize, &CanvasImageCell)> {
-        self.cells.iter().enumerate().flat_map(|(row, cells)| {
-            cells.iter().enumerate().filter_map(move |(column, cell)| {
-                cell.image.as_ref().map(|image| (column, row, image))
+        self.image_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, has_images)| **has_images)
+            .flat_map(|(row, _)| {
+                self.cells[row]
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(column, cell)| {
+                        cell.image.as_ref().map(|image| (column, row, image))
+                    })
             })
-        })
     }
 
     pub(crate) fn resolve_images(
         &mut self,
+        visible_rows: usize,
         mut resolve: impl FnMut(&CanvasImageCell) -> (String, CanvasTextStyle),
     ) {
-        for row in 0..self.height() {
+        for row in 0..self.height().min(visible_rows) {
+            if !self.image_rows[row] {
+                continue;
+            }
             if !self.cells[row].iter().any(|cell| cell.image.is_some()) {
+                self.image_rows[row] = false;
                 continue;
             }
             for cell in self.cells_row_mut(row) {

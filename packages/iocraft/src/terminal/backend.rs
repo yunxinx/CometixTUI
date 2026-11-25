@@ -21,6 +21,13 @@ pub(super) trait TerminalImpl: Write + Send {
     fn size(&self) -> Option<(u16, u16)> {
         None
     }
+    fn canvas_row_limit(&self) -> usize {
+        if let (true, Some((_, rows))) = (self.is_fullscreen(), self.size()) {
+            usize::from(rows)
+        } else {
+            usize::MAX
+        }
+    }
     fn set_size_from_resize_event(&mut self, _width: u16, _height: u16) {}
     fn set_mouse_capture(&mut self, _enabled: bool) -> io::Result<()> {
         Ok(())
@@ -317,14 +324,6 @@ pub(super) fn clear_canvas_inline(
             .queue(terminal::Clear(terminal::ClearType::FromCursorDown))?;
         Ok(())
     }
-}
-
-// Diagnostic kill-switch for the inline diff damage-skip fast path. The skip
-// is sound only while every canvas write path marks its rows; set
-// `IOCRAFT_DISABLE=damage-skip` to force full per-row scans when bisecting
-// stale-output artifacts.
-fn damage_skip_enabled() -> bool {
-    !crate::debug_env::disabled().damage_skip
 }
 
 /// Inline geometry restored when the alternate screen returns its saved cursor.
@@ -821,7 +820,14 @@ impl TerminalImpl for StdTerminal<'_> {
             && !canvas.should_force_full_repaint()
             && !canvas.has_damage()
             && previous.is_none_or(|previous| !previous.has_damage())
-            && previous == Some(canvas)
+            && previous.is_some_and(|previous| {
+                if self.fullscreen {
+                    previous.cursor_declaration() == canvas.cursor_declaration()
+                        && previous.has_same_cells_up_to(canvas, self.canvas_row_limit())
+                } else {
+                    previous == canvas
+                }
+            })
     }
 
     fn write_canvas(
@@ -905,6 +911,7 @@ impl TerminalImpl for StdTerminal<'_> {
                 top_row,
                 self.size.map(|(_, rows)| rows),
             );
+            let mut encoded_row = Vec::new();
             for y in 0..visible_rows {
                 let start_col = if force_full_repaint || y >= canvas.height() {
                     Some(0)
@@ -922,8 +929,10 @@ impl TerminalImpl for StdTerminal<'_> {
                     canvas.write_ansi_row_from_col_without_newline(
                         y,
                         start_col,
-                        &mut *self.dest,
+                        &mut encoded_row,
                     )?;
+                    self.dest.write_all(&encoded_row)?;
+                    encoded_row.clear();
                 } else {
                     self.dest
                         .queue(terminal::Clear(terminal::ClearType::CurrentLine))?;
@@ -982,22 +991,6 @@ impl TerminalImpl for StdTerminal<'_> {
         let mut current_y = prev_height.saturating_sub(1);
 
         for y in 0..max_height {
-            // Damage skip: a row unwritten in BOTH frames is provably
-            // unchanged — untouched rows are default-blank, and baseline-blit
-            // rows equal the previous frame by construction — so the per-cell
-            // scan below cannot find a change there. On a large resumed
-            // session this collapses the scan from O(canvas rows) to
-            // O(written rows).
-            if damage_skip_enabled()
-                && y < new_height
-                && y < prev_height
-                && !canvas.row_written(y)
-                && !prev.row_written(y)
-                && !canvas.row_is_damaged(y)
-                && !prev.row_is_damaged(y)
-            {
-                continue;
-            }
             let Some(mut start_col) = prev.row_change_start(canvas, y) else {
                 continue;
             };
@@ -1287,10 +1280,13 @@ impl<'a> StdTerminal<'a> {
         // rendering. Do the same at row granularity: absolute CUP per row never
         // scrolls the alt buffer, even when the canvas fills the viewport.
         self.dest.write_all(b"\x1b[0m")?;
+        let mut encoded_row = Vec::new();
         for y in 0..visible_rows {
             self.dest
                 .queue(cursor::MoveTo(0, self.prev_canvas_top_row + y as u16))?;
-            canvas.write_ansi_row_without_newline(y, &mut *self.dest)?;
+            canvas.write_ansi_row_without_newline(y, &mut encoded_row)?;
+            self.dest.write_all(&encoded_row)?;
+            encoded_row.clear();
         }
         Ok(())
     }

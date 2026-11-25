@@ -7,8 +7,8 @@
 //!   rendering artifact can be bisected back to the pass that introduced it.
 //!   `push-wake`: poll every component every frame instead of only the woken
 //!   paths. `retained-blit`: re-draw memo-retained subtrees instead of
-//!   blitting them from the previous canvas. `damage-skip`: diff every row
-//!   instead of only the rows a canvas write marked.
+//!   blitting them from the previous canvas. `damage-skip`: compare independent
+//!   unwritten blank rows cell by cell.
 //! - `IOCRAFT_DEBUG` turns on a diagnostic that is off by default because it
 //!   costs per frame. `settle`: print each component whose render-phase state
 //!   write re-ran the update. `cells`: count changed cells per frame for the

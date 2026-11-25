@@ -99,16 +99,16 @@ fn test_event_cell_snapshot_follows_mouse_capture() {
     let canvas = Canvas::new(4, 2);
 
     // Inline, no capture: nothing can click, so nothing is scanned.
-    terminal.set_event_cell_snapshot(&canvas);
+    terminal.set_event_cell_snapshot(None, &canvas);
     assert!(!terminal.has_event_cell_snapshot());
 
     terminal.enable_mouse_capture().unwrap();
-    terminal.set_event_cell_snapshot(&canvas);
+    terminal.set_event_cell_snapshot(None, &canvas);
     assert!(terminal.has_event_cell_snapshot());
 
     // Capture off again drops the stale snapshot rather than keeping it.
     terminal.disable_mouse_capture().unwrap();
-    terminal.set_event_cell_snapshot(&canvas);
+    terminal.set_event_cell_snapshot(None, &canvas);
     assert!(!terminal.has_event_cell_snapshot());
 }
 
@@ -4240,6 +4240,32 @@ fn test_inline_diff_identical_canvas_is_noop() {
         diff_buf.lock().unwrap().is_empty(),
         "identical canvas should produce no output"
     );
+}
+
+#[test]
+fn test_inline_diff_erases_content_copied_without_damage_in_the_previous_frame() {
+    let mut source = Canvas::new(10, 2);
+    source
+        .subview_mut(0, 0, 0, 0, 10, 2)
+        .set_text(0, 0, "old", CanvasTextStyle::default());
+    let mut previous = Canvas::new(10, 2);
+    assert!(previous.try_blit_region_from_baseline(&source, 0, 0, 10, 1));
+    let next = Canvas::new(10, 2);
+
+    let (dest, bytes) = new_test_writer();
+    let mut terminal = new_inline_term(dest, 2);
+    terminal
+        .write_canvas(Some(&previous), &next, OutputContext::default())
+        .unwrap();
+
+    let mut stream = Vec::new();
+    previous
+        .write_ansi_without_final_newline(&mut stream)
+        .unwrap();
+    stream.extend_from_slice(&bytes.lock().unwrap());
+    let mut emulator = avt::Vt::new(10, 5);
+    emulator.feed_str(&String::from_utf8(stream).unwrap());
+    assert_eq!(emulator.line(0).text(), "          ");
 }
 
 #[test]

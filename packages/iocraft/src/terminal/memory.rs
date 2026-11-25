@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex, Weak};
 
-/// A capacity envelope admitted by the application's resource budget.
-/// The retained lease covers output allocations and their unused completion reserve.
+/// Capacity for queued output payloads, clipboard preparation and source coverage.
+///
+/// Canvas lifetime is bounded by the output queue and screen baselines. Image
+/// sources are shared with the application and keep their own allocation lifetime.
 pub struct OutputCapacity {
     bytes: usize,
     _lease: Box<dyn Send + Sync>,
@@ -27,7 +29,7 @@ impl Default for OutputCapacity {
 
 struct State {
     used: usize,
-    allocations: BTreeMap<(u8, usize), Weak<Allocation>>,
+    allocations: BTreeMap<usize, Weak<Allocation>>,
 }
 
 pub(crate) struct OutputMemory {
@@ -52,17 +54,13 @@ impl OutputMemory {
 
     pub(crate) fn shared(
         self: &Arc<Self>,
-        key: (u8, usize),
+        key: usize,
         bytes: usize,
     ) -> io::Result<Arc<Allocation>> {
         self.allocate(Some(key), bytes)
     }
 
-    fn allocate(
-        self: &Arc<Self>,
-        key: Option<(u8, usize)>,
-        bytes: usize,
-    ) -> io::Result<Arc<Allocation>> {
+    fn allocate(self: &Arc<Self>, key: Option<usize>, bytes: usize) -> io::Result<Arc<Allocation>> {
         let mut state = self.state.lock().expect("output memory is not poisoned");
         if let Some(existing) = key
             .and_then(|key| state.allocations.get(&key))
@@ -99,7 +97,7 @@ fn capacity_error() -> io::Error {
 pub(crate) struct Allocation {
     memory: Arc<OutputMemory>,
     bytes: usize,
-    key: Option<(u8, usize)>,
+    key: Option<usize>,
 }
 
 impl std::fmt::Debug for Allocation {
@@ -127,25 +125,5 @@ impl Drop for Allocation {
         {
             state.allocations.remove(&key);
         }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct OutputAllocations(pub(crate) Vec<Arc<Allocation>>);
-
-impl OutputAllocations {
-    pub(crate) fn reserve(&mut self, memory: &Arc<OutputMemory>, bytes: usize) -> io::Result<()> {
-        self.0.push(memory.reserve(bytes)?);
-        Ok(())
-    }
-
-    pub(crate) fn shared(
-        &mut self,
-        memory: &Arc<OutputMemory>,
-        key: (u8, usize),
-        bytes: usize,
-    ) -> io::Result<()> {
-        self.0.push(memory.shared(key, bytes)?);
-        Ok(())
     }
 }

@@ -415,8 +415,7 @@ impl<'a, E: ElementExt + 'a> RenderLoopFuture<'a, E> {
         }
     }
 
-    /// Supplies an already admitted output envelope from a shared resource budget.
-    /// Keep enough capacity for queued targets, both screen baselines and a completing frame.
+    /// Sets capacity for queued output payloads, clipboard preparation and source coverage.
     pub fn output_capacity(mut self, capacity: crate::OutputCapacity) -> Self {
         match &mut self.state {
             RenderLoopFutureState::Init {

@@ -5,9 +5,8 @@ use crate::{
     component,
     components::View,
     element,
-    hooks::{
-        Ref, SelectionContext, State, UseConst, UseInterval, UseRef, UseState, UseTerminalEvents,
-    },
+    hooks::{Ref, SelectionContext, State, UseConst, UseInterval, UseRef, UseState},
+    terminal::vertical_wheel_direction,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -1612,11 +1611,7 @@ impl Default for ScrollWheel {
 impl ScrollWheel {
     /// Returns the signed row request for a vertical wheel event, including host acceleration.
     pub fn navigation(&mut self, event: &MouseEventKind) -> Option<ScrollNavigation> {
-        let direction = match event {
-            MouseEventKind::ScrollUp => -1,
-            MouseEventKind::ScrollDown => 1,
-            _ => return None,
-        };
+        let direction = vertical_wheel_direction(*event)?;
         let step = self.state.compute_now(direction);
         (step > 0).then_some(ScrollNavigation::Rows(step * i32::from(direction)))
     }
@@ -2122,7 +2117,7 @@ pub fn ScrollView<'a>(
         }
     }
 
-    hooks.use_local_propagated_terminal_events({
+    hooks.use_local_scroll_events({
         let vh = viewport_height;
         let subscribers = subscribers.clone();
         let selection_screen_for_events = selection_screen.clone();
@@ -2138,25 +2133,23 @@ pub fn ScrollView<'a>(
                         None
                     }
                 }
-                TerminalEvent::FullscreenMouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        let step = if wheel_acceleration {
-                            wheel_accel.write().compute_now(-1)
-                        } else {
-                            scroll_step
-                        };
-                        (step > 0).then_some((-step, true))
-                    }
-                    MouseEventKind::ScrollDown => {
-                        let step = if wheel_acceleration {
-                            wheel_accel.write().compute_now(1)
-                        } else {
-                            scroll_step
-                        };
-                        (step > 0).then_some((step, true))
-                    }
-                    _ => None,
-                },
+                TerminalEvent::FullscreenMouse(mouse) if mouse.vertical_wheel().is_some() => {
+                    let directions = event.vertical_wheel_directions();
+                    let delta = if wheel_acceleration {
+                        let mut acceleration = wheel_accel.write();
+                        directions
+                            .map(|direction| {
+                                acceleration.compute_now(direction) * i32::from(direction)
+                            })
+                            .fold(0, i32::saturating_add)
+                    } else {
+                        directions
+                            .map(i32::from)
+                            .sum::<i32>()
+                            .saturating_mul(scroll_step)
+                    };
+                    (delta != 0).then_some((delta, true))
+                }
                 _ => None,
             };
 
@@ -2891,6 +2884,23 @@ mod tests {
         let output = canvases.last().unwrap().to_string();
         assert!(output.contains("Line 2"));
         assert!(!output.contains("Line 0"));
+    }
+
+    #[apply(test!)]
+    async fn test_scroll_view_combines_wheel_displacement_before_clamping() {
+        let wheel = |kind| TerminalEvent::FullscreenMouse(FullscreenMouseEvent::new(kind, 1, 1));
+        let key = |code| TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, code));
+        let canvases = element!(TestScrollView)
+            .mock_terminal_render_loop(MockTerminalConfig::with_events(stream::iter([
+                wheel(MouseEventKind::ScrollUp),
+                wheel(MouseEventKind::ScrollDown),
+                key(KeyCode::Down),
+                key(KeyCode::Char('q')),
+            ])))
+            .collect::<Vec<_>>()
+            .await;
+        let output = canvases.last().unwrap().to_string();
+        assert!(output.starts_with("Line 1 "), "{output:?}");
     }
 
     #[apply(test!)]

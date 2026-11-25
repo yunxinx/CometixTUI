@@ -46,6 +46,7 @@ pub(crate) struct ExitOnCtrlCContext(pub bool);
 pub struct SystemContext {
     pub(crate) image_scope: Option<crate::ImageScope>,
     pub(crate) output: Option<crate::terminal::OutputSender>,
+    pub(crate) pending_history: Option<Box<crate::HistoryDraft>>,
     should_exit: bool,
     mouse_capture: Option<bool>,
     keyboard_enhancement_flags: Option<crate::KeyboardEnhancementFlags>,
@@ -58,6 +59,7 @@ impl SystemContext {
         Self {
             image_scope: None,
             output: None,
+            pending_history: None,
             should_exit: false,
             mouse_capture: None,
             keyboard_enhancement_flags: None,

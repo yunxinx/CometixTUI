@@ -4,12 +4,16 @@ use std::sync::Arc;
 
 /// Application-owned source coverage, returned unchanged after a local commit.
 #[derive(Clone)]
-pub struct SourceCoverage(Arc<dyn Any + Send + Sync>, usize, super::OutputAllocations);
+pub struct SourceCoverage(
+    Arc<dyn Any + Send + Sync>,
+    usize,
+    Option<Arc<super::Allocation>>,
+);
 
 impl SourceCoverage {
     /// Wraps a shared immutable source identity. The terminal never interprets its contents.
     pub fn new<T: Any + Send + Sync>(value: Arc<T>) -> Self {
-        Self(value, size_of::<T>(), Default::default())
+        Self(value, size_of::<T>(), None)
     }
 
     /// Declares additional owned storage behind the identity, excluding already budgeted shared sources.
@@ -22,13 +26,7 @@ impl SourceCoverage {
     }
 
     pub(crate) fn reserve(&mut self, memory: &Arc<super::OutputMemory>) -> std::io::Result<()> {
-        let mut allocations = super::OutputAllocations::default();
-        allocations.shared(
-            memory,
-            (3, Arc::as_ptr(&self.0) as *const () as usize),
-            self.1,
-        )?;
-        self.2 = allocations;
+        self.2 = Some(memory.shared(Arc::as_ptr(&self.0) as *const () as usize, self.1)?);
         Ok(())
     }
 
@@ -76,7 +74,6 @@ pub struct CommittedFrame {
     /// Local write receipt; it is not a terminal acknowledgement.
     pub receipt: CommitReceipt,
     pub(crate) hits: Arc<[HitRegion]>,
-    pub(crate) _allocations: super::OutputAllocations,
     pub(crate) views: Option<Arc<crate::components::ViewHitProjection>>,
 }
 
@@ -138,11 +135,11 @@ pub enum FrameCommit {
 pub struct FrameDraft {
     pub(crate) canvas: Canvas,
     pub(super) graphics: super::graphics::GraphicsPlan,
-    pub(crate) allocations: super::OutputAllocations,
     pub(crate) coverage: Option<SourceCoverage>,
     pub(crate) alternate: bool,
     pub(crate) hits: Vec<HitRegion>,
     pub(crate) views: Option<Arc<crate::components::ViewHitProjection>>,
+    pub(crate) history: Option<Box<HistoryDraft>>,
 }
 
 impl FrameDraft {
@@ -151,11 +148,11 @@ impl FrameDraft {
         Self {
             canvas,
             graphics: Default::default(),
-            allocations: Default::default(),
             coverage: None,
             alternate: false,
             hits: Vec::new(),
             views: None,
+            history: None,
         }
     }
 
@@ -194,6 +191,7 @@ impl HistoryTarget {
 }
 
 /// A finite set of history rows with immutable image attachments.
+#[derive(Clone)]
 pub struct HistoryDraft {
     pub(crate) target: Option<HistoryTarget>,
     pub(crate) replace: bool,
@@ -230,5 +228,11 @@ impl HistoryDraft {
     pub fn with_coverage(mut self, coverage: SourceCoverage) -> Self {
         self.coverage = Some(coverage);
         self
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.target
+            .as_ref()
+            .is_some_and(HistoryTarget::is_cancelled)
     }
 }

@@ -67,6 +67,88 @@ impl CanvasImageSource for Source {
 }
 
 #[test]
+fn archived_main_images_survive_alternate_eviction_and_screen_switch() {
+    smol::block_on(async {
+        let capture = Capture::default();
+        let mut output = TerminalOutput::new(capture.clone(), 20, 8).unwrap();
+        let image = CanvasImage::new(Arc::new(Source(ImageScope::default())), 2, 2).unwrap();
+        let mut document = Canvas::new(2, 2);
+        document
+            .subview_mut(0, 0, 0, 0, 2, 2)
+            .set_image(0, 0, &image);
+        let mut viewport = Canvas::new(20, 3);
+        viewport
+            .subview_mut(0, 0, 0, 0, 20, 3)
+            .blit_region_from_clean(&document, 5, 1, 0, 1, 2, 1);
+        let take_output =
+            || String::from_utf8(std::mem::take(&mut *capture.bytes.lock().unwrap())).unwrap();
+        let uploaded_id = |text: &str| -> u32 {
+            text.split_once("a=t,f=100,t=d,i=")
+                .unwrap()
+                .1
+                .split_once(',')
+                .unwrap()
+                .0
+                .parse()
+                .unwrap()
+        };
+        let deletion = |id| format!("a=d,d=I,i={id},");
+
+        output
+            .present(FrameDraft::new(viewport.clone()))
+            .await
+            .unwrap();
+        let main = uploaded_id(&take_output());
+        output
+            .append_history(HistoryDraft::new(viewport.clone()))
+            .await
+            .unwrap();
+        let archived = uploaded_id(&take_output());
+        assert_eq!(archived, main + 2);
+        output
+            .present(FrameDraft::new(viewport.clone()).alternate_screen())
+            .await
+            .unwrap();
+        let alternate = uploaded_id(&take_output());
+        assert_ne!(main % 2, alternate % 2);
+
+        let mut offscreen = Canvas::new(20, 10);
+        offscreen
+            .subview_mut(0, 0, 0, 0, 20, 10)
+            .blit_region_from_clean(&document, 5, 8, 0, 0, 2, 2);
+        output
+            .present(FrameDraft::new(offscreen).alternate_screen())
+            .await
+            .unwrap();
+        let evicted = take_output();
+        assert!(evicted.contains(&deletion(alternate)));
+        assert!(!evicted.contains("a=t,f=100"));
+        output
+            .present(FrameDraft::new(viewport).alternate_screen())
+            .await
+            .unwrap();
+        let reentered = uploaded_id(&take_output());
+        assert_eq!(reentered, alternate + 2);
+
+        output
+            .present(FrameDraft::new(Canvas::new(20, 3)))
+            .await
+            .unwrap();
+        let returned = take_output();
+        assert!(
+            returned.find(&deletion(reentered)).unwrap() < returned.find("\x1b[?1049l").unwrap()
+        );
+        output.finish().await.unwrap();
+        let finished = take_output();
+        for id in [main, archived] {
+            assert!(!evicted.contains(&deletion(id)));
+            assert!(!returned.contains(&deletion(id)));
+            assert!(!finished.contains(&deletion(id)));
+        }
+    });
+}
+
+#[test]
 fn handoff_stops_retirement_until_reacquired() {
     smol::block_on(async {
         let capture = Capture::default();
@@ -446,6 +528,116 @@ fn committed_hits_survive_backpressure_and_are_invalidated_by_handoff() {
 }
 
 #[test]
+fn mouse_snapshot_tracks_visual_changes_independently_of_committed_hits() {
+    smol::block_on(async {
+        let capture = Capture::default();
+        let mut output = session(capture.clone());
+        let target = |canvas, label| {
+            let mut operation = frame(canvas, 3);
+            if let Operation::Frame { draft, .. } = &mut operation {
+                draft.hits.push(HitRegion {
+                    column: 0,
+                    row: 0,
+                    width: 10,
+                    height: 1,
+                    target: SourceCoverage::new(Arc::new(label)),
+                });
+            }
+            operation
+        };
+        let mut canvas = Canvas::new(20, 2);
+        output.enqueue(target(canvas.clone(), "initial")).unwrap();
+        barrier(&mut output).await;
+        let initial = output.projection().unwrap();
+        assert!(initial.cells.is_none());
+        assert_eq!(initial.frame.hit::<&str>(0, 0), Some(&"initial"));
+
+        output.enqueue(Operation::Mouse(true)).unwrap();
+        barrier(&mut output).await;
+        let initial_cells = output.projection().unwrap().cells.unwrap();
+        assert!(initial_cells.cell_is_blank(0, 0));
+        capture.bytes.lock().unwrap().clear();
+        output
+            .enqueue(target(canvas.clone(), "same pixels"))
+            .unwrap();
+        barrier(&mut output).await;
+        let unchanged = output.projection().unwrap();
+        assert!(capture.bytes.lock().unwrap().is_empty());
+        assert_eq!(unchanged.frame.hit::<&str>(0, 0), Some(&"same pixels"));
+        assert!(Arc::ptr_eq(&initial_cells, &unchanged.cells.unwrap()));
+
+        canvas.declare_cursor(1, 0, true);
+        output
+            .enqueue(target(canvas.clone(), "moved caret"))
+            .unwrap();
+        barrier(&mut output).await;
+        assert!(!capture.bytes.lock().unwrap().is_empty());
+        let moved_caret = output.projection().unwrap().cells.unwrap();
+        assert!(Arc::ptr_eq(&initial_cells, &moved_caret));
+
+        canvas
+            .subview_mut(0, 0, 0, 0, 20, 2)
+            .set_text(0, 0, "content", CanvasTextStyle::default());
+        output.enqueue(target(canvas, "painted")).unwrap();
+        barrier(&mut output).await;
+        let painted = output.projection().unwrap().cells.unwrap();
+        assert!(!painted.cell_is_blank(0, 0));
+
+        output.enqueue(Operation::Mouse(false)).unwrap();
+        barrier(&mut output).await;
+        let disabled = output.projection().unwrap();
+        assert!(disabled.cells.is_none());
+        assert_eq!(disabled.frame.hit::<&str>(0, 0), Some(&"painted"));
+        output.finish().await.unwrap();
+    });
+}
+
+#[test]
+fn hidden_fullscreen_changes_skip_output_and_mouse_snapshot_until_resize() {
+    smol::block_on(async {
+        let capture = Capture::default();
+        let mut output = session(capture.clone());
+        let alternate_frame = |canvas, rows| {
+            let mut operation = frame(canvas, rows);
+            if let Operation::Frame { screen, .. } = &mut operation {
+                *screen = Some(crate::context::AlternateScreenRequest {
+                    mouse_tracking: true,
+                });
+            }
+            operation
+        };
+        let mut canvas = Canvas::new(20, 4);
+        output.enqueue(alternate_frame(canvas.clone(), 2)).unwrap();
+        barrier(&mut output).await;
+        let initial = output.projection().unwrap().cells.unwrap();
+        capture.bytes.lock().unwrap().clear();
+        canvas.subview_mut(0, 0, 0, 0, 20, 4).set_text(
+            0,
+            3,
+            "revealed",
+            CanvasTextStyle::default(),
+        );
+        output.enqueue(alternate_frame(canvas.clone(), 2)).unwrap();
+        barrier(&mut output).await;
+        assert!(capture.bytes.lock().unwrap().is_empty());
+        let unchanged = output.projection().unwrap().cells.unwrap();
+        assert!(Arc::ptr_eq(&initial, &unchanged));
+        assert!(unchanged.cell_is_blank(0, 3));
+
+        output.enqueue(alternate_frame(canvas, 4)).unwrap();
+        barrier(&mut output).await;
+        let resized = output.projection().unwrap().cells.unwrap();
+        assert!(!resized.cell_is_blank(0, 3));
+        assert!(
+            std::str::from_utf8(&capture.bytes.lock().unwrap())
+                .unwrap()
+                .contains("revealed")
+        );
+        output.finish().await.unwrap();
+    });
+}
+
+#[test]
 fn frame_capacity_backpressure_preserves_the_accepted_target_and_recovers() {
     smol::block_on(async {
         let capture = Capture::default();
@@ -604,6 +796,68 @@ fn identical_editor_frames_preserve_the_terminal_cursor() {
             }
             output.finish().await.unwrap();
         }
+    });
+}
+
+#[test]
+fn attached_history_follows_main_screen_transition_under_backpressure() {
+    smol::block_on(async {
+        let capture = Capture::default();
+        let mut output = session(capture.clone());
+        let mut alternate = frame(Canvas::new(20, 3), 3);
+        if let Operation::Frame { screen, .. } = &mut alternate {
+            *screen = Some(crate::context::AlternateScreenRequest {
+                mouse_tracking: false,
+            });
+        }
+        output.enqueue(alternate).unwrap();
+        barrier(&mut output).await;
+        capture.bytes.lock().unwrap().clear();
+
+        let canvas = |text| {
+            let mut canvas = Canvas::new(20, 1);
+            canvas
+                .subview_mut(0, 0, 0, 0, 20, 1)
+                .set_text(0, 0, text, CanvasTextStyle::default());
+            canvas
+        };
+        capture.blocked.store(true, Ordering::Release);
+        output
+            .enqueue(Operation::Control("\x1b]2;blocked\x07".into(), None))
+            .unwrap();
+        let previous_target = HistoryTarget::default();
+        let mut superseded = frame(canvas("obsolete input"), 3);
+        if let Operation::Frame { draft, .. } = &mut superseded {
+            draft.history = Some(Box::new(
+                HistoryDraft::new(canvas("obsolete history"))
+                    .replace_scrollback()
+                    .with_target(previous_target.clone()),
+            ));
+        }
+        output.enqueue(superseded).unwrap();
+        previous_target.cancel();
+        let mut returning = frame(canvas("returning"), 3);
+        if let Operation::Frame { draft, .. } = &mut returning {
+            draft.history = Some(Box::new(
+                HistoryDraft::new(canvas("archived")).replace_scrollback(),
+            ));
+        }
+        output.enqueue(returning).unwrap();
+        output.enqueue(frame(canvas("latest input"), 3)).unwrap();
+        capture.blocked.store(false, Ordering::Release);
+        barrier(&mut output).await;
+
+        let bytes = capture.bytes.lock().unwrap().clone();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(!text.contains("obsolete"));
+        let leave = text.find("\x1b[?1049l").unwrap();
+        let archived = text.find("archived").unwrap();
+        let latest = text.find("latest input").unwrap();
+        let history_begin = text[..archived].rfind("\x1b[?2026h").unwrap();
+        let history_end = text[archived..].find("\x1b[?2026l").unwrap() + archived;
+        assert!(leave < history_begin && history_end < latest);
+        assert!(text[archived..history_end].contains("returning"));
+        output.finish().await.unwrap();
     });
 }
 

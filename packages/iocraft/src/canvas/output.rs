@@ -36,18 +36,23 @@ impl CanvasSubviewMut<'_> {
     ) {
         let (left, top, width, height) =
             self.clipped_rect(x, y, image.columns.into(), image.rows.into());
+        if width == 0 || height == 0 {
+            return;
+        }
         let source_left = self.x as i128 + x as i128;
         let source_top = self.y as i128 + y as i128;
+        self.canvas.clear_text(left, top, width, height);
         for row in top..top + height {
-            for column in left..left + width {
-                self.canvas.clear_region(column, row, 1, 1);
-                self.canvas.cells_row_mut(row)[column].image = Some(CanvasImageCell {
+            self.canvas.image_rows[row] = true;
+            let cells = self.canvas.cells_row_mut(row);
+            for (column, cell) in cells.iter_mut().enumerate().skip(left).take(width) {
+                cell.image = Some(CanvasImageCell {
                     image: image.clone(),
                     column: (column as i128 - source_left) as u16,
                     row: (row as i128 - source_top) as u16,
                 });
                 if let Some(hyperlink) = hyperlink {
-                    self.canvas.cells_row_mut(row)[column].character = Some(Character {
+                    cell.character = Some(Character {
                         value: " ".into(),
                         style: CanvasTextStyle::default(),
                         hyperlink: Some(hyperlink.into()),
@@ -55,7 +60,6 @@ impl CanvasSubviewMut<'_> {
                 }
             }
         }
-        self.canvas.mark_rows_written_range(top, top + height);
     }
 
     // A clip can extend beyond isize even though its intersection fits on the canvas.
@@ -250,6 +254,10 @@ impl CanvasSubviewMut<'_> {
         self.canvas
             .mark_rows_written_range(dst_top, dst_top.saturating_add(copy_height));
         let mut damage_width = copy_width;
+        let full_row = src_left == 0
+            && dst_left == 0
+            && copy_width == src.width()
+            && copy_width == self.canvas.width();
 
         for row_offset in 0..copy_height {
             let src_row = src_top + row_offset;
@@ -257,6 +265,19 @@ impl CanvasSubviewMut<'_> {
             let src_right = src_left + copy_width;
             let dst_right = dst_left + copy_width;
 
+            if full_row {
+                self.canvas.cells[dst_row] = src.cells[src_row].clone();
+                self.canvas.overlays[dst_row] = src.overlays[src_row].clone();
+                self.canvas.no_select[dst_row] = src.no_select[src_row].clone();
+                self.canvas.image_rows[dst_row] = src.image_rows[src_row];
+                self.canvas.soft_wrap[dst_row] = src.soft_wrap[src_row];
+                continue;
+            }
+            if dst_left == 0 && dst_right == self.canvas.width() {
+                self.canvas.image_rows[dst_row] = src.image_rows[src_row];
+            } else {
+                self.canvas.image_rows[dst_row] |= src.image_rows[src_row];
+            }
             self.canvas.cells_row_mut(dst_row)[dst_left..dst_right]
                 .clone_from_slice(&src.cells[src_row][src_left..src_right]);
             self.canvas.overlays_row_mut(dst_row)[dst_left..dst_right]

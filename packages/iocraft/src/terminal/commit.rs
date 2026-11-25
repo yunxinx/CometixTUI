@@ -68,6 +68,30 @@ impl Operation {
             _ => {}
         }
     }
+
+    fn prepare_graphics(&mut self) -> io::Result<()> {
+        use super::graphics::GraphicsPlan;
+
+        match self {
+            Self::Frame { draft, .. } => {
+                draft.graphics = GraphicsPlan::collect(&draft.canvas)?;
+                if draft
+                    .history
+                    .as_deref()
+                    .is_some_and(HistoryDraft::is_cancelled)
+                {
+                    draft.history = None;
+                }
+                if let Some(history) = &mut draft.history {
+                    history.graphics = GraphicsPlan::collect(&history.canvas)?;
+                }
+            }
+            Self::History(draft, _) => draft.graphics = GraphicsPlan::collect(&draft.canvas)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn reserve(
         &mut self,
         memory: &Arc<OutputMemory>,
@@ -82,15 +106,13 @@ impl Operation {
                 }
             }
             Self::Frame { draft, .. } => {
-                draft.canvas.output_allocations = draft.canvas.reserve_output(memory, false)?;
-                draft.graphics = super::graphics::GraphicsPlan::reserve(&draft.canvas, memory)?;
-                let bytes = draft.canvas.width() * draft.canvas.height()
-                    + draft.hits.capacity() * size_of::<HitRegion>()
-                    + draft
-                        .views
-                        .as_ref()
-                        .map_or(0, |views| views.retained_bytes());
-                draft.allocations.reserve(memory, bytes)?;
+                if let Some(coverage) = draft
+                    .history
+                    .as_mut()
+                    .and_then(|history| history.coverage.as_mut())
+                {
+                    coverage.reserve(memory)?;
+                }
                 for region in &mut draft.hits {
                     region.target.reserve(memory)?;
                 }
@@ -102,8 +124,6 @@ impl Operation {
                 if let Some(coverage) = &mut draft.coverage {
                     coverage.reserve(memory)?;
                 }
-                draft.canvas.output_allocations = draft.canvas.reserve_output(memory, false)?;
-                draft.graphics = super::graphics::GraphicsPlan::reserve(&draft.canvas, memory)?;
             }
             _ => {}
         }
@@ -164,9 +184,15 @@ struct Pending {
     active: bool,
     resumed: bool,
     finished: Option<Result<(), (io::ErrorKind, String)>>,
-    snapshot: Option<EventCellSnapshot>,
+    projection: Option<OutputProjection>,
     #[cfg(unix)]
     resume_signal: Option<super::backend::ResumeSignalListener>,
+}
+
+#[derive(Clone)]
+pub(super) struct OutputProjection {
+    pub(super) frame: Arc<CommittedFrame>,
+    pub(super) cells: Option<Arc<EventCellSnapshot>>,
 }
 
 struct Shared {
@@ -303,7 +329,7 @@ impl OutputSession {
                 active: false,
                 resumed: false,
                 finished: None,
-                snapshot: None,
+                projection: None,
                 #[cfg(unix)]
                 resume_signal: None,
             }),
@@ -344,7 +370,7 @@ impl OutputSession {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 pending.admission = Admission::Finished;
-                let projection = pending.snapshot.take();
+                let projection = pending.projection.take();
                 let rejected = std::mem::take(&mut pending.operations);
                 let result = result.map_err(|error| (error.kind(), error.to_string()));
                 pending.finished =
@@ -494,12 +520,12 @@ impl OutputSession {
         Ok(())
     }
 
-    pub(super) fn snapshot(&self) -> Option<EventCellSnapshot> {
+    pub(super) fn projection(&self) -> Option<OutputProjection> {
         self.shared
             .pending
             .lock()
             .expect("output projection is not poisoned")
-            .snapshot
+            .projection
             .clone()
     }
 
@@ -548,9 +574,9 @@ impl OutputSender {
             .pending
             .lock()
             .expect("output projection is not poisoned")
-            .snapshot
+            .projection
             .as_ref()
-            .and_then(|snapshot| snapshot.frame.clone())
+            .map(|projection| projection.frame.clone())
     }
 
     pub(crate) fn append_history(
@@ -604,6 +630,10 @@ impl OutputSender {
     }
 
     fn enqueue(&self, mut operation: Operation) -> io::Result<()> {
+        if let Err(error) = operation.prepare_graphics() {
+            operation.reject(&error);
+            return Err(error);
+        }
         let mut pending = self
             .shared
             .pending
@@ -615,9 +645,23 @@ impl OutputSender {
             operation.reject(&error);
             return Err(error);
         }
+        let mut cancelled_history = Vec::new();
+        if matches!(&operation, Operation::Frame { draft, .. } if draft.history.is_some()) {
+            for (queued, _) in &mut pending.operations {
+                if let Operation::Frame { draft, .. } = queued
+                    && draft
+                        .history
+                        .as_deref()
+                        .is_some_and(HistoryDraft::is_cancelled)
+                {
+                    cancelled_history.extend(draft.history.take());
+                }
+            }
+        }
         let replacing = matches!(
             (&operation, pending.operations.back()),
-            (Operation::Frame { .. }, Some((Operation::Frame { .. }, _)))
+            (Operation::Frame { .. }, Some((Operation::Frame { draft, .. }, _)))
+                if draft.history.is_none()
         );
         if !replacing
             && pending.operations.len() >= MAX_PENDING_OPERATIONS
@@ -667,6 +711,7 @@ impl OutputSender {
         }
         pending.operations.push_back((operation, allocation));
         drop(pending);
+        drop(cancelled_history);
         if let Some((
             Operation::Frame {
                 receipt: Some(receipt),
@@ -823,14 +868,14 @@ impl OutputOwner {
     }
 
     fn invalidate_projection(&self) {
-        let snapshot = self
+        let projection = self
             .shared
             .pending
             .lock()
             .expect("output projection is not poisoned")
-            .snapshot
+            .projection
             .take();
-        drop(snapshot);
+        drop(projection);
     }
 
     fn execute(&mut self, operation: Operation) -> io::Result<()> {
@@ -852,18 +897,14 @@ impl OutputOwner {
         match operation {
             Operation::Query(query) => query(self.backend.dest())?,
             Operation::History(draft, receipt) => {
-                if draft
-                    .target
-                    .as_ref()
-                    .is_some_and(HistoryTarget::is_cancelled)
-                {
+                if draft.is_cancelled() {
                     let _ = receipt.send(Err(io::Error::new(
                         io::ErrorKind::Interrupted,
                         "history target was replaced",
                     )));
                     return Ok(());
                 }
-                let result = self.write_history(&draft.canvas, draft.graphics, draft.replace);
+                let result = self.write_history(draft.canvas, draft.graphics, draft.replace);
                 let reported = match &result {
                     Ok(()) => Ok(CommitReceipt {
                         sequence: self.sequence,
@@ -888,16 +929,27 @@ impl OutputOwner {
                 )?;
             }
             Operation::Frame {
-                mut draft,
+                draft,
                 size,
                 screen,
                 receipt,
             } => {
-                let canvas = &draft.canvas;
+                let FrameDraft {
+                    canvas,
+                    graphics,
+                    coverage,
+                    hits,
+                    views,
+                    history,
+                    ..
+                } = *draft;
+                let previous_row_limit = self.backend.canvas_row_limit();
                 if let Some((width, height)) = size {
                     self.backend.set_size_from_resize_event(width, height);
                 }
                 self.synchronization.enter();
+                let mouse_was_enabled = self.backend.mouse_events_possible();
+                let mut cells_changed = false;
                 let mut next_canvas = None;
                 let result: io::Result<()> = (|| {
                     if let Some(previous) = &self.previous {
@@ -925,11 +977,13 @@ impl OutputOwner {
                             }
                         }
                     }
+                    let row_limit = self.backend.canvas_row_limit();
                     let resolved = self.graphics.prepare(
                         canvas,
                         self.backend.is_fullscreen(),
+                        row_limit,
                         self.backend.dest(),
-                        std::mem::take(&mut draft.graphics),
+                        graphics,
                     )?;
                     if !screen_changed
                         && self
@@ -944,51 +998,72 @@ impl OutputOwner {
                         &resolved,
                         self.synchronization.context(),
                     )?;
-                    self.backend.position_cursor(canvas.cursor_declaration())?;
+                    self.backend
+                        .position_cursor(resolved.cursor_declaration())?;
+                    cells_changed = self.backend.mouse_events_possible()
+                        && (screen_changed
+                            || self.previous.as_ref().is_none_or(|previous| {
+                                previous.height().min(previous_row_limit)
+                                    != resolved.height().min(row_limit)
+                                    || !previous.has_same_cells_up_to(&resolved, row_limit)
+                            }));
                     next_canvas = Some(resolved);
                     Ok(())
                 })();
                 let end = self.synchronization.leave(self.backend.dest());
                 let result = result.and(end).and_then(|()| {
-                    self.backend.flush()?;
+                    self.graphics
+                        .commit(self.backend.is_fullscreen(), self.backend.dest())?;
                     if let Some(canvas) = next_canvas {
                         self.previous = Some(canvas);
+                    }
+                    if let Some(history) = history.filter(|history| !history.is_cancelled()) {
+                        self.write_history(history.canvas, history.graphics, history.replace)?;
                     }
                     Ok(())
                 });
                 if result.is_ok() {
-                    let mut snapshot = EventCellSnapshot::from_canvas(&draft.canvas);
-                    snapshot.frame = Some(Arc::new(CommittedFrame {
+                    let mouse_enabled = self.backend.mouse_events_possible();
+                    let row_limit = self.backend.canvas_row_limit();
+                    let cells = self
+                        .previous
+                        .as_ref()
+                        .filter(|_| mouse_enabled && (!mouse_was_enabled || cells_changed))
+                        .map(|canvas| Arc::new(EventCellSnapshot::from_canvas(canvas, row_limit)));
+                    let frame = Arc::new(CommittedFrame {
                         receipt: CommitReceipt {
                             sequence: self.sequence,
-                            coverage: draft.coverage.clone(),
+                            coverage: coverage.clone(),
                         },
-                        hits: draft.hits.into(),
-                        views: draft.views,
-                        _allocations: draft.allocations,
-                    }));
-                    let previous = self
+                        hits: hits.into(),
+                        views,
+                    });
+                    let mut pending = self
                         .shared
                         .pending
                         .lock()
-                        .expect("output projection is not poisoned")
-                        .snapshot
-                        .replace(snapshot);
+                        .expect("output projection is not poisoned");
+                    let previous = pending.projection.take();
+                    let cells = if mouse_enabled {
+                        cells.or_else(|| previous.as_ref()?.cells.clone())
+                    } else {
+                        None
+                    };
+                    pending.projection = Some(OutputProjection { frame, cells });
+                    drop(pending);
                     drop(previous);
                 }
                 if let Some(receipt) = receipt {
                     let reported = match &result {
                         Ok(()) => Ok(FrameCommit::Committed(CommitReceipt {
                             sequence: self.sequence,
-                            coverage: draft.coverage,
+                            coverage,
                         })),
                         Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
                     };
                     let _ = receipt.send(reported);
                 }
                 result?;
-                self.graphics
-                    .commit(self.backend.is_fullscreen(), self.backend.dest())?;
             }
             Operation::Control(sequence, receipt) => {
                 let result = self.backend.write_control_sequence(&sequence);
@@ -1029,7 +1104,28 @@ impl OutputOwner {
                 self.previous = None;
                 self.saved_main = None;
             }
-            Operation::Mouse(enabled) => self.backend.set_mouse_capture(enabled)?,
+            Operation::Mouse(enabled) => {
+                let was_enabled = self.backend.mouse_events_possible();
+                self.backend.set_mouse_capture(enabled)?;
+                let is_enabled = self.backend.mouse_events_possible();
+                if was_enabled != is_enabled {
+                    let row_limit = self.backend.canvas_row_limit();
+                    let cells =
+                        self.previous.as_ref().filter(|_| is_enabled).map(|canvas| {
+                            Arc::new(EventCellSnapshot::from_canvas(canvas, row_limit))
+                        });
+                    if let Some(projection) = self
+                        .shared
+                        .pending
+                        .lock()
+                        .expect("output projection is not poisoned")
+                        .projection
+                        .as_mut()
+                    {
+                        projection.cells = cells;
+                    }
+                }
+            }
             Operation::Keyboard(flags) => self.backend.set_keyboard_enhancement_flags(flags)?,
             Operation::RawMode(enabled) => {
                 if self.backend.is_raw_mode_supported() {
@@ -1139,7 +1235,7 @@ impl OutputOwner {
 
     fn write_history(
         &mut self,
-        canvas: &Canvas,
+        canvas: Canvas,
         plan: super::graphics::GraphicsPlan,
         replace: bool,
     ) -> io::Result<()> {

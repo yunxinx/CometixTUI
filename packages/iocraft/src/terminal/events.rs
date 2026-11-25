@@ -58,11 +58,36 @@ impl SharedEventState {
 pub struct PropagatedTerminalEvent {
     event: TerminalEvent,
     state: Arc<SharedEventState>,
+    following_wheels: Vec<(i8, Arc<SharedEventState>)>,
 }
 
 impl PropagatedTerminalEvent {
     pub(crate) fn new(event: TerminalEvent, state: Arc<SharedEventState>) -> Self {
-        Self { event, state }
+        Self {
+            event,
+            state,
+            following_wheels: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_following_wheels(
+        mut self,
+        following_wheels: Vec<(i8, Arc<SharedEventState>)>,
+    ) -> Self {
+        self.following_wheels = following_wheels;
+        self
+    }
+
+    pub(crate) fn vertical_wheel_directions(&self) -> impl Iterator<Item = i8> + '_ {
+        self.event
+            .vertical_wheel()
+            .map(|(direction, _)| direction)
+            .into_iter()
+            .chain(
+                self.following_wheels
+                    .iter()
+                    .map(|(direction, _)| *direction),
+            )
     }
 
     /// The underlying terminal event.
@@ -76,6 +101,9 @@ impl PropagatedTerminalEvent {
     /// subscribers are unaffected — they observe every event regardless.
     pub fn stop_propagation(&self) {
         self.state.stop_propagation();
+        for (_, state) in &self.following_wheels {
+            state.stop_propagation();
+        }
     }
 
     pub(crate) fn stop_component_propagation(&self) {
@@ -238,6 +266,41 @@ impl TerminalEvents {
             Poll::Pending
         }
     }
+
+    pub(crate) fn take_following_wheels(
+        &self,
+        first: &FullscreenMouseEvent,
+    ) -> Vec<(i8, Arc<SharedEventState>)> {
+        let mut following = Vec::new();
+        let Some((_, target)) = first.vertical_wheel() else {
+            return following;
+        };
+        let mut inner = self.shared.inner.lock().unwrap();
+        while let Some((TerminalEvent::FullscreenMouse(next), _)) = inner.pending.front() {
+            let Some((direction, next_target)) = next.vertical_wheel() else {
+                break;
+            };
+            if next_target != target {
+                break;
+            }
+            let same_frame = match (first.frame.as_ref(), next.frame.as_ref()) {
+                (Some(frame), Some(next_frame)) => Arc::ptr_eq(frame, next_frame),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same_frame {
+                break;
+            }
+            let (_, state) = inner
+                .pending
+                .pop_front()
+                .expect("peeked wheel report is queued");
+            if !state.is_propagation_stopped() {
+                following.push((direction, state));
+            }
+        }
+        following
+    }
 }
 
 #[cfg(test)]
@@ -357,20 +420,37 @@ impl FullscreenMouseEvent {
         self.cell_is_blank = cell_is_blank;
         self
     }
+
+    pub(crate) fn vertical_wheel(&self) -> Option<(i8, WheelTarget)> {
+        Some((
+            vertical_wheel_direction(self.kind)?,
+            WheelTarget {
+                column: self.column,
+                row: self.row,
+                modifiers: self.modifiers,
+            },
+        ))
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WheelTarget {
+    column: u16,
+    row: u16,
+    modifiers: KeyModifiers,
+}
+
+#[derive(Debug)]
 pub(super) struct EventCellSnapshot {
     width: usize,
     height: usize,
-    blank: Arc<[bool]>,
-    pub(super) frame: Option<Arc<crate::CommittedFrame>>,
+    blank: Box<[bool]>,
 }
 
 impl EventCellSnapshot {
-    pub(super) fn from_canvas(canvas: &Canvas) -> Self {
+    pub(super) fn from_canvas(canvas: &Canvas, row_limit: usize) -> Self {
         let width = canvas.width();
-        let height = canvas.height();
+        let height = canvas.height().min(row_limit);
         let mut blank = Vec::with_capacity(width.saturating_mul(height));
         for row in 0..height {
             for column in 0..width {
@@ -381,8 +461,11 @@ impl EventCellSnapshot {
             width,
             height,
             blank: blank.into(),
-            frame: None,
         }
+    }
+
+    pub(super) fn matches_extent(&self, canvas: &Canvas, row_limit: usize) -> bool {
+        self.width == canvas.width() && self.height == canvas.height().min(row_limit)
     }
 
     pub(super) fn cell_is_blank(&self, column: u16, row: u16) -> bool {
@@ -426,6 +509,23 @@ pub enum TerminalEvent {
     /// this variant lets custom frontends or tests route parsed responses through
     /// iocraft's event system and into [`TerminalQuerier::on_event`].
     Response(TerminalResponse),
+}
+
+impl TerminalEvent {
+    pub(crate) fn vertical_wheel(&self) -> Option<(i8, WheelTarget)> {
+        let Self::FullscreenMouse(mouse) = self else {
+            return None;
+        };
+        mouse.vertical_wheel()
+    }
+}
+
+pub(crate) fn vertical_wheel_direction(kind: MouseEventKind) -> Option<i8> {
+    match kind {
+        MouseEventKind::ScrollUp => Some(-1),
+        MouseEventKind::ScrollDown => Some(1),
+        _ => None,
+    }
 }
 
 /// A terminal response sequence produced by a terminal query.

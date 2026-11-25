@@ -2,6 +2,38 @@
 use std::io::IsTerminal;
 use std::io::{self, Write};
 
+#[cfg(unix)]
+struct TerminalFile(std::fs::File);
+
+#[cfg(unix)]
+impl Write for TerminalFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+
+        match self.0.write(bytes) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let mut descriptor = libc::pollfd {
+                    fd: self.0.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // The output owner must regain control promptly when the reader stalls.
+                // SAFETY: descriptor is live and poll only accesses this one entry.
+                match unsafe { libc::poll(&mut descriptor, 1, 2) } {
+                    -1 => Err(io::Error::last_os_error()),
+                    0 => Err(error),
+                    _ => self.0.write(bytes),
+                }
+            }
+            result => result,
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
 pub(crate) fn system_output(stderr: bool) -> io::Result<Box<dyn Write + Send>> {
     #[cfg(unix)]
     {
@@ -30,7 +62,7 @@ pub(crate) fn system_output(stderr: bool) -> io::Result<Box<dyn Write + Send>> {
                 .write(true)
                 .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(OsStr::from_bytes(path.to_bytes()))?;
-            return Ok(Box::new(file));
+            return Ok(Box::new(TerminalFile(file)));
         }
     }
     if stderr {

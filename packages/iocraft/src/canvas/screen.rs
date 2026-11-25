@@ -247,7 +247,6 @@ impl CanvasCell {
 /// - When implementing unit tests for components, you may want to render to a `Canvas` for inspection.
 #[derive(Clone)]
 pub struct Canvas {
-    pub(crate) output_allocations: crate::terminal::OutputAllocations,
     pub(super) image_scope: Option<ImageScope>,
     pub(super) width: usize,
     /// Rows are `Arc`-shared copy-on-write: blitting a full row from another
@@ -260,6 +259,9 @@ pub struct Canvas {
     /// previous per-cell deep clones dominated draw on multi-thousand-row
     /// inline sessions.
     pub(super) cells: Vec<std::sync::Arc<Vec<CanvasCell>>>,
+    blank_cells: std::sync::Arc<Vec<CanvasCell>>,
+    // Partial writes may leave a row marked after removing its last image.
+    pub(super) image_rows: Vec<bool>,
     /// Same copy-on-write rows as `cells`: a new canvas shares one blank
     /// template row, and `overlays_row_mut` / `no_select_row_mut` copy a row
     /// only when it is first written. Before this, every frame allocated and
@@ -267,6 +269,7 @@ pub struct Canvas {
     /// inline canvas that was the whole `Canvas::new` cost, several megabytes
     /// per frame for rows nothing would touch.
     pub(super) overlays: Vec<std::sync::Arc<Vec<Option<StyleOverlay>>>>,
+    blank_overlays: std::sync::Arc<Vec<Option<StyleOverlay>>>,
     pub(super) no_select: Vec<std::sync::Arc<Vec<bool>>>,
     pub(super) soft_wrap: Vec<usize>,
     pub(super) cursor_declaration: Option<CursorDeclaration>,
@@ -276,32 +279,17 @@ pub struct Canvas {
     /// Per-row write tracking for damage-driven terminal diffs. A row is
     /// marked whenever any mutating entry point touches it; rows copied from
     /// the diff-baseline frame via the clean blit variant stay unmarked
-    /// (their cells are identical to that baseline by construction). A row
-    /// unmarked in BOTH frames of a diff is provably unchanged, so terminal
-    /// writers can skip its cell scan. Excluded from `PartialEq` (bookkeeping,
-    /// not content).
+    /// (their cells are identical to that baseline by construction). Terminal
+    /// diffing uses the blank templates or shared backing rows to establish
+    /// equality across canvases.
     pub(super) dirty_rows: Vec<bool>,
 }
 
 impl PartialEq for Canvas {
     fn eq(&self, other: &Self) -> bool {
         self.image_scope == other.image_scope
-            && self.width == other.width
-            && self.cells.len() == other.cells.len()
-            && self
-                .cells
-                .iter()
-                .zip(&other.cells)
-                // Pointer-identical rows (shared blank template, baseline
-                // blits, canvas clones) compare equal without touching cells.
-                .all(|(a, b)| std::sync::Arc::ptr_eq(a, b) || a == b)
-            && self.overlays.len() == other.overlays.len()
-            && self
-                .overlays
-                .iter()
-                .zip(&other.overlays)
-                .all(|(a, b)| std::sync::Arc::ptr_eq(a, b) || a == b)
             && self.cursor_declaration == other.cursor_declaration
+            && self.has_same_cells(other)
     }
 }
 
@@ -455,68 +443,6 @@ pub struct CursorDeclaration {
 }
 
 impl Canvas {
-    pub(crate) fn output_metadata_bytes(&self) -> usize {
-        size_of::<Self>()
-            + self.cells.capacity() * size_of::<std::sync::Arc<Vec<CanvasCell>>>()
-            + self.overlays.capacity() * size_of::<std::sync::Arc<Vec<Option<StyleOverlay>>>>()
-            + self.no_select.capacity() * size_of::<std::sync::Arc<Vec<bool>>>()
-            + self.soft_wrap.capacity() * size_of::<usize>()
-            + self.dirty_rows.capacity()
-            + self.height() * 3 * size_of::<std::sync::Arc<crate::terminal::Allocation>>()
-    }
-
-    pub(crate) fn reserve_output(
-        &self,
-        memory: &std::sync::Arc<crate::terminal::OutputMemory>,
-        resolve_images: bool,
-    ) -> io::Result<crate::terminal::OutputAllocations> {
-        let mut allocations = crate::terminal::OutputAllocations::default();
-        allocations.reserve(memory, self.output_metadata_bytes())?;
-        let mut images = std::collections::HashSet::new();
-        let mut image_bytes = 0usize;
-        for row in &self.cells {
-            let bytes = cell_row_bytes(row);
-            if resolve_images && row.iter().any(|cell| cell.image.is_some()) {
-                allocations.reserve(memory, bytes + row.len() * 32)?;
-            } else {
-                allocations.shared(memory, (0, std::sync::Arc::as_ptr(row) as usize), bytes)?;
-            }
-            for cell in row.iter().filter_map(|cell| cell.image.as_ref()) {
-                if images.insert(std::sync::Arc::as_ptr(&cell.image.source) as *const () as usize) {
-                    image_bytes = image_bytes
-                        .checked_add(cell.image.source.encoded_png().len())
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::OutOfMemory,
-                                "image sources exceed output limits",
-                            )
-                        })?;
-                    if image_bytes > 64 * 1024 * 1024 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::OutOfMemory,
-                            "image sources exceed output limits",
-                        ));
-                    }
-                }
-            }
-        }
-        for row in &self.overlays {
-            allocations.shared(
-                memory,
-                (1, std::sync::Arc::as_ptr(row) as usize),
-                row.capacity() * size_of::<Option<StyleOverlay>>(),
-            )?;
-        }
-        for row in &self.no_select {
-            allocations.shared(
-                memory,
-                (2, std::sync::Arc::as_ptr(row) as usize),
-                row.capacity(),
-            )?;
-        }
-        Ok(allocations)
-    }
-
     /// Constructs a new canvas with the given dimensions.
     pub fn new(width: usize, height: usize) -> Self {
         let blank_row = std::sync::Arc::new(vec![CanvasCell::default(); width]);
@@ -524,10 +450,12 @@ impl Canvas {
         let blank_no_select = Self::blank_no_select_row(width);
         Self {
             width,
-            output_allocations: Default::default(),
             image_scope: None,
-            cells: vec![blank_row; height],
-            overlays: vec![blank_overlays; height],
+            cells: vec![blank_row.clone(); height],
+            blank_cells: blank_row,
+            image_rows: vec![false; height],
+            overlays: vec![blank_overlays.clone(); height],
+            blank_overlays,
             no_select: vec![blank_no_select; height],
             soft_wrap: vec![0; height],
             cursor_declaration: None,
@@ -549,7 +477,7 @@ impl Canvas {
 
     /// Whether the row was touched by any mutating entry point this frame.
     /// Out-of-range rows report true so callers never skip on bad indices.
-    pub(crate) fn row_written(&self, y: usize) -> bool {
+    fn row_written(&self, y: usize) -> bool {
         self.dirty_rows.get(y).copied().unwrap_or(true)
     }
 
@@ -1123,6 +1051,7 @@ impl Canvas {
         self.damage_region.is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn row_is_damaged(&self, y: usize) -> bool {
         self.damage_region
             .is_some_and(|region| region.intersects_row(y))
@@ -1324,9 +1253,11 @@ impl Canvas {
                 // cloning cell-by-cell (CanvasCell carries heap fields); a
                 // row is copied for real only if something later writes it.
                 self.cells[row] = std::sync::Arc::clone(&source.cells[row]);
+                self.image_rows[row] = source.image_rows[row];
                 self.overlays[row] = std::sync::Arc::clone(&source.overlays[row]);
                 self.no_select[row] = std::sync::Arc::clone(&source.no_select[row]);
             } else {
+                self.image_rows[row] |= source.image_rows[row];
                 self.cells_row_mut(row)[x..max_x].clone_from_slice(&source.cells[row][x..max_x]);
                 self.overlays_row_mut(row)[x..max_x]
                     .clone_from_slice(&source.overlays[row][x..max_x]);
@@ -1406,6 +1337,7 @@ impl Canvas {
         if abs_delta >= height {
             for y in top..=bottom {
                 self.cells[y] = std::sync::Arc::new(vec![CanvasCell::default(); self.width]);
+                self.image_rows[y] = false;
                 self.overlays[y] = Self::blank_overlays_row(self.width);
                 self.no_select[y] = Self::blank_no_select_row(self.width);
                 self.soft_wrap[y] = 0;
@@ -1416,12 +1348,14 @@ impl Canvas {
         if delta > 0 {
             for y in top..=bottom - abs_delta {
                 self.cells[y] = self.cells[y + abs_delta].clone();
+                self.image_rows[y] = self.image_rows[y + abs_delta];
                 self.overlays[y] = self.overlays[y + abs_delta].clone();
                 self.no_select[y] = self.no_select[y + abs_delta].clone();
                 self.soft_wrap[y] = self.soft_wrap[y + abs_delta];
             }
             for y in bottom - abs_delta + 1..=bottom {
                 self.cells[y] = std::sync::Arc::new(vec![CanvasCell::default(); self.width]);
+                self.image_rows[y] = false;
                 self.overlays[y] = Self::blank_overlays_row(self.width);
                 self.no_select[y] = Self::blank_no_select_row(self.width);
                 self.soft_wrap[y] = 0;
@@ -1429,12 +1363,14 @@ impl Canvas {
         } else {
             for y in (top + abs_delta..=bottom).rev() {
                 self.cells[y] = self.cells[y - abs_delta].clone();
+                self.image_rows[y] = self.image_rows[y - abs_delta];
                 self.overlays[y] = self.overlays[y - abs_delta].clone();
                 self.no_select[y] = self.no_select[y - abs_delta].clone();
                 self.soft_wrap[y] = self.soft_wrap[y - abs_delta];
             }
             for y in top..top + abs_delta {
                 self.cells[y] = std::sync::Arc::new(vec![CanvasCell::default(); self.width]);
+                self.image_rows[y] = false;
                 self.overlays[y] = Self::blank_overlays_row(self.width);
                 self.no_select[y] = Self::blank_no_select_row(self.width);
                 self.soft_wrap[y] = 0;
@@ -1470,6 +1406,7 @@ impl Canvas {
                 break;
             }
             self.cells.pop();
+            self.image_rows.pop();
             self.overlays.pop();
             self.no_select.pop();
             self.soft_wrap.pop();
@@ -2139,8 +2076,44 @@ impl Canvas {
     /// here, cursor movement would leave stale inverted cells on screen.
     pub(crate) fn row_eq(&self, other: &Self, y: usize) -> bool {
         self.width == other.width
-            && self.row(y) == other.row(y)
-            && self.overlay_row(y) == other.overlay_row(y)
+            && (self.row_storage_eq(other, y)
+                || (self.row(y) == other.row(y) && self.overlay_row(y) == other.overlay_row(y)))
+    }
+
+    pub(crate) fn has_same_cells(&self, other: &Self) -> bool {
+        self.has_same_cells_up_to(other, usize::MAX)
+    }
+
+    pub(crate) fn has_same_cells_up_to(&self, other: &Self, row_limit: usize) -> bool {
+        let rows = self.height().min(row_limit);
+        self.width == other.width
+            && rows == other.height().min(row_limit)
+            && (0..rows).all(|y| {
+                self.row_storage_eq(other, y)
+                    || (shared_rows_equal(&self.cells[y], &other.cells[y])
+                        && shared_rows_equal(&self.overlays[y], &other.overlays[y]))
+            })
+    }
+
+    fn row_storage_eq(&self, other: &Self, y: usize) -> bool {
+        use std::sync::Arc;
+
+        match (self.cells.get(y), other.cells.get(y)) {
+            (Some(previous), Some(next)) => {
+                let previous_overlays = &self.overlays[y];
+                let next_overlays = &other.overlays[y];
+                (Arc::ptr_eq(previous, next) && Arc::ptr_eq(previous_overlays, next_overlays))
+                    || (!self.row_written(y)
+                        && !other.row_written(y)
+                        && Arc::ptr_eq(previous, &self.blank_cells)
+                        && Arc::ptr_eq(next, &other.blank_cells)
+                        && Arc::ptr_eq(previous_overlays, &self.blank_overlays)
+                        && Arc::ptr_eq(next_overlays, &other.blank_overlays)
+                        && !crate::debug_env::disabled().damage_skip)
+            }
+            (None, None) => true,
+            _ => false,
+        }
     }
 
     fn row_damage_start(&self, y: usize) -> Option<usize> {
@@ -2149,14 +2122,6 @@ impl Canvas {
             return None;
         }
         Some(region.x.min(self.width))
-    }
-
-    fn cell_for_diff(&self, y: usize, x: usize) -> CanvasCell {
-        self.cells
-            .get(y)
-            .and_then(|row| row.get(x))
-            .cloned()
-            .unwrap_or_default()
     }
 
     fn overlay_for_diff(&self, y: usize, x: usize) -> Option<StyleOverlay> {
@@ -2192,21 +2157,22 @@ impl Canvas {
             .flatten()
             .min();
 
-        let max_len = self
-            .row(y)
-            .map_or(0, <[CanvasCell]>::len)
-            .max(other.row(y).map_or(0, <[CanvasCell]>::len));
-        let diff_start = (0..max_len).find(|&x| {
-            self.cell_for_diff(y, x) != other.cell_for_diff(y, x)
-                || self.overlay_for_diff(y, x) != other.overlay_for_diff(y, x)
-        });
-
-        let mut start = match (damage_start, diff_start) {
-            (Some(a), Some(b)) => a.min(b),
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => return None,
+        let diff_start = if self.row_storage_eq(other, y) {
+            None
+        } else {
+            let previous = self.cells.get(y).map_or(&[][..], |row| row.as_slice());
+            let next = other.cells.get(y).map_or(&[][..], |row| row.as_slice());
+            let previous_overlays = self.overlays.get(y).map_or(&[][..], |row| row.as_slice());
+            let next_overlays = other.overlays.get(y).map_or(&[][..], |row| row.as_slice());
+            let default_cell = CanvasCell::default();
+            (0..damage_start.unwrap_or(self.width)).find(|&x| {
+                previous.get(x).unwrap_or(&default_cell) != next.get(x).unwrap_or(&default_cell)
+                    || previous_overlays.get(x).unwrap_or(&None)
+                        != next_overlays.get(x).unwrap_or(&None)
+            })
         };
+
+        let mut start = diff_start.or(damage_start)?;
 
         if start > 0
             && (self.cell_width_for_diff(y, start) == CellWidth::WidthTail
@@ -2219,14 +2185,9 @@ impl Canvas {
     }
 }
 
-fn cell_row_bytes(row: &Vec<CanvasCell>) -> usize {
-    row.capacity() * size_of::<CanvasCell>()
-        + row
-            .iter()
-            .filter_map(|cell| cell.character.as_ref())
-            .map(|character| {
-                character.value.capacity()
-                    + character.hyperlink.as_ref().map_or(0, String::capacity)
-            })
-            .sum::<usize>()
+fn shared_rows_equal<T: PartialEq>(
+    previous: &std::sync::Arc<Vec<T>>,
+    next: &std::sync::Arc<Vec<T>>,
+) -> bool {
+    std::sync::Arc::ptr_eq(previous, next) || previous == next
 }

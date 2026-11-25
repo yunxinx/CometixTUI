@@ -118,11 +118,23 @@ fn image_cells_preserve_coordinates_through_clipping_blitting_and_clearing() {
     let source = Arc::new(ImageSource::default());
     let image = CanvasImage::new(source, 4, 3).unwrap();
     let mut canvas = Canvas::new(5, 4);
-    canvas
-        .subview_mut(0, 0, 0, 0, 5, 4)
-        .set_image(-2, -1, &image);
-    let cell = canvas.cell(0, 0).unwrap().image.as_ref().unwrap();
-    assert_eq!((cell.column, cell.row), (2, 1));
+    let background = Color::DarkBlue;
+    let overlay = StyleOverlay {
+        background_color: Some(Some(Color::DarkRed)),
+        ..StyleOverlay::default()
+    };
+    canvas.set_overlay(0, 0, overlay);
+    let mut destination = canvas.subview_mut(0, 0, 0, 0, 5, 4);
+    destination.set_background_color(0, 0, 2, 2, background);
+    destination.set_image_with_link(-2, -1, &image, Some("https://example.com"));
+    let cell = canvas.cell(0, 0).unwrap();
+    assert_eq!(cell.background_color, Some(background));
+    assert_eq!(cell.hyperlink(), Some("https://example.com"));
+    let image_cell = cell.image.as_ref().unwrap();
+    assert_eq!((image_cell.column, image_cell.row), (2, 1));
+    let change = &Canvas::new(5, 4).diff(&canvas)[0];
+    assert_eq!(change.added.as_ref().unwrap().overlay, Some(overlay));
+    assert!(canvas.damage_region().is_none());
     let cropped = canvas.copy_region(0, 0, 2, 2);
     let mut destination = Canvas::new(6, 5);
     destination

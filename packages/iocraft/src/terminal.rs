@@ -35,6 +35,7 @@ pub use crossterm::event::{
 };
 
 const STDIN_RESUME_GAP: Duration = Duration::from_secs(5);
+const MAX_READY_WHEEL_REPORTS: usize = 64;
 
 mod backend;
 mod capability;
@@ -46,7 +47,7 @@ pub(crate) use commit::OutputSender;
 use commit::{Operation, OutputSession};
 pub use draft::*;
 pub use memory::OutputCapacity;
-pub(crate) use memory::{Allocation, OutputAllocations, OutputMemory};
+pub(crate) use memory::{Allocation, OutputMemory};
 mod session;
 pub use session::*;
 mod events;
@@ -478,6 +479,7 @@ impl<'a> Terminal<'a> {
         if let OutputBackend::Worker(output) = &mut self.inner {
             return output.enqueue(Operation::Mouse(false));
         }
+        self.event_cell_snapshot = None;
         self.inner.set_mouse_capture(false)
     }
 
@@ -650,6 +652,7 @@ impl<'a> Terminal<'a> {
         &mut self,
         prev: Option<&Canvas>,
         draft: FrameDraft,
+        should_repaint: bool,
     ) -> io::Result<bool> {
         if let OutputBackend::Worker(output) = &mut self.inner {
             return output.enqueue_frame(Operation::Frame {
@@ -658,6 +661,9 @@ impl<'a> Terminal<'a> {
                 screen: output.screen,
                 receipt: None,
             });
+        }
+        if !should_repaint {
+            return Ok(false);
         }
         // The render loop has already classified this frame as a repaint. Avoid
         // running the terminal backend's preflight row scan only to repeat the
@@ -668,16 +674,9 @@ impl<'a> Terminal<'a> {
             .map(|()| true)
     }
 
-    /// Updates the retained screen-buffer metadata used to annotate mouse events
-    /// with CC Ink-style blank-cell information.
-    ///
-    /// Skipped — and any stale snapshot dropped — while the terminal is not
-    /// reporting the mouse. The snapshot is an O(canvas) scan per frame and
-    /// only ever serves mouse events; inline mode never enables tracking (CC
-    /// does so only inside its alternate screen), so on a long inline
-    /// session it was a quarter of every frame spent on events that could
-    /// not arrive.
-    pub fn set_event_cell_snapshot(&mut self, canvas: &Canvas) {
+    /// Refreshes blank-cell metadata for a changed direct-backend frame while
+    /// tracking the mouse. The output worker owns its committed metadata.
+    pub fn set_event_cell_snapshot(&mut self, previous: Option<&Canvas>, canvas: &Canvas) {
         if matches!(self.inner, OutputBackend::Worker(_)) {
             return;
         }
@@ -685,25 +684,20 @@ impl<'a> Terminal<'a> {
             self.event_cell_snapshot = None;
             return;
         }
-        self.event_cell_snapshot = Some(EventCellSnapshot::from_canvas(canvas));
+        let row_limit = self.inner.canvas_row_limit();
+        if self
+            .event_cell_snapshot
+            .as_ref()
+            .is_none_or(|snapshot| !snapshot.matches_extent(canvas, row_limit))
+            || previous.is_none_or(|previous| !previous.has_same_cells_up_to(canvas, row_limit))
+        {
+            self.event_cell_snapshot = Some(EventCellSnapshot::from_canvas(canvas, row_limit));
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn has_event_cell_snapshot(&self) -> bool {
         self.event_cell_snapshot.is_some()
-    }
-
-    fn annotate_terminal_event(
-        mut event: TerminalEvent,
-        snapshot: Option<&EventCellSnapshot>,
-    ) -> TerminalEvent {
-        if let TerminalEvent::FullscreenMouse(mouse) = &mut event {
-            mouse.frame = snapshot.and_then(|snapshot| snapshot.frame.clone());
-            mouse.cell_is_blank = snapshot
-                .map(|snapshot| snapshot.cell_is_blank(mouse.column, mouse.row))
-                .unwrap_or(false);
-        }
-        event
     }
 
     /// Positions the physical cursor per the declaration's visibility flag.
@@ -964,17 +958,22 @@ impl<'a> Terminal<'a> {
 
     /// Peeks at already available input without dispatching it before props settle.
     pub(crate) fn has_pending_input(&mut self) -> bool {
+        self.peek_event();
+        self.pending_event.as_ref().is_some_and(|event| {
+            event.as_ref().is_ok_and(|event| {
+                matches!(event, TerminalEvent::Key(_) | TerminalEvent::Paste(_))
+                    && !self.event_requests_suspend(event)
+            })
+        })
+    }
+
+    fn peek_event(&mut self) -> Option<&io::Result<TerminalEvent>> {
         if self.pending_event.is_none()
             && let Poll::Ready(Some(event)) = self.poll_event_stream_now()
         {
             self.pending_event = Some(event);
         }
-        self.pending_event.as_ref().is_some_and(|event| {
-            matches!(event, Ok(TerminalEvent::Key(_) | TerminalEvent::Paste(_)))
-                && !event
-                    .as_ref()
-                    .is_ok_and(|event| self.event_requests_suspend(event))
-        })
+        self.pending_event.as_ref()
     }
 
     fn event_requests_suspend(&self, event: &TerminalEvent) -> bool {
@@ -1017,6 +1016,7 @@ impl<'a> Terminal<'a> {
             output.check()?;
         }
 
+        let mut wheel_reports = 0;
         loop {
             // Race the next terminal event against the resume (SIGCONT) signal so
             // the render loop wakes immediately when the process is foregrounded,
@@ -1126,6 +1126,7 @@ impl<'a> Terminal<'a> {
                 );
             }
             let is_resize = matches!(event, TerminalEvent::Resize(..));
+            let wheel = event.vertical_wheel();
             self.input_dispatched =
                 matches!(event, TerminalEvent::Key(_) | TerminalEvent::Paste(_));
             if let TerminalEvent::Resize(width, height) = &event {
@@ -1148,17 +1149,23 @@ impl<'a> Terminal<'a> {
                 }
                 self.resized = true;
             }
-            let event_cell_snapshot = match &self.inner {
-                OutputBackend::Worker(output) => output.snapshot(),
-                _ => self.event_cell_snapshot.clone(),
-            };
-            if matches!(self.inner, OutputBackend::Worker(_))
-                && event_cell_snapshot.is_none()
-                && matches!(event, TerminalEvent::FullscreenMouse(_))
-            {
-                continue;
+            let mut event = event;
+            if let TerminalEvent::FullscreenMouse(mouse) = &mut event {
+                let projection;
+                let cells = match &self.inner {
+                    OutputBackend::Worker(output) => {
+                        let Some(committed) = output.projection() else {
+                            continue;
+                        };
+                        projection = committed;
+                        mouse.frame = Some(projection.frame);
+                        projection.cells.as_deref()
+                    }
+                    _ => self.event_cell_snapshot.as_ref(),
+                };
+                mouse.cell_is_blank =
+                    cells.is_some_and(|cells| cells.cell_is_blank(mouse.column, mouse.row));
             }
-            let event = Self::annotate_terminal_event(event, event_cell_snapshot.as_ref());
 
             // Dispatch to the interested subscribers first — Ctrl+C is a
             // normal event.
@@ -1173,6 +1180,23 @@ impl<'a> Terminal<'a> {
                 } else {
                     // No component can consume it, so preserve the default behavior.
                     self.received_ctrl_c = true;
+                }
+            }
+            if let Some((_, target)) = wheel {
+                self.input_dispatched = true;
+                wheel_reports += 1;
+                // Let scrolling components consume this ready run together. Preserve the
+                // next event so it observes the reconciled viewport and hit targets.
+                if wheel_reports < MAX_READY_WHEEL_REPORTS
+                    && self.peek_event().is_some_and(|event| {
+                        event.as_ref().is_ok_and(|event| {
+                            event
+                                .vertical_wheel()
+                                .is_some_and(|(_, next)| next == target)
+                        })
+                    })
+                {
+                    continue;
                 }
             }
             if self.received_ctrl_c || is_resize || self.input_dispatched {

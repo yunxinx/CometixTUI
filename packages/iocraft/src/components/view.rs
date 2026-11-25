@@ -726,14 +726,6 @@ pub(crate) struct ViewHitProjection {
     hover: Vec<ViewHoverRecord>,
 }
 
-impl ViewHitProjection {
-    pub(crate) fn retained_bytes(&self) -> usize {
-        size_of::<Self>()
-            + self.clicks.capacity() * (size_of::<ViewHitRecord>() + 512)
-            + self.hover.capacity() * (size_of::<ViewHoverRecord>() + 512)
-    }
-}
-
 impl ViewFocusParentContext {
     pub(crate) fn capture_hits(&self) -> Arc<ViewHitProjection> {
         let freeze = |region: &Arc<Mutex<Option<ViewEventRegion>>>| {

@@ -186,6 +186,7 @@ impl UseTerminalEvents for Hooks<'_, '_> {
             in_component: false,
             propagation_aware: false,
             observe_stopped: false,
+            coalesce_wheel: false,
             interest: TerminalEventInterest::ALL,
             f: None,
         });
@@ -205,6 +206,7 @@ impl UseTerminalEvents for Hooks<'_, '_> {
             in_component: true,
             propagation_aware: false,
             observe_stopped: false,
+            coalesce_wheel: false,
             interest: TerminalEventInterest::ALL,
             f: None,
         });
@@ -217,17 +219,7 @@ impl UseTerminalEvents for Hooks<'_, '_> {
     where
         F: FnMut(&PropagatedTerminalEvent) + Send + 'static,
     {
-        let h = self.use_hook(move || UseTerminalEventsImpl {
-            events: None,
-            component_location: Default::default(),
-            identity: Arc::new(()),
-            in_component: true,
-            propagation_aware: true,
-            observe_stopped: false,
-            interest: TerminalEventInterest::ALL,
-            f: None,
-        });
-        h.f = Some(Arc::new(Mutex::new(Box::new(f))));
+        self.use_local_propagated_events(false, f);
     }
 
     fn use_propagated_terminal_events<F>(&mut self, f: F)
@@ -241,6 +233,7 @@ impl UseTerminalEvents for Hooks<'_, '_> {
             in_component: false,
             propagation_aware: true,
             observe_stopped: false,
+            coalesce_wheel: false,
             interest: TerminalEventInterest::ALL,
             f: None,
         });
@@ -258,6 +251,7 @@ impl UseTerminalEvents for Hooks<'_, '_> {
             in_component: false,
             propagation_aware: false,
             observe_stopped: false,
+            coalesce_wheel: false,
             interest,
             f: None,
         });
@@ -278,11 +272,39 @@ impl UseTerminalEvents for Hooks<'_, '_> {
             in_component: false,
             propagation_aware: true,
             observe_stopped: false,
+            coalesce_wheel: false,
             interest,
             f: None,
         });
         h.interest = interest;
         h.f = Some(Arc::new(Mutex::new(Box::new(f))));
+    }
+}
+
+impl Hooks<'_, '_> {
+    pub(crate) fn use_local_scroll_events<F>(&mut self, f: F)
+    where
+        F: FnMut(&PropagatedTerminalEvent) + Send + 'static,
+    {
+        self.use_local_propagated_events(true, f);
+    }
+
+    fn use_local_propagated_events<F>(&mut self, coalesce_wheel: bool, f: F)
+    where
+        F: FnMut(&PropagatedTerminalEvent) + Send + 'static,
+    {
+        let hook = self.use_hook(move || UseTerminalEventsImpl {
+            events: None,
+            component_location: Default::default(),
+            identity: Arc::new(()),
+            in_component: true,
+            propagation_aware: true,
+            observe_stopped: false,
+            coalesce_wheel,
+            interest: TerminalEventInterest::ALL,
+            f: None,
+        });
+        hook.f = Some(Arc::new(Mutex::new(Box::new(f))));
     }
 }
 
@@ -298,6 +320,7 @@ impl UseTerminalDefaultEvents for Hooks<'_, '_> {
             in_component: false,
             propagation_aware: true,
             observe_stopped: true,
+            coalesce_wheel: false,
             interest: TerminalEventInterest::ALL,
             f: None,
         });
@@ -320,6 +343,7 @@ struct UseTerminalEventsImpl {
     in_component: bool,
     propagation_aware: bool,
     observe_stopped: bool,
+    coalesce_wheel: bool,
     interest: TerminalEventInterest,
     f: Option<Arc<Mutex<EventCallback>>>,
 }
@@ -376,6 +400,14 @@ impl Hook for UseTerminalEventsImpl {
                         let row = component_local_offset(event.row, location.y);
                         let column = component_local_offset(event.column, location.x);
                         if let Some(f) = callback {
+                            let following_wheels = if self.coalesce_wheel {
+                                self.events
+                                    .as_ref()
+                                    .expect("local event came from a terminal subscription")
+                                    .take_following_wheels(&event)
+                            } else {
+                                Vec::new()
+                            };
                             f.lock().expect("input callback is not poisoned")(
                                 &PropagatedTerminalEvent::new(
                                     TerminalEvent::FullscreenMouse(FullscreenMouseEvent {
@@ -384,7 +416,8 @@ impl Hook for UseTerminalEventsImpl {
                                         ..event
                                     }),
                                     state,
-                                ),
+                                )
+                                .with_following_wheels(following_wheels),
                             );
                         }
                     }
